@@ -18,6 +18,7 @@ inline UINT gRTVDescriptorSize;
 inline UINT gDSVDescriptorSize;
 inline UINT gCSUDescriptorSize;
 inline DXGI_FORMAT gBackBufferFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+inline DXGI_FORMAT gDepthStencilFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
 inline UINT g4xMsaaQuality = 0;
 
 inline ComPtr<ID3D12CommandQueue> gCommandQueue;
@@ -28,6 +29,17 @@ inline ComPtr<IDXGISwapChain3> gSwapChain;
 inline constexpr UINT gSwapChainBufferCount = 2;   // 双缓冲
 inline UINT gClientWidth = 0;
 inline UINT gClientHeight = 0;
+inline ComPtr<ID3D12Resource> gSwapChainBuffer[gSwapChainBufferCount];
+
+//描述符堆
+inline ComPtr<ID3D12DescriptorHeap> gRTVDescriptorHeap;
+inline ComPtr<ID3D12DescriptorHeap> gDSVDescriptorHeap;
+
+//深度/模版缓冲资源
+inline ComPtr<ID3D12Resource> gDenthStencilBuffer;
+
+inline D3D12_VIEWPORT gScreenViewport;
+inline D3D12_RECT     gScissorRect;
 
 //封装初始化Windows应用程序所需的代码
 bool InitWindowsApp(HINSTANCE instanceHandle, int show);

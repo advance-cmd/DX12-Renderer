@@ -5,16 +5,116 @@
 #include <wrl.h>
 
 #include <d3d12.h>          // 所有 ID3D12xxx 接口、D3D12_xxx 结构体和枚举
+#include <d3dx12/d3dx12.h>
 #include <dxgi1_4.h>        // IDXGIFactory4、IDXGISwapChain、适配器枚举
 #include <d3dcompiler.h>    // D3DCompileFromFile，第 6 章编译 HLSL 时才用
 #include <DirectXColors.h>  // Colors::LightSteelBlue 之类的预定义颜色
 
-extern "C" { __declspec(dllexport) extern const UINT D3D12SDKVersion = 619; }
-extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\"; }
+extern "C" {
+__declspec(dllexport) extern const UINT D3D12SDKVersion = 619;
+}
+
+extern "C" {
+__declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\";
+}
 
 using namespace std;
 using namespace DirectX;
 using namespace DirectX::PackedVector;
+
+bool InitWindowsApp(HINSTANCE instanceHandle, int show)
+{
+    // 通过填写WNDCLASS结构体，根据其中描述的特征来创建一个窗口
+    WNDCLASS wc;
+
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = WndProc;
+    wc.cbClsExtra = 0;
+    wc.cbWndExtra = 0;
+    wc.hInstance = instanceHandle;
+    wc.hIcon = LoadIcon(0, IDI_APPLICATION);
+    wc.hCursor = LoadCursor(0, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    wc.lpszMenuName = 0;
+    wc.lpszClassName = L"BasicWndClass";
+
+    //下一步，我们要在Windows系统中为上述WNDCLASS注册一个实例，这样一来，即可据此创建窗口
+    if (!RegisterClass(&wc))
+    {
+        MessageBox(0, L"RegisterClass FALLED", 0, 0);
+        return false;
+    }
+    //注册过WNDCLASS实例之后，我们就能用CreateWindow函数来创建一个窗口了。此函数返回的就
+    //是所建窗口的句柄(一个HWND类型的数值)。如果创建失败，返回的句柄数值为0。窗口句柄是一种
+    //窗口的引用方式， Windows系统会在内部对此进行管理。处理窗口的大量Win32 API函数都需要
+    //把HWND类型作为参数，以此来确定要对哪一个窗口执行相应的操作
+    ghMainWnd = CreateWindow(
+        L"BasicWndClass",
+        L"Win32Basic",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        0,
+        0,
+        instanceHandle,
+        0);
+    if (ghMainWnd == 0)
+    {
+        MessageBox(0, L"CreateWindow FALLED", 0, 0);
+        return false;
+    }
+    //调用展示和更新函数
+    ShowWindow(ghMainWnd, show);
+    UpdateWindow(ghMainWnd);
+
+    return true;
+}
+
+int Run()
+{
+    MSG msg = {0};
+
+    while (msg.message != WM_QUIT)
+    {
+        if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) // 有消息：照常翻译、分发给 WndProc
+        {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        else // 没消息：跑游戏逻辑 + 渲染一帧
+        {
+            // Update(); Draw();
+        }
+    }
+
+    return (int)msg.wParam;
+}
+
+LRESULT WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE)
+        {
+            SendMessage(hWnd, WM_CLOSE, 0, 0);
+        }
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    case WM_CLOSE:
+        if (MessageBox(hWnd, L"确定关闭？", L"提醒", MB_OKCANCEL | MB_ICONQUESTION) == IDOK)
+        {
+            DestroyWindow(hWnd);
+        }
+        return 0; // 点了取消就直接返回，窗口保持打开
+    default:
+        return DefWindowProc(hWnd, msg, wParam, lParam);
+    }
+}
 
 //启用D3D12的调试层（只在 Debug 下生效，必须在创建设备之前调用）
 void EnableD3DDebugLayer()
@@ -105,16 +205,15 @@ void CreateCommandObjects()
         0,
         D3D12_COMMAND_LIST_TYPE_DIRECT,
         gCommandAllocator.Get(),
-        nullptr,    //初始化流水线状态对象
+        nullptr, //初始化流水线状态对象
         IID_PPV_ARGS(gCommandList.GetAddressOf())));
     ThrowIfFailed(gCommandList->Close());
 }
 
 void CreateSwapChain()
 {
-    
     gSwapChain.Reset();
-    
+
     DXGI_SWAP_CHAIN_DESC1 desc = {
         .Width = 0,
         .Height = 0,
@@ -138,112 +237,119 @@ void CreateSwapChain()
         nullptr,
         nullptr,
         &swapChain1));
-    
+
     ThrowIfFailed(swapChain1.As(&gSwapChain));
 
     DXGI_SWAP_CHAIN_DESC1 actual = {};
     ThrowIfFailed(gSwapChain->GetDesc1(&actual));
-    gClientWidth  = actual.Width;
+    gClientWidth = actual.Width;
     gClientHeight = actual.Height;
-    
+
     ThrowIfFailed(gDxgiFactory->MakeWindowAssociation(ghMainWnd, DXGI_MWA_NO_ALT_ENTER));
 }
 
-
-bool InitWindowsApp(HINSTANCE instanceHandle, int show)
+void CreateDescHeaps()
 {
-    // 通过填写WNDCLASS结构体，根据其中描述的特征来创建一个窗口
-    WNDCLASS wc;
-
-    wc.style = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc = WndProc;
-    wc.cbClsExtra = 0;
-    wc.cbWndExtra = 0;
-    wc.hInstance = instanceHandle;
-    wc.hIcon = LoadIcon(0, IDI_APPLICATION);
-    wc.hCursor = LoadCursor(0, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
-    wc.lpszMenuName = 0;
-    wc.lpszClassName = L"BasicWndClass";
-
-    //下一步，我们要在Windows系统中为上述WNDCLASS注册一个实例，这样一来，即可据此创建窗口
-    if (!RegisterClass(&wc))
-    {
-        MessageBox(0, L"RegisterClass FALLED", 0, 0);
-        return false;
-    }
-    //注册过WNDCLASS实例之后，我们就能用CreateWindow函数来创建一个窗口了。此函数返回的就
-    //是所建窗口的句柄(一个HWND类型的数值)。如果创建失败，返回的句柄数值为0。窗口句柄是一种
-    //窗口的引用方式， Windows系统会在内部对此进行管理。处理窗口的大量Win32 API函数都需要
-    //把HWND类型作为参数，以此来确定要对哪一个窗口执行相应的操作
-    ghMainWnd = CreateWindow(
-        L"BasicWndClass",
-        L"Win32Basic",
-        WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        0,
-        0,
-        instanceHandle,
-        0);
-    if (ghMainWnd == 0)
-    {
-        MessageBox(0, L"CreateWindow FALLED", 0, 0);
-        return false;
-    }
-    //调用展示和更新函数
-    ShowWindow(ghMainWnd, show);
-    UpdateWindow(ghMainWnd);
-
-    return true;
+    /*
+     * 渲染缓冲区视图
+     */
+    D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+        .NumDescriptors = gSwapChainBufferCount,
+        .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+        .NodeMask = 0
+    };
+    ThrowIfFailed(gDevice->CreateDescriptorHeap(
+        &rtvHeapDesc,IID_PPV_ARGS(gRTVDescriptorHeap.GetAddressOf())));
+    /*
+     * 深度/模板视图
+     */
+    D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {
+        .NumDescriptors = 1,
+        .Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+        .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+        .NodeMask = 0
+    };
+    ThrowIfFailed(gDevice->CreateDescriptorHeap(
+        &dsvHeapDesc,IID_PPV_ARGS(gDSVDescriptorHeap.GetAddressOf())));
 }
 
-int Run()
+D3D12_CPU_DESCRIPTOR_HANDLE CurrentBackBufferView()
 {
-    MSG msg = {0};
-
-    while (msg.message != WM_QUIT)
-    {
-        if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))   // 有消息：照常翻译、分发给 WndProc
-        {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-        else                                              // 没消息：跑游戏逻辑 + 渲染一帧
-        {
-            // Update(); Draw();
-        }
-    }
-
-    return (int)msg.wParam;
+    return CD3DX12_CPU_DESCRIPTOR_HANDLE(
+        gRTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
+        gSwapChain->GetCurrentBackBufferIndex(),
+        gRTVDescriptorSize);
 }
 
-LRESULT WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+D3D12_CPU_DESCRIPTOR_HANDLE DepthStencilView()
 {
-    switch (msg)
+    return gDSVDescriptorHeap->GetCPUDescriptorHandleForHeapStart();
+}
+
+void CreateSwapChainRTV()
+{
+    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHeapHandle(gRTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+    for (UINT i = 0; i < gSwapChainBufferCount; i++)
     {
-    case WM_KEYDOWN:
-        if (wParam == VK_ESCAPE)
-        {
-            SendMessage(hWnd, WM_CLOSE, 0, 0);
-        }
-        return 0;
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        return 0;
-    case WM_CLOSE:
-        if (MessageBox(hWnd, L"确定关闭？", L"提醒", MB_OKCANCEL | MB_ICONQUESTION) == IDOK)
-        {
-            DestroyWindow(hWnd);
-        }
-        return 0;   // 点了取消就直接返回，窗口保持打开
-    default:
-        return DefWindowProc(hWnd, msg, wParam, lParam);
+        //获取交换链内的第i个缓冲区
+        ThrowIfFailed(gSwapChain->GetBuffer(i,IID_PPV_ARGS(&gSwapChainBuffer[i])));
+
+        //创建RTV
+        gDevice->CreateRenderTargetView(gSwapChainBuffer[i].Get(), nullptr, rtvHeapHandle);
+
+        //偏移到描述符堆中的下一个缓冲区
+        rtvHeapHandle.Offset(1, gRTVDescriptorSize);
     }
 }
 
+void CreateDepthAndStencil()
+{
+    //创建深度/模板缓冲区及其视图
+    D3D12_RESOURCE_DESC depthStencilDesc{
+        .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        .Alignment = 0,
+        .Width = gClientWidth,
+        .Height = gClientHeight,
+        .DepthOrArraySize = 1,
+        .MipLevels = 1,
+        .Format = gDepthStencilFormat,
+        .SampleDesc = {
+            .Count = 1,
+            .Quality = 0
+        },
+        .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        .Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+    };
+    D3D12_CLEAR_VALUE optClear{
+        .Format = gDepthStencilFormat,
+        .DepthStencil = {
+            .Depth = 1.0f,
+            .Stencil = 0
+        }
+    };
+    CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+    ThrowIfFailed(gDevice->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &depthStencilDesc,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        &optClear,
+        IID_PPV_ARGS(gDenthStencilBuffer.GetAddressOf())));
+
+    //利用此资源的格式，为整个资源的第0mip层创建描述符
+    gDevice->CreateDepthStencilView(
+        gDenthStencilBuffer.Get(),
+        nullptr,
+        DepthStencilView());
+}
+
+// 初始化时：只算值，不调 RSSet
+void UpdateViewportAndScissor()
+{
+    gScreenViewport = { 0.0f, 0.0f, (float)gClientWidth, (float)gClientHeight, 0.0f, 1.0f };
+    gScissorRect    = { 0, 0, (LONG)gClientWidth, (LONG)gClientHeight };
+}
 
 int WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShowCmd)
 {
@@ -251,7 +357,8 @@ int WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int n
     try
     {
         //将hInstance和nShowCmd作为参数来调用封装函数InitWindowsApp，用来创建和初始化应用程序的主窗口
-        if (!InitWindowsApp(hInstance, nShowCmd)) {
+        if (!InitWindowsApp(hInstance, nShowCmd))
+        {
             return 0;
         }
 
@@ -263,6 +370,12 @@ int WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int n
         Check4xMsaaQuality();
         CreateCommandObjects();
         CreateSwapChain();
+        CreateDescHeaps();
+        CreateSwapChainRTV();
+        CreateDepthAndStencil();
+        UpdateViewportAndScissor();
+        
+        
 
         //初始化完毕后就可以开启消息循环了
         return Run();

@@ -141,12 +141,12 @@
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="Adapter\D3DApp.cpp" />
+    <ClCompile Include="Common\GameTimer.cpp" />
     <ClCompile Include="main.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="Adapter\D3DApp.h" />
     <ClInclude Include="Common\DxUtil.h" />
+    <ClInclude Include="Common\GameTimer.h" />
     <ClInclude Include="main.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
