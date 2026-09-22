@@ -1,0 +1,21 @@
+# 编译输出（exe、obj、pdb、复制过来的 D3D12 运行时 DLL 都在这里面）
+/x64/
+/Win32/
+/LearnDX12/
+Debug/
+Release/
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.tlog
+*.recipe
+*.log
+
+# IDE 缓存与个人设置
+.vs/
+.idea/
+*.vcxproj.user
+*.suo
+*.user
