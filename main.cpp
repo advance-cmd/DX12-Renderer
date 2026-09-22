@@ -265,8 +265,8 @@ void CreateDescHeaps()
      * 深度/模板视图
      */
     D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {
-        .NumDescriptors = 1,
         .Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+        .NumDescriptors = 1,
         .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
         .NodeMask = 0
     };
