@@ -31,7 +31,36 @@ private:
 
     void Draw(const GameTimer& gt) override
     {
-        // 4.5 节在这里写：重置命令分配器/命令列表 → 设置视口和裁剪矩形 → 清屏 → 提交 → Present
+        //准备录制
+        ThrowIfFailed(mCommandAllocator->Reset());
+        ThrowIfFailed(mCommandList->Reset(mCommandAllocator.Get(),nullptr));
+        //屏障 Present -> Render_Target
+        auto toRenderTarget = CD3DX12_RESOURCE_BARRIER::Transition(
+            CurrentBackBuffer(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        mCommandList->ResourceBarrier(1, &toRenderTarget); //                   有几个屏障          屏障数组的首地址
+        //视口和裁剪矩形
+        mCommandList->RSSetViewports(1, &mScreenViewport);
+        mCommandList->RSSetScissorRects(1, &mScissorRect);
+        //清屏，绑定渲染目标
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = CurrentBackBufferView();
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv = DepthStencilView();
+
+        mCommandList->ClearRenderTargetView(rtv, Colors::LightSteelBlue, 0, nullptr);
+        mCommandList->ClearDepthStencilView(
+            dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0,
+            nullptr);
+        mCommandList->OMSetRenderTargets(1, &rtv, true, &dsv);
+        //屏障：Render_Target -> Prsent
+        auto toPresent = CD3DX12_RESOURCE_BARRIER::Transition(
+            CurrentBackBuffer(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_PRESENT);
+        mCommandList->ResourceBarrier(1, &toPresent);
+        //结束录制，提交
+        ThrowIfFailed(mCommandList->Close());
+        ID3D12CommandList* cmdLists[]={mCommandList.Get()};
+        mCommandQueue->ExecuteCommandLists(_countof(cmdLists), cmdLists);
+        //显示，然后等GPU
+        ThrowIfFailed(mSwapChain->Present(0,0));
+        FlushCommandQueue();
     }
 };
 

@@ -8,6 +8,7 @@
 #include <wrl/client.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <d3dx12/d3dx12.h>
 
 #include "DxUtil.h"     // ThrowIfFailed
 #include "GameTimer.h"
@@ -62,7 +63,10 @@ protected:
     void UpdateViewportAndScissor();
 
     D3D12_CPU_DESCRIPTOR_HANDLE CurrentBackBufferView() const;
+    ID3D12Resource* CurrentBackBuffer() const;
     D3D12_CPU_DESCRIPTOR_HANDLE DepthStencilView() const;
+    
+    void FlushCommandQueue();
 
 protected:
     inline static D3DApp* mApp = nullptr;
@@ -76,6 +80,7 @@ protected:
     ComPtr<IDXGIFactory4> mDxgiFactory;
     ComPtr<ID3D12Device> mDevice;
     ComPtr<ID3D12Fence1> mFence;
+    UINT64 mCurrentFence = 0;
     UINT mRTVDescriptorSize = 0;
     UINT mDSVDescriptorSize = 0;
     UINT mCSUDescriptorSize = 0;

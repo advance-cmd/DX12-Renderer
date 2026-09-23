@@ -1,7 +1,6 @@
 #include "D3DApp.h"
 
 #include <cassert>
-#include <d3dx12/d3dx12.h>
 
 // 窗口类只认普通函数指针，填不了成员函数，这里转发给当前 App 的 MsgProc
 static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -18,7 +17,10 @@ D3DApp::D3DApp(HINSTANCE hInstance) : mhAppInst(hInstance)
 
 D3DApp::~D3DApp()
 {
-    // 书里在这里先 FlushCommandQueue()，等 GPU 用完资源再释放；等你写了 FlushCommandQueue 再补上
+    if (mCommandQueue != nullptr)
+    {
+        FlushCommandQueue();
+    }
 }
 
 D3DApp* D3DApp::GetApp()
@@ -326,9 +328,30 @@ D3D12_CPU_DESCRIPTOR_HANDLE D3DApp::CurrentBackBufferView() const
         mRTVDescriptorSize);
 }
 
+ID3D12Resource* D3DApp::CurrentBackBuffer() const
+{
+    return mSwapChainBuffer[mSwapChain->GetCurrentBackBufferIndex()].Get();
+}
+
 D3D12_CPU_DESCRIPTOR_HANDLE D3DApp::DepthStencilView() const
 {
     return mDSVDescriptorHeap->GetCPUDescriptorHandleForHeapStart();
+}
+
+void D3DApp::FlushCommandQueue()
+{
+    mCurrentFence++;
+    ThrowIfFailed(mCommandQueue->Signal(mFence.Get(), mCurrentFence));
+    if (mFence->GetCompletedValue() < mCurrentFence)
+    {
+        HANDLE eventHandle = CreateEventEx(nullptr,nullptr,0,EVENT_ALL_ACCESS);
+        
+        // 预约：围栏值到了 mCurrentFence 时，把这个事件设为"有信号"
+        ThrowIfFailed(mFence->SetEventOnCompletion(mCurrentFence,eventHandle));
+        // 线程在这里睡下，直到事件有信号。睡着的时候不占用CPU
+        WaitForSingleObject(eventHandle,INFINITE);
+        CloseHandle(eventHandle);
+    }
 }
 
 void D3DApp::CreateSwapChainRTV()
