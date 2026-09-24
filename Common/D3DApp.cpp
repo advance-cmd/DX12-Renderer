@@ -1,6 +1,7 @@
-#include <format>
 #include "D3DApp.h"
+
 #include <cassert>
+#include <format>
 
 // 窗口类只认普通函数指针，填不了成员函数，这里转发给当前 App 的 MsgProc
 static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -236,7 +237,7 @@ void D3DApp::InitDirect3D()
 }
 
 // 和窗口尺寸有关的资源：RTV、深度缓冲、视口/裁剪矩形
-// 现在只在初始化时调用一次；书 4.5 处理 WM_SIZE 时，窗口大小一变就要重建它们
+// 初始化时调用一次，之后窗口大小一变（WM_SIZE / WM_EXITSIZEMOVE）就再调用一次，全部重建
 void D3DApp::OnResize()
 {
     //等GPU用完旧缓冲
