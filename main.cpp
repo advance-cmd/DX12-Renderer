@@ -61,6 +61,7 @@ private:
         //显示，然后等GPU
         ThrowIfFailed(mSwapChain->Present(0,0));
         FlushCommandQueue();
+        
     }
 };
 

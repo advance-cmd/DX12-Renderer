@@ -6,6 +6,8 @@
 
 #include <windows.h>
 #include <wrl/client.h>
+#include <string>
+
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <d3dx12/d3dx12.h>
@@ -67,6 +69,8 @@ protected:
     D3D12_CPU_DESCRIPTOR_HANDLE DepthStencilView() const;
     
     void FlushCommandQueue();
+    
+    void CalculateFrameStats();
 
 protected:
     inline static D3DApp* mApp = nullptr;
@@ -74,8 +78,12 @@ protected:
     HINSTANCE mhAppInst = nullptr;
     //用于指认所创建主窗口的句柄
     HWND mhMainWnd = nullptr;
+    std::wstring mMainWndCaption = L"LearnDX12";   // 窗口标题的基础文字
 
     GameTimer mTimer;
+    bool mAppPaused = false;    //暂停：失去焦点、最小化、拖动边框时
+    bool mMinmized = false;     //当前是否处于最小化状态
+    bool mResizing = false;     //是否正在拖动边框
 
     ComPtr<IDXGIFactory4> mDxgiFactory;
     ComPtr<ID3D12Device> mDevice;

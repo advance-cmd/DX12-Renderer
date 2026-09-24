@@ -1,11 +1,19 @@
+#include <format>
 #include "D3DApp.h"
-
 #include <cassert>
 
 // 窗口类只认普通函数指针，填不了成员函数，这里转发给当前 App 的 MsgProc
 static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    return D3DApp::GetApp()->MsgProc(hWnd, msg, wParam, lParam);
+    try
+    {
+        return D3DApp::GetApp()->MsgProc(hWnd, msg, wParam, lParam);
+    }catch (DxException& e)
+    {
+        MessageBox(nullptr, e.ToString().c_str(), L"HR Failed", MB_OK | MB_ICONERROR);
+        PostQuitMessage(0);   // 出错了就退出程序
+        return 0;
+    }
 }
 
 D3DApp::D3DApp(HINSTANCE hInstance) : mhAppInst(hInstance)
@@ -58,8 +66,16 @@ int D3DApp::Run()
         else // 没消息：跑游戏逻辑 + 渲染一帧
         {
             mTimer.Tick();
-            Update(mTimer);
-            Draw(mTimer);
+            if (!mAppPaused)
+            {
+                CalculateFrameStats(); // Tick 之后，这样 TotalTime 是这一帧最新的时间
+                Update(mTimer);
+                Draw(mTimer);
+            }
+            else
+            {
+                Sleep(100); //暂停时让出CPU，否则这个空循环会把一个核占满
+            }
         }
     }
 
@@ -76,15 +92,81 @@ LRESULT D3DApp::MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             SendMessage(hWnd, WM_CLOSE, 0, 0);
         }
         return 0;
+
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
+
     case WM_CLOSE:
         if (MessageBox(hWnd, L"确定关闭？", L"提醒", MB_OKCANCEL | MB_ICONQUESTION) == IDOK)
         {
             DestroyWindow(hWnd);
         }
         return 0; // 点了取消就直接返回，窗口保持打开
+
+    case WM_ACTIVATE:
+        //窗口获得或失去焦点
+        if (LOWORD(wParam) == WA_INACTIVE)
+        {
+            mAppPaused = true;
+            mTimer.Stop();
+        }
+        else
+        {
+            mAppPaused = false;
+            mTimer.Start();
+        }
+        return 0;
+
+    case WM_SIZE:
+        //窗口大小改变了
+        mClientHeight = HIWORD(lParam);
+        mClientWidth = LOWORD(lParam);
+        if (mSwapChain == nullptr) //D3D还没初始化完，先只记下尺寸
+            return 0;
+        if (wParam == SIZE_MINIMIZED)
+        {
+            //最小化客户端
+            mAppPaused = true;
+            mMinmized = true;
+        }
+        else if (wParam == SIZE_MAXIMIZED || wParam == SIZE_RESTORED)
+        {
+            if (mMinmized)
+            {
+                //从最小化恢复
+                mAppPaused = false;
+                mMinmized = false;
+            }
+            if (!mResizing)
+            {
+                //正在拖边框时先不重建，松手后统一处理
+                OnResize();
+            }
+        }
+        return 0;
+
+    case WM_ENTERSIZEMOVE:
+        //开始拖动边框或标题栏
+        mAppPaused = true;
+        mResizing = true;
+        mTimer.Stop();
+        return 0;
+
+    case WM_EXITSIZEMOVE:
+        //松开鼠标
+        mAppPaused = false;
+        mResizing = false;
+        mTimer.Start();
+        OnResize();
+        return 0;
+
+    case WM_GETMINMAXINFO:
+        //限制窗口最小尺寸
+        ((MINMAXINFO*)lParam)->ptMinTrackSize.x = 200;
+        ((MINMAXINFO*)lParam)->ptMinTrackSize.y = 200;
+        return 0;
+
     default:
         return DefWindowProc(hWnd, msg, wParam, lParam);
     }
@@ -118,7 +200,7 @@ bool D3DApp::InitMainWindow()
     //把HWND类型作为参数，以此来确定要对哪一个窗口执行相应的操作
     mhMainWnd = CreateWindow(
         L"BasicWndClass",
-        L"Win32Basic",
+        mMainWndCaption.c_str(),
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
@@ -157,6 +239,21 @@ void D3DApp::InitDirect3D()
 // 现在只在初始化时调用一次；书 4.5 处理 WM_SIZE 时，窗口大小一变就要重建它们
 void D3DApp::OnResize()
 {
+    //等GPU用完旧缓冲
+    FlushCommandQueue();
+
+    //释放对旧缓冲有用的所有引用
+    for (UINT i = 0; i < SwapChainBufferCount; i++)
+    {
+        mSwapChainBuffer[i].Reset();
+    }
+    mDepthStencilBuffer.Reset();
+
+    //让交换链按新尺寸重新分配缓冲
+    ThrowIfFailed(mSwapChain->ResizeBuffers(
+        SwapChainBufferCount,mClientWidth,mClientHeight,mBackBufferFormat,0));
+
+    //重建
     CreateSwapChainRTV();
     CreateDepthAndStencil();
     UpdateViewportAndScissor();
@@ -344,13 +441,33 @@ void D3DApp::FlushCommandQueue()
     ThrowIfFailed(mCommandQueue->Signal(mFence.Get(), mCurrentFence));
     if (mFence->GetCompletedValue() < mCurrentFence)
     {
-        HANDLE eventHandle = CreateEventEx(nullptr,nullptr,0,EVENT_ALL_ACCESS);
-        
+        HANDLE eventHandle = CreateEventEx(nullptr, nullptr, 0,EVENT_ALL_ACCESS);
+
         // 预约：围栏值到了 mCurrentFence 时，把这个事件设为"有信号"
         ThrowIfFailed(mFence->SetEventOnCompletion(mCurrentFence,eventHandle));
         // 线程在这里睡下，直到事件有信号。睡着的时候不占用CPU
         WaitForSingleObject(eventHandle,INFINITE);
         CloseHandle(eventHandle);
+    }
+}
+
+void D3DApp::CalculateFrameStats()
+{
+    static int frameCnt = 0; //这一秒内花了几帧
+    static float timeElapsed = 0.0f; //上一次更新标题时的时间点
+
+    frameCnt++;
+    if (mTimer.TotalTime() - timeElapsed >= 1.0f)
+    {
+        float fps = (float)frameCnt; //一秒内画了几帧，就是帧率
+        float mspf = 1000.0f / fps; //平均每帧用了多少毫秒
+
+        std::wstring windowText = std::format(L"{}    fps: {:.0f}    mspf: {:.3f}",
+                                              mMainWndCaption, fps, mspf);
+        SetWindowText(mhMainWnd, windowText.c_str());
+        // 为下一秒做准备
+        frameCnt = 0;
+        timeElapsed += 1.0f;
     }
 }
 
@@ -414,6 +531,6 @@ void D3DApp::CreateDepthAndStencil()
 // 初始化时：只算值，不调 RSSet
 void D3DApp::UpdateViewportAndScissor()
 {
-    mScreenViewport = { 0.0f, 0.0f, (float)mClientWidth, (float)mClientHeight, 0.0f, 1.0f };
-    mScissorRect    = { 0, 0, (LONG)mClientWidth, (LONG)mClientHeight };
+    mScreenViewport = {0.0f, 0.0f, (float)mClientWidth, (float)mClientHeight, 0.0f, 1.0f};
+    mScissorRect = {0, 0, (LONG)mClientWidth, (LONG)mClientHeight};
 }
