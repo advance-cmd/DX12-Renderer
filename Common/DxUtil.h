@@ -64,8 +64,8 @@ ComPtr<ID3D12Resource> CreateDefaultBuffer(
 ComPtr<ID3DBlob> CompileShader(
     const std::wstring& filename,
     const D3D_SHADER_MACRO* defines,
-    const std::wstring& entrypoint,
-    const std::wstring& target);
+    const std::string& entrypoint,
+    const std::string& target);
 
 //将离线编译的Shader加载到应用程序
 ComPtr<ID3DBlob> LoadBinary(const std::wstring& filename);

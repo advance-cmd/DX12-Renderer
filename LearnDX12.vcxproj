@@ -144,7 +144,7 @@
     <ClCompile Include="Common\D3DApp.cpp" />
     <ClCompile Include="Common\DxUtil.cpp" />
     <ClCompile Include="Common\GameTimer.cpp" />
-    <ClCompile Include="HLSL\Triangle.hlsl" />
+    <None Include="HLSL\Triangle.hlsl" />
     <ClCompile Include="main.cpp" />
   </ItemGroup>
   <ItemGroup>
