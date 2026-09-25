@@ -1,3 +1,5 @@
+#include <algorithm>
+
 #include "Common/D3DApp.h"
 
 #include <vector>
@@ -78,11 +80,11 @@ private:
         float z = mRadius * sinf(mPhi) * sinf(mTheta);
         float y = mRadius * cosf(mPhi);
 
-        XMStoreFloat4x4(&mView,XMMatrixLookAtLH(XMVectorSet(x, y, z, 1.0f), XMVectorZero(), XMVectorSet(0, 1, 0, 0)));
+        XMStoreFloat4x4(&mView, XMMatrixLookAtLH(XMVectorSet(x, y, z, 1.0f), XMVectorZero(), XMVectorSet(0, 1, 0, 0)));
         XMStoreFloat4x4(&oc.MVP, XMMatrixTranspose(
-            XMLoadFloat4x4(&mWorld)*
-            XMLoadFloat4x4(&mView)*
-            XMLoadFloat4x4(&mProj))); //把矩阵转置后存进 oc.MVP
+                            XMLoadFloat4x4(&mWorld) *
+                            XMLoadFloat4x4(&mView) *
+                            XMLoadFloat4x4(&mProj))); //把矩阵转置后存进 oc.MVP
         mObjectCB->CopyData(0, oc); //把整个 oc 复制进常量缓冲区的第 0 个元素
     }
 
@@ -152,10 +154,12 @@ private:
     //V
     XMFLOAT4X4 mView = XMFLOAT4X4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
     //P
-    XMFLOAT4X4 mProj = XMFLOAT4X4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1); 
+    XMFLOAT4X4 mProj = XMFLOAT4X4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
     float mTheta = 1.5f * XM_PI; // 绕 y 轴转的角度
     float mPhi = XM_PIDIV4; // 和 +y 轴的夹角
     float mRadius = 5.0f; // 离原点多远
+
+    POINT mLastMousePos = {};
 
     //建一个能放 CBV 的堆
     void BuildDescriptorHeaps()
@@ -339,6 +343,39 @@ protected:
         D3DApp::OnResize(); // 先让基类重建交换链缓冲、RTV、深度缓冲、视口
         XMMATRIX P = XMMatrixPerspectiveFovLH(0.25f * XM_PI, AspectRatio(), 1.0f, 1000.0f);
         XMStoreFloat4x4(&mProj, P);
+    }
+
+    void OnMouseDown(WPARAM btnState, int x, int y) override
+    {
+        mLastMousePos.x = x;
+        mLastMousePos.y = y;
+        SetCapture(mhMainWnd); //按着键拖出窗口以后，鼠标消息仍然发给这个窗口
+    }
+
+    void OnMouseUp(WPARAM btnState, int x, int y) override
+    {
+        ReleaseCapture(); //把鼠标放开
+    }
+
+    void OnMouseMove(WPARAM btnState, int x, int y) override
+    {
+        if ((btnState & MK_LBUTTON) != 0) // 左键：旋转
+        {
+            float dx = XMConvertToRadians(0.25f * static_cast<float>(x - mLastMousePos.x)); // 每像素 0.25°
+            float dy = XMConvertToRadians(0.25f * static_cast<float>(y - mLastMousePos.y));
+            mTheta -= dx;
+            mPhi -= dy;
+            mPhi = std::clamp(mPhi, 0.1f, XM_PI - 0.1f);
+        }
+        else if ((btnState & MK_RBUTTON) != 0) // 右键：缩放
+        {
+            float dx = 0.005f * static_cast<float>(x - mLastMousePos.x); // 每像素 0.005 个单位
+            float dy = 0.005f * static_cast<float>(y - mLastMousePos.y);
+            mRadius -= dx - dy;
+            mRadius = std::clamp(mRadius, 3.0f, 15.0f);
+        }
+        mLastMousePos.x = x; // 这两行必须放在最后
+        mLastMousePos.y = y;
     }
 };
 

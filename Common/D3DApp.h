@@ -45,6 +45,11 @@ protected:
     // 纯虚函数：每个 Demo 自己决定每帧更新什么、画什么
     virtual void Update(const GameTimer& gt) = 0;
     virtual void Draw(const GameTimer& gt) = 0;
+    
+    //鼠标移动
+    virtual void OnMouseDown(WPARAM btnState,int x,int y){}
+    virtual void OnMouseUp(WPARAM btnState,int x,int y){}
+    virtual void OnMouseMove(WPARAM btnState,int x,int y){}
 
 protected:
     //封装初始化Windows应用程序所需的代码

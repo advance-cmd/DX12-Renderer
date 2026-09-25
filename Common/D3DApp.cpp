@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <format>
+#include <windowsx.h>
 
 // 窗口类只认普通函数指针，填不了成员函数，这里转发给当前 App 的 MsgProc
 static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -166,6 +167,22 @@ LRESULT D3DApp::MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         //限制窗口最小尺寸
         ((MINMAXINFO*)lParam)->ptMinTrackSize.x = 200;
         ((MINMAXINFO*)lParam)->ptMinTrackSize.y = 200;
+        return 0;
+        
+    case WM_LBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+        OnMouseDown(wParam,GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam));
+        return 0;
+        
+    case WM_LBUTTONUP:
+    case WM_MBUTTONUP:
+    case WM_RBUTTONUP:
+        OnMouseUp(wParam,GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam));
+        return 0;
+        
+    case WM_MOUSEMOVE:
+        OnMouseMove(wParam,GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam));
         return 0;
 
     default:
