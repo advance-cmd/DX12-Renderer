@@ -81,6 +81,11 @@ ComPtr<ID3DBlob> LoadBinary(const std::wstring& filename)
     return blob;
 }
 
+UINT CalcConstantBufferByteSize(UINT BufferSize)
+{
+    return 255 + BufferSize & ~255;
+}
+
 ComPtr<ID3DBlob> CompileShader(const std::wstring& filename, const D3D_SHADER_MACRO* defines,
                                const std::string& entrypoint, const std::string& target)
 {

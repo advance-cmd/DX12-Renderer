@@ -151,6 +151,7 @@
     <ClInclude Include="Common\D3DApp.h" />
     <ClInclude Include="Common\DxUtil.h" />
     <ClInclude Include="Common\GameTimer.h" />
+    <ClInclude Include="Common\UploadBuffer.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

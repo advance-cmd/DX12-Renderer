@@ -69,3 +69,13 @@ ComPtr<ID3DBlob> CompileShader(
 
 //将离线编译的Shader加载到应用程序
 ComPtr<ID3DBlob> LoadBinary(const std::wstring& filename);
+
+UINT CalcConstantBufferByteSize(UINT BufferSize);
+
+namespace DX_Utils
+{
+    struct SubmeshGeometry
+    {
+        
+    };
+}
