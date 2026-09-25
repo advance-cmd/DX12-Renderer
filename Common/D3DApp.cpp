@@ -472,6 +472,11 @@ void D3DApp::CalculateFrameStats()
     }
 }
 
+float D3DApp::AspectRatio() const
+{
+    return static_cast<float>(mClientWidth)/mClientHeight;
+}
+
 void D3DApp::CreateSwapChainRTV()
 {
     CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHeapHandle(mRTVDescriptorHeap->GetCPUDescriptorHandleForHeapStart());

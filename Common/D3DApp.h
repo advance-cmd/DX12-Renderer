@@ -71,6 +71,7 @@ protected:
     void FlushCommandQueue();
     
     void CalculateFrameStats();
+    float AspectRatio() const;
 
 protected:
     inline static D3DApp* mApp = nullptr;
@@ -115,4 +116,5 @@ protected:
 
     D3D12_VIEWPORT mScreenViewport = {};
     D3D12_RECT     mScissorRect = {};
+    
 };

@@ -28,6 +28,7 @@ struct Vertex
     XMFLOAT3 Pos; //12byte
     XMFLOAT4 Color; //16byte
 };
+
 //HLSL常量
 struct ObjectConstants
 {
@@ -72,9 +73,17 @@ public:
 private:
     void Update(const GameTimer& gt) override
     {
-        XMMATRIX m =XMMatrixScaling(0.5f, 0.5f, 0.5f) * XMMatrixTranslation(0.0f,0.0f,0.5f);
-        XMStoreFloat4x4(&oc.MVP,XMMatrixTranspose(m));  //把矩阵转置后存进 oc.MVP
-        mObjectCB->CopyData(0,oc);  //把整个 oc 复制进常量缓冲区的第 0 个元素
+        // 球坐标转成 xyz（6.11 笔记里有这个公式）
+        float x = mRadius * sinf(mPhi) * cosf(mTheta);
+        float z = mRadius * sinf(mPhi) * sinf(mTheta);
+        float y = mRadius * cosf(mPhi);
+
+        XMStoreFloat4x4(&mView,XMMatrixLookAtLH(XMVectorSet(x, y, z, 1.0f), XMVectorZero(), XMVectorSet(0, 1, 0, 0)));
+        XMStoreFloat4x4(&oc.MVP, XMMatrixTranspose(
+            XMLoadFloat4x4(&mWorld)*
+            XMLoadFloat4x4(&mView)*
+            XMLoadFloat4x4(&mProj))); //把矩阵转置后存进 oc.MVP
+        mObjectCB->CopyData(0, oc); //把整个 oc 复制进常量缓冲区的第 0 个元素
     }
 
     void Draw(const GameTimer& gt) override
@@ -98,11 +107,11 @@ private:
             dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0,
             nullptr);
         mCommandList->OMSetRenderTargets(1, &rtv, true, &dsv);
-        
+
         ID3D12DescriptorHeap* heaps[] = {mCbvHeap.Get()};
-        mCommandList->SetDescriptorHeaps(_countof(heaps), heaps);   //先设置描述符堆
+        mCommandList->SetDescriptorHeaps(_countof(heaps), heaps); //先设置描述符堆
         mCommandList->SetGraphicsRootSignature(mRootSignature.Get()); // 着色器的"参数列表"
-        mCommandList->SetGraphicsRootDescriptorTable(0,mCbvHeap->GetGPUDescriptorHandleForHeapStart()); //再设置描述符表
+        mCommandList->SetGraphicsRootDescriptorTable(0, mCbvHeap->GetGPUDescriptorHandleForHeapStart()); //再设置描述符表
         // 视图是函数返回的临时对象，先存成变量才能取地址（直接 &mBoxGeo->VertexBufferView() 会报 C2102）
         D3D12_VERTEX_BUFFER_VIEW vbv = mBoxGeo->VertexBufferView();
         D3D12_INDEX_BUFFER_VIEW ibv = mBoxGeo->IndexBufferView();
@@ -133,10 +142,20 @@ private:
     ComPtr<ID3DBlob> mPSByteCode; // 像素着色器字节码
     std::vector<D3D12_INPUT_ELEMENT_DESC> mInputLayout; // 输入布局
     ComPtr<ID3D12PipelineState> mPSO;
-    
+
     ComPtr<ID3D12DescriptorHeap> mCbvHeap;
     std::unique_ptr<UploadBuffer<ObjectConstants>> mObjectCB;
     ObjectConstants oc;
+
+    //M
+    XMFLOAT4X4 mWorld = XMFLOAT4X4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
+    //V
+    XMFLOAT4X4 mView = XMFLOAT4X4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
+    //P
+    XMFLOAT4X4 mProj = XMFLOAT4X4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1); 
+    float mTheta = 1.5f * XM_PI; // 绕 y 轴转的角度
+    float mPhi = XM_PIDIV4; // 和 +y 轴的夹角
+    float mRadius = 5.0f; // 离原点多远
 
     //建一个能放 CBV 的堆
     void BuildDescriptorHeaps()
@@ -153,14 +172,14 @@ private:
     //创建缓冲区，在堆里放 CBV
     void BuildConstantBuffers()
     {
-        mObjectCB = std::make_unique<UploadBuffer<ObjectConstants>>(mDevice.Get(),1,true);
+        mObjectCB = std::make_unique<UploadBuffer<ObjectConstants>>(mDevice.Get(), 1, true);
         D3D12_CONSTANT_BUFFER_VIEW_DESC cbvViewDesc = {
             .BufferLocation = mObjectCB->Resource()->GetGPUVirtualAddress(),
             .SizeInBytes = CalcConstantBufferByteSize(sizeof(ObjectConstants)),
         };
-        mDevice->CreateConstantBufferView(&cbvViewDesc,mCbvHeap->GetCPUDescriptorHandleForHeapStart());
+        mDevice->CreateConstantBufferView(&cbvViewDesc, mCbvHeap->GetCPUDescriptorHandleForHeapStart());
     }
-    
+
     void BuildBoxGeometry()
     {
         std::array<Vertex, 8> vertices = {
@@ -194,7 +213,8 @@ private:
             4, 3, 7
         };
         const UINT vbByteSize = (UINT)vertices.size() * sizeof(Vertex);
-        const UINT ibByteSize = (UINT)indices.size() * sizeof(std::uint16_t);   //它和数组的元素类型、IndexFormat = DXGI_FORMAT_R16_UINT 三者一致
+        const UINT ibByteSize = (UINT)indices.size() * sizeof(std::uint16_t);
+        //它和数组的元素类型、IndexFormat = DXGI_FORMAT_R16_UINT 三者一致
 
         mBoxGeo = std::make_unique<DX_Utils::MeshGeometry>();
         mBoxGeo->Name = "boxGeo";
@@ -228,10 +248,10 @@ private:
     void BuildRootSignature()
     {
         CD3DX12_DESCRIPTOR_RANGE cbvTable;
-        cbvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0);   // 1 个 CBV，从 b0 开始
+        cbvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0); // 1 个 CBV，从 b0 开始
         CD3DX12_ROOT_PARAMETER slotRootParameter[1];
         slotRootParameter[0].InitAsDescriptorTable(1, &cbvTable);
-        
+
         CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(
             1,
             slotRootParameter,
@@ -311,6 +331,14 @@ private:
         psoDesc.SampleDesc.Quality = 0;
 
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&mPSO)));
+    }
+
+protected:
+    void OnResize() override
+    {
+        D3DApp::OnResize(); // 先让基类重建交换链缓冲、RTV、深度缓冲、视口
+        XMMATRIX P = XMMatrixPerspectiveFovLH(0.25f * XM_PI, AspectRatio(), 1.0f, 1000.0f);
+        XMStoreFloat4x4(&mProj, P);
     }
 };
 
