@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <d3d12.h>
 #include <string>
+#include <unordered_map>
+#include <DirectXCollision.h>  // DirectX::BoundingBox
 #include <d3dx12/d3dx12_barriers.h>
 #include <d3dx12/d3dx12_core.h>
 #include <d3dx12/d3dx12_resource_helpers.h>
@@ -74,8 +76,66 @@ UINT CalcConstantBufferByteSize(UINT BufferSize);
 
 namespace DX_Utils
 {
+    // 大缓冲区里的一段：一个物体用哪几个索引、顶点编号从哪里开始算（书 6.10）
     struct SubmeshGeometry
     {
-        
+        UINT IndexCount = 0;
+        UINT StartIndexLocation = 0;
+        INT BaseVertexLocation = 0;   // 每个索引读顶点之前先加上它
+
+        // 包围盒，后面的章节才用
+        DirectX::BoundingBox Bounds;
+    };
+
+    // 一对顶点缓冲 + 索引缓冲，外加画里面各个物体要用的参数；多个物体可以挤在同一对缓冲区里
+    struct MeshGeometry
+    {
+        std::string Name;
+
+        // 内存里的副本，以后拾取、碰撞检测时 CPU 要用。顶点和索引的格式由用户定，所以用不带类型的 Blob
+        ComPtr<ID3DBlob> VertexBufferCPU = nullptr;
+        ComPtr<ID3DBlob> IndexBufferCPU = nullptr;
+
+        ComPtr<ID3D12Resource> VertexBufferGPU = nullptr;
+        ComPtr<ID3D12Resource> IndexBufferGPU = nullptr;
+
+        // 上传缓冲区要活到复制命令执行完（Flush 之后），再调用 DisposeUploaders 释放
+        ComPtr<ID3D12Resource> VertexBufferUploader = nullptr;
+        ComPtr<ID3D12Resource> IndexBufferUploader = nullptr;
+
+        // 算两个视图要用的参数
+        UINT VertexByteStride = 0;
+        UINT VertexBufferByteSize = 0;
+        DXGI_FORMAT IndexFormat = DXGI_FORMAT_R16_UINT;
+        UINT IndexBufferByteSize = 0;
+
+        // 名字 → 这个物体在缓冲区里是哪一段，比如 DrawArgs["box"]
+        std::unordered_map<std::string, SubmeshGeometry> DrawArgs;
+
+        // 视图每次调用时现算。返回的是临时对象，要先存成变量才能取地址（C2102）
+        D3D12_VERTEX_BUFFER_VIEW VertexBufferView() const
+        {
+            D3D12_VERTEX_BUFFER_VIEW vbv;
+            vbv.BufferLocation = VertexBufferGPU->GetGPUVirtualAddress();
+            vbv.StrideInBytes = VertexByteStride;
+            vbv.SizeInBytes = VertexBufferByteSize;
+            return vbv;
+        }
+
+        D3D12_INDEX_BUFFER_VIEW IndexBufferView() const
+        {
+            D3D12_INDEX_BUFFER_VIEW ibv;
+            ibv.BufferLocation = IndexBufferGPU->GetGPUVirtualAddress();
+            ibv.Format = IndexFormat;
+            ibv.SizeInBytes = IndexBufferByteSize;
+            return ibv;
+        }
+
+        // 数据复制到默认堆以后，上传缓冲区就没用了
+        void DisposeUploaders()
+        {
+            VertexBufferUploader = nullptr;
+            IndexBufferUploader = nullptr;
+        }
     };
 }

@@ -1,3 +1,10 @@
+
+struct ObjectConstants
+{
+    float4x4 MVP;
+};
+ConstantBuffer<ObjectConstants> gObjConstants :register(b0);
+
 struct VertexIn
 {
     float3 PosL : POSITION; //位置(L=Local，局部空间)
@@ -13,7 +20,7 @@ struct VertexOut
 VertexOut VS(VertexIn vin)
 {
     VertexOut vOut;
-    vOut.PosH = float4(vin.PosL * 0.5f + float3(0.0f, 0.0f, 0.5f), 1.0f);
+    vOut.PosH = mul(float4(vin.PosL, 1.0f), gObjConstants.MVP);
     vOut.Color = vin.Color;
     return vOut;
 }
