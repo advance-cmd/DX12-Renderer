@@ -13,7 +13,7 @@ struct VertexOut
 VertexOut VS(VertexIn vin)
 {
     VertexOut vOut;
-    vOut.PosH = float4(vin.PosL,1.0f);  //w为1
+    vOut.PosH = float4(vin.PosL * 0.5f + float3(0.0f, 0.0f, 0.5f), 1.0f);
     vOut.Color = vin.Color;
     return vOut;
 }

@@ -1,6 +1,8 @@
 #include "Common/D3DApp.h"
 
 #include <vector>
+#include <array>
+#include <cstdint>
 #include <DirectXMath.h>
 #include <DirectXPackedVector.h>
 #include <d3dcompiler.h>    // D3DCompileFromFile，第 6 章编译 HLSL 时才用
@@ -44,7 +46,7 @@ public:
 
         BuildRootSignature();
         BuildShadersAndInputLayout();
-        BuildTriangleGeometry(); // 这里会往命令列表里录制复制命令
+        BuildBoxGeometry(); // 这里会往命令列表里录制复制命令
         BuildPSO(); // 要用到上面三个的结果，所以放在最后
 
         // 提交命令，等 GPU 把复制做完
@@ -55,6 +57,7 @@ public:
 
         // 复制已经完成，中转站可以释放了
         mVertexBufferUploader.Reset();
+        mIndexBufferUploader.Reset();
         return true;
     }
 
@@ -87,8 +90,9 @@ private:
 
         mCommandList->SetGraphicsRootSignature(mRootSignature.Get()); // 着色器的"参数列表"
         mCommandList->IASetVertexBuffers(0, 1, &mVBV); // 顶点从哪读（输入槽 0）
+        mCommandList->IASetIndexBuffer(&mIBV); //索引
         mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST); // 每 3 个顶点组成一个三角形
-        mCommandList->DrawInstanced(3, 1, 0, 0); // 画 3 个顶点，1 个实例
+        mCommandList->DrawIndexedInstanced(36, 1, 0, 0, 0);
 
         //屏障：Render_Target -> Prsent
         auto toPresent = CD3DX12_RESOURCE_BARRIER::Transition(
@@ -104,28 +108,61 @@ private:
     }
 
     ComPtr<ID3D12Resource> mVertexBufferGPU; //默认堆里的顶点缓冲区（真正用来画的）
+    ComPtr<ID3D12Resource> mIndexBufferGPU; //索引缓冲
     ComPtr<ID3D12Resource> mVertexBufferUploader; //上传缓冲区
+    ComPtr<ID3D12Resource> mIndexBufferUploader; //索引上传缓冲区
     D3D12_VERTEX_BUFFER_VIEW mVBV = {}; //顶点缓冲区视图
+    D3D12_INDEX_BUFFER_VIEW mIBV = {}; //索引缓冲区视图
     ComPtr<ID3D12RootSignature> mRootSignature; //根签名
     ComPtr<ID3DBlob> mVSByteCode; // 顶点着色器字节码
     ComPtr<ID3DBlob> mPSByteCode; // 像素着色器字节码
     std::vector<D3D12_INPUT_ELEMENT_DESC> mInputLayout; // 输入布局
     ComPtr<ID3D12PipelineState> mPSO;
 
-    void BuildTriangleGeometry()
+    void BuildBoxGeometry()
     {
-        Vertex vertices[] = {
-            {XMFLOAT3(0.0f, 0.5f, 0.5f), XMFLOAT4(Colors::Red)}, //上
-            {XMFLOAT3(0.5f, -0.5f, 0.5f), XMFLOAT4(Colors::Green)}, //右下
-            {XMFLOAT3(-0.5f, -0.5f, 0.5f), XMFLOAT4(Colors::Blue)}, //左下
+        std::array<Vertex, 8> vertices = {
+            Vertex({XMFLOAT3(-1.0f, -1.0f, -1.0f), XMFLOAT4(Colors::White)}),
+            Vertex({XMFLOAT3(-1.0f, 1.0f, -1.0f), XMFLOAT4(Colors::Black)}),
+            Vertex({XMFLOAT3(1.0f, 1.0f, -1.0f), XMFLOAT4(Colors::Red)}),
+            Vertex({XMFLOAT3(1.0f, -1.0f, -1.0f), XMFLOAT4(Colors::Green)}),
+            Vertex({XMFLOAT3(-1.0f, -1.0f, 1.0f), XMFLOAT4(Colors::Blue)}),
+            Vertex({XMFLOAT3(-1.0f, 1.0f, 1.0f), XMFLOAT4(Colors::Yellow)}),
+            Vertex({XMFLOAT3(1.0f, 1.0f, 1.0f), XMFLOAT4(Colors::Cyan)}),
+            Vertex({XMFLOAT3(1.0f, -1.0f, 1.0f), XMFLOAT4(Colors::Magenta)}),
         };
-        const UINT vbByteSize = sizeof(vertices); //得到整个字节数
-        mVertexBufferGPU = CreateDefaultBuffer(mDevice.Get(), mCommandList.Get(), vertices, vbByteSize,
-                                               mVertexBufferUploader);
-
-        mVBV.BufferLocation = mVertexBufferGPU->GetGPUVirtualAddress(); //缓冲区在显存里的地址
-        mVBV.StrideInBytes = sizeof(Vertex); //每个顶点占多少字节
-        mVBV.SizeInBytes = vbByteSize; //整个缓冲区多大
+        std::array<std::uint16_t, 36> indices = {
+            //前表面
+            0, 1, 2,
+            0, 2, 3,
+            //后表面
+            4, 6, 5,
+            4, 7, 6,
+            //左表面
+            4, 5, 1,
+            4, 1, 0,
+            //右表面
+            3, 2, 6,
+            3, 6, 7,
+            //上表面
+            1, 5, 6,
+            1, 6, 2,
+            //下表面
+            4, 0, 3,
+            4, 3, 7
+        };
+        const UINT vbByteSize = (UINT)vertices.size() * sizeof(Vertex);
+        mVertexBufferGPU = CreateDefaultBuffer(mDevice.Get(), mCommandList.Get(),
+                                               vertices.data(), vbByteSize, mVertexBufferUploader);
+        mVBV.BufferLocation = mVertexBufferGPU->GetGPUVirtualAddress();
+        mVBV.SizeInBytes = vbByteSize;
+        mVBV.StrideInBytes = sizeof(Vertex);
+        const UINT ibByteSize = (UINT)indices.size() * sizeof(std::uint16_t);   //它和数组的元素类型、mIBV.Format = DXGI_FORMAT_R16_UINT 三者一致
+        mIndexBufferGPU = CreateDefaultBuffer(mDevice.Get(), mCommandList.Get(),
+                                              indices.data(), ibByteSize, mIndexBufferUploader);
+        mIBV.BufferLocation = mIndexBufferGPU->GetGPUVirtualAddress();
+        mIBV.SizeInBytes = ibByteSize;
+        mIBV.Format = DXGI_FORMAT_R16_UINT;
     }
 
     void BuildRootSignature()
