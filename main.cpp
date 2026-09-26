@@ -12,6 +12,7 @@
 #include <DirectXColors.h>  // Colors::LightSteelBlue 之类的预定义颜色
 
 #include "Common/UploadBuffer.h"
+#include "Common/DDSTextureLoader.h"
 
 extern "C" {
 __declspec(dllexport) extern const UINT D3D12SDKVersion = 619;
@@ -28,7 +29,7 @@ using namespace DirectX::PackedVector;
 struct Vertex
 {
     XMFLOAT3 Pos; //12byte
-    XMFLOAT4 Color; //16byte
+    XMFLOAT2 TexC;  //8byte
 };
 
 //HLSL常量
@@ -54,8 +55,10 @@ public:
 
         // 框架初始化结束时命令列表是关着的，要录制"复制顶点数据"的命令，先把它打开
         ThrowIfFailed(mCommandList->Reset(mCommandAllocator.Get(), nullptr));
+        LoadTextures();
         BuildDescriptorHeaps(); //先有堆
         BuildConstantBuffers(); //建UploadBuffer，并把CBV写进堆里
+        BuildShaderResourceViews();
         BuildRootSignature();
         BuildShadersAndInputLayout();
         BuildBoxGeometry(); // 这里会往命令列表里录制复制命令
@@ -69,6 +72,7 @@ public:
 
         // 复制已经完成，中转站可以释放了
         mBoxGeo->DisposeUploaders();
+        mCreateTexUploader.Reset();
         return true;
     }
 
@@ -110,10 +114,15 @@ private:
             nullptr);
         mCommandList->OMSetRenderTargets(1, &rtv, true, &dsv);
 
-        ID3D12DescriptorHeap* heaps[] = {mCbvHeap.Get()};
+        ID3D12DescriptorHeap* heaps[] = {mHeap.Get()};
         mCommandList->SetDescriptorHeaps(_countof(heaps), heaps); //先设置描述符堆
         mCommandList->SetGraphicsRootSignature(mRootSignature.Get()); // 着色器的"参数列表"
-        mCommandList->SetGraphicsRootDescriptorTable(0, mCbvHeap->GetGPUDescriptorHandleForHeapStart()); //再设置描述符表
+        mCommandList->SetGraphicsRootDescriptorTable(0, mHeap->GetGPUDescriptorHandleForHeapStart()); //再设置描述符表
+        
+        CD3DX12_GPU_DESCRIPTOR_HANDLE TexGPUHandle(mHeap->GetGPUDescriptorHandleForHeapStart());
+        TexGPUHandle.Offset(1,mCSUDescriptorSize);
+        mCommandList->SetGraphicsRootDescriptorTable(1, TexGPUHandle);
+        
         // 视图是函数返回的临时对象，先存成变量才能取地址（直接 &mBoxGeo->VertexBufferView() 会报 C2102）
         D3D12_VERTEX_BUFFER_VIEW vbv = mBoxGeo->VertexBufferView();
         D3D12_INDEX_BUFFER_VIEW ibv = mBoxGeo->IndexBufferView();
@@ -145,7 +154,7 @@ private:
     std::vector<D3D12_INPUT_ELEMENT_DESC> mInputLayout; // 输入布局
     ComPtr<ID3D12PipelineState> mPSO;
 
-    ComPtr<ID3D12DescriptorHeap> mCbvHeap;
+    ComPtr<ID3D12DescriptorHeap> mHeap;
     std::unique_ptr<UploadBuffer<ObjectConstants>> mObjectCB;
     ObjectConstants oc;
 
@@ -161,16 +170,44 @@ private:
 
     POINT mLastMousePos = {};
 
-    //建一个能放 CBV 的堆
+    ComPtr<ID3D12Resource> mCreateTex;
+    ComPtr<ID3D12Resource> mCreateTexUploader;
+
+    void LoadTextures()
+    {
+        ThrowIfFailed(
+            CreateDDSTextureFromFile12(
+                mDevice.Get(), mCommandList.Get(), L"Textures\\WoodCrate01.dds", mCreateTex, mCreateTexUploader));
+    }
+
+    //建堆
     void BuildDescriptorHeaps()
     {
-        D3D12_DESCRIPTOR_HEAP_DESC cbvHeapDesc = {
+        D3D12_DESCRIPTOR_HEAP_DESC HeapDesc = {
             .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            .NumDescriptors = 1,
+            .NumDescriptors = 2,
             .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, //着色器要从这个堆里读。RTV/DSV 堆不需要着色器访问，所以之前写的是 NONE
             .NodeMask = 0,
         };
-        ThrowIfFailed(mDevice->CreateDescriptorHeap(&cbvHeapDesc,IID_PPV_ARGS(mCbvHeap.GetAddressOf())));
+        ThrowIfFailed(mDevice->CreateDescriptorHeap(&HeapDesc,IID_PPV_ARGS(mHeap.GetAddressOf())));
+    }
+
+    void BuildShaderResourceViews()
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC SRVDesc = {
+            .Format = mCreateTex->GetDesc().Format,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .Texture2D = {
+                .MostDetailedMip = 0,
+                .MipLevels = mCreateTex->GetDesc().MipLevels,
+                .PlaneSlice = 0,
+                .ResourceMinLODClamp = 0.0f,
+            }
+        };
+        CD3DX12_CPU_DESCRIPTOR_HANDLE hDescriptor(mHeap->GetCPUDescriptorHandleForHeapStart());
+        hDescriptor.Offset(1, mCSUDescriptorSize);
+        mDevice->CreateShaderResourceView(mCreateTex.Get(), &SRVDesc, hDescriptor);
     }
 
     //创建缓冲区，在堆里放 CBV
@@ -181,40 +218,54 @@ private:
             .BufferLocation = mObjectCB->Resource()->GetGPUVirtualAddress(),
             .SizeInBytes = CalcConstantBufferByteSize(sizeof(ObjectConstants)),
         };
-        mDevice->CreateConstantBufferView(&cbvViewDesc, mCbvHeap->GetCPUDescriptorHandleForHeapStart());
+        mDevice->CreateConstantBufferView(&cbvViewDesc, mHeap->GetCPUDescriptorHandleForHeapStart());
     }
 
     void BuildBoxGeometry()
     {
-        std::array<Vertex, 8> vertices = {
-            Vertex({XMFLOAT3(-1.0f, -1.0f, -1.0f), XMFLOAT4(Colors::White)}),
-            Vertex({XMFLOAT3(-1.0f, 1.0f, -1.0f), XMFLOAT4(Colors::Black)}),
-            Vertex({XMFLOAT3(1.0f, 1.0f, -1.0f), XMFLOAT4(Colors::Red)}),
-            Vertex({XMFLOAT3(1.0f, -1.0f, -1.0f), XMFLOAT4(Colors::Green)}),
-            Vertex({XMFLOAT3(-1.0f, -1.0f, 1.0f), XMFLOAT4(Colors::Blue)}),
-            Vertex({XMFLOAT3(-1.0f, 1.0f, 1.0f), XMFLOAT4(Colors::Yellow)}),
-            Vertex({XMFLOAT3(1.0f, 1.0f, 1.0f), XMFLOAT4(Colors::Cyan)}),
-            Vertex({XMFLOAT3(1.0f, -1.0f, 1.0f), XMFLOAT4(Colors::Magenta)}),
+        // 24 个顶点：每个面 4 个，各自带 uv（一个角在 3 个面上的 uv 不同，所以不能共用）
+        // 数据来自书上 GeometryGenerator::CreateBox，w2 = h2 = d2 = 1；uv 的 v 轴朝下，左上角是 (0, 0)
+        std::array<Vertex, 24> vertices = {
+            //前表面（z = -1）
+            Vertex({XMFLOAT3(-1.0f, -1.0f, -1.0f), XMFLOAT2(0.0f, 1.0f)}), // 0 左下
+            Vertex({XMFLOAT3(-1.0f, +1.0f, -1.0f), XMFLOAT2(0.0f, 0.0f)}), // 1 左上
+            Vertex({XMFLOAT3(+1.0f, +1.0f, -1.0f), XMFLOAT2(1.0f, 0.0f)}), // 2 右上
+            Vertex({XMFLOAT3(+1.0f, -1.0f, -1.0f), XMFLOAT2(1.0f, 1.0f)}), // 3 右下
+            //后表面（z = +1）
+            Vertex({XMFLOAT3(-1.0f, -1.0f, +1.0f), XMFLOAT2(1.0f, 1.0f)}),
+            Vertex({XMFLOAT3(+1.0f, -1.0f, +1.0f), XMFLOAT2(0.0f, 1.0f)}),
+            Vertex({XMFLOAT3(+1.0f, +1.0f, +1.0f), XMFLOAT2(0.0f, 0.0f)}),
+            Vertex({XMFLOAT3(-1.0f, +1.0f, +1.0f), XMFLOAT2(1.0f, 0.0f)}),
+            //上表面（y = +1）
+            Vertex({XMFLOAT3(-1.0f, +1.0f, -1.0f), XMFLOAT2(0.0f, 1.0f)}),
+            Vertex({XMFLOAT3(-1.0f, +1.0f, +1.0f), XMFLOAT2(0.0f, 0.0f)}),
+            Vertex({XMFLOAT3(+1.0f, +1.0f, +1.0f), XMFLOAT2(1.0f, 0.0f)}),
+            Vertex({XMFLOAT3(+1.0f, +1.0f, -1.0f), XMFLOAT2(1.0f, 1.0f)}),
+            //下表面（y = -1）
+            Vertex({XMFLOAT3(-1.0f, -1.0f, -1.0f), XMFLOAT2(1.0f, 1.0f)}),
+            Vertex({XMFLOAT3(+1.0f, -1.0f, -1.0f), XMFLOAT2(0.0f, 1.0f)}),
+            Vertex({XMFLOAT3(+1.0f, -1.0f, +1.0f), XMFLOAT2(0.0f, 0.0f)}),
+            Vertex({XMFLOAT3(-1.0f, -1.0f, +1.0f), XMFLOAT2(1.0f, 0.0f)}),
+            //左表面（x = -1）
+            Vertex({XMFLOAT3(-1.0f, -1.0f, +1.0f), XMFLOAT2(0.0f, 1.0f)}),
+            Vertex({XMFLOAT3(-1.0f, +1.0f, +1.0f), XMFLOAT2(0.0f, 0.0f)}),
+            Vertex({XMFLOAT3(-1.0f, +1.0f, -1.0f), XMFLOAT2(1.0f, 0.0f)}),
+            Vertex({XMFLOAT3(-1.0f, -1.0f, -1.0f), XMFLOAT2(1.0f, 1.0f)}),
+            //右表面（x = +1）
+            Vertex({XMFLOAT3(+1.0f, -1.0f, -1.0f), XMFLOAT2(0.0f, 1.0f)}),
+            Vertex({XMFLOAT3(+1.0f, +1.0f, -1.0f), XMFLOAT2(0.0f, 0.0f)}),
+            Vertex({XMFLOAT3(+1.0f, +1.0f, +1.0f), XMFLOAT2(1.0f, 0.0f)}),
+            Vertex({XMFLOAT3(+1.0f, -1.0f, +1.0f), XMFLOAT2(1.0f, 1.0f)}),
         };
+        // 每个面的 4 个顶点从外面看都是"左下、左上、右上、右下"，所以索引规律都一样：
+        // 4f, 4f+1, 4f+2,  4f, 4f+2, 4f+3（两个三角形都是顺时针）
         std::array<std::uint16_t, 36> indices = {
-            //前表面
-            0, 1, 2,
-            0, 2, 3,
-            //后表面
-            4, 6, 5,
-            4, 7, 6,
-            //左表面
-            4, 5, 1,
-            4, 1, 0,
-            //右表面
-            3, 2, 6,
-            3, 6, 7,
-            //上表面
-            1, 5, 6,
-            1, 6, 2,
-            //下表面
-            4, 0, 3,
-            4, 3, 7
+            0, 1, 2, 0, 2, 3, //前表面
+            4, 5, 6, 4, 6, 7, //后表面
+            8, 9, 10, 8, 10, 11, //上表面
+            12, 13, 14, 12, 14, 15, //下表面
+            16, 17, 18, 16, 18, 19, //左表面
+            20, 21, 22, 20, 22, 23 //右表面
         };
         const UINT vbByteSize = (UINT)vertices.size() * sizeof(Vertex);
         const UINT ibByteSize = (UINT)indices.size() * sizeof(std::uint16_t);
@@ -251,16 +302,21 @@ private:
 
     void BuildRootSignature()
     {
-        CD3DX12_DESCRIPTOR_RANGE cbvTable;
-        cbvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0); // 1 个 CBV，从 b0 开始
-        CD3DX12_ROOT_PARAMETER slotRootParameter[1];
-        slotRootParameter[0].InitAsDescriptorTable(1, &cbvTable);
+        CD3DX12_ROOT_PARAMETER slotRootParameter[2];
+        CD3DX12_DESCRIPTOR_RANGE cbvRange;
+        cbvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0); // 1 个 CBV，从 b0 开始
+        slotRootParameter[0].InitAsDescriptorTable(1, &cbvRange);
+        CD3DX12_DESCRIPTOR_RANGE srvRange;
+        srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+        slotRootParameter[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
+
+        CD3DX12_STATIC_SAMPLER_DESC sampler_desc(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
 
         CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(
-            1,
+            2,
             slotRootParameter,
-            0,
-            nullptr,
+            1,
+            &sampler_desc,
             D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
 
         //第一步：把描述“序列化”成一段二进制数据
@@ -296,9 +352,9 @@ private:
                 0
             },
             {
-                "COLOR",
+                "TEXCOORD",
                 0,
-                DXGI_FORMAT_R32G32B32A32_FLOAT,
+                DXGI_FORMAT_R32G32_FLOAT,
                 0,
                 12,
                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,

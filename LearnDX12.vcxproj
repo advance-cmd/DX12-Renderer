@@ -142,6 +142,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Common\D3DApp.cpp" />
+    <ClCompile Include="Common\DDSTextureLoader.cpp" />
     <ClCompile Include="Common\DxUtil.cpp" />
     <ClCompile Include="Common\GameTimer.cpp" />
     <None Include="HLSL\Triangle.hlsl" />
@@ -149,9 +150,13 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Common\D3DApp.h" />
+    <ClInclude Include="Common\DDSTextureLoader.h" />
     <ClInclude Include="Common\DxUtil.h" />
     <ClInclude Include="Common\GameTimer.h" />
     <ClInclude Include="Common\UploadBuffer.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="Textures\WoodCrate01.dds" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
