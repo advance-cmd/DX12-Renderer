@@ -1,14 +1,12 @@
-#include <algorithm>
-
 #include "Common/D3DApp.h"
 
+#include <algorithm>
 #include <vector>
 #include <array>
 #include <cstdint>
 #include <memory>
 #include <DirectXMath.h>
-#include <DirectXPackedVector.h>
-#include <d3dcompiler.h>    // D3DCompileFromFile，第 6 章编译 HLSL 时才用
+#include <d3dcompiler.h>    // D3DCompileFromFile：运行时编译 HLSL
 #include <DirectXColors.h>  // Colors::LightSteelBlue 之类的预定义颜色
 
 #include "Common/UploadBuffer.h"
@@ -23,13 +21,12 @@ __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\";
 }
 
 using namespace DirectX;
-using namespace DirectX::PackedVector;
 
 //顶点结构体
 struct Vertex
 {
     XMFLOAT3 Pos; //12byte
-    XMFLOAT2 TexC;  //8byte
+    XMFLOAT2 TexC; //8byte
 };
 
 //HLSL常量
@@ -38,11 +35,12 @@ struct ObjectConstants
     XMFLOAT4X4 MVP; //需要和HLSL的Cbuffer对应
 };
 
-// 第 4 章的 Demo：继承框架，初始化全由 D3DApp 完成，这里只写每帧要做的事
-class InitDirect3DApp : public D3DApp
+// 带纹理的木箱：鼠标拖动绕着它转（左键旋转，右键缩放）
+// 窗口、设备、交换链由 D3DApp 负责，这里只管木箱自己的资源、每帧更新和绘制
+class CrateApp : public D3DApp
 {
 public:
-    InitDirect3DApp(HINSTANCE hInstance) : D3DApp(hInstance)
+    CrateApp(HINSTANCE hInstance) : D3DApp(hInstance)
     {
     }
 
@@ -53,15 +51,15 @@ public:
             return false;
         }
 
-        // 框架初始化结束时命令列表是关着的，要录制"复制顶点数据"的命令，先把它打开
+        // 框架初始化结束时命令列表是关着的；上传纹理和顶点/索引数据要录制复制命令，先把它打开
         ThrowIfFailed(mCommandList->Reset(mCommandAllocator.Get(), nullptr));
-        LoadTextures();
+        LoadTextures(); // 录制复制命令（纹理）
         BuildDescriptorHeaps(); //先有堆
         BuildConstantBuffers(); //建UploadBuffer，并把CBV写进堆里
         BuildShaderResourceViews();
         BuildRootSignature();
         BuildShadersAndInputLayout();
-        BuildBoxGeometry(); // 这里会往命令列表里录制复制命令
+        BuildBoxGeometry(); // 录制复制命令（顶点/索引）
         BuildPSO(); // 要用到上面三个的结果，所以放在最后
 
         // 提交命令，等 GPU 把复制做完
@@ -72,13 +70,17 @@ public:
 
         // 复制已经完成，中转站可以释放了
         mBoxGeo->DisposeUploaders();
-        mCreateTexUploader.Reset();
+        for (auto & it :mTextures)
+        {
+            it.second->UploadHeap.Reset();
+        }
         return true;
     }
 
 private:
     void Update(const GameTimer& gt) override
     {
+        ObjectConstants oc;
         // 球坐标转成 xyz（6.11 笔记里有这个公式）
         float x = mRadius * sinf(mPhi) * cosf(mTheta);
         float z = mRadius * sinf(mPhi) * sinf(mTheta);
@@ -117,12 +119,12 @@ private:
         ID3D12DescriptorHeap* heaps[] = {mHeap.Get()};
         mCommandList->SetDescriptorHeaps(_countof(heaps), heaps); //先设置描述符堆
         mCommandList->SetGraphicsRootSignature(mRootSignature.Get()); // 着色器的"参数列表"
-        mCommandList->SetGraphicsRootDescriptorTable(0, mHeap->GetGPUDescriptorHandleForHeapStart()); //再设置描述符表
-        
+        mCommandList->SetGraphicsRootDescriptorTable(0, mHeap->GetGPUDescriptorHandleForHeapStart()); //设置描述符表 cbv
+
         CD3DX12_GPU_DESCRIPTOR_HANDLE TexGPUHandle(mHeap->GetGPUDescriptorHandleForHeapStart());
-        TexGPUHandle.Offset(1,mCSUDescriptorSize);
-        mCommandList->SetGraphicsRootDescriptorTable(1, TexGPUHandle);
-        
+        TexGPUHandle.Offset(1, mCSUDescriptorSize);
+        mCommandList->SetGraphicsRootDescriptorTable(1, TexGPUHandle); //设置描述符表srv (Tex/Sample)
+
         // 视图是函数返回的临时对象，先存成变量才能取地址（直接 &mBoxGeo->VertexBufferView() 会报 C2102）
         D3D12_VERTEX_BUFFER_VIEW vbv = mBoxGeo->VertexBufferView();
         D3D12_INDEX_BUFFER_VIEW ibv = mBoxGeo->IndexBufferView();
@@ -134,7 +136,7 @@ private:
         const DX_Utils::SubmeshGeometry& box = mBoxGeo->DrawArgs["box"];
         mCommandList->DrawIndexedInstanced(box.IndexCount, 1, box.StartIndexLocation, box.BaseVertexLocation, 0);
 
-        //屏障：Render_Target -> Prsent
+        //屏障：Render_Target -> Present
         auto toPresent = CD3DX12_RESOURCE_BARRIER::Transition(
             CurrentBackBuffer(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
         mCommandList->ResourceBarrier(1, &toPresent);
@@ -156,7 +158,6 @@ private:
 
     ComPtr<ID3D12DescriptorHeap> mHeap;
     std::unique_ptr<UploadBuffer<ObjectConstants>> mObjectCB;
-    ObjectConstants oc;
 
     //M
     XMFLOAT4X4 mWorld = XMFLOAT4X4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
@@ -170,14 +171,16 @@ private:
 
     POINT mLastMousePos = {};
 
-    ComPtr<ID3D12Resource> mCreateTex;
-    ComPtr<ID3D12Resource> mCreateTexUploader;
+    std::unordered_map<std::string, std::unique_ptr<DX_Utils::Texture>> mTextures;
 
     void LoadTextures()
     {
-        ThrowIfFailed(
-            CreateDDSTextureFromFile12(
-                mDevice.Get(), mCommandList.Get(), L"Textures\\WoodCrate01.dds", mCreateTex, mCreateTexUploader));
+        auto Tex = std::make_unique<DX_Utils::Texture>();
+        Tex->Name = "woodCrateTex";
+        Tex->Filename = L"Textures\\WoodCrate01.dds";
+        ThrowIfFailed(CreateDDSTextureFromFile12(mDevice.Get(), mCommandList.Get(), Tex->Filename.c_str(), Tex->Resource,
+                                   Tex->UploadHeap));
+        mTextures[Tex->Name] = std::move(Tex);
     }
 
     //建堆
@@ -194,20 +197,21 @@ private:
 
     void BuildShaderResourceViews()
     {
+        auto& woodTex = mTextures.at("woodCrateTex")->Resource;
         D3D12_SHADER_RESOURCE_VIEW_DESC SRVDesc = {
-            .Format = mCreateTex->GetDesc().Format,
+            .Format = woodTex->GetDesc().Format,
             .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
             .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             .Texture2D = {
                 .MostDetailedMip = 0,
-                .MipLevels = mCreateTex->GetDesc().MipLevels,
+                .MipLevels = woodTex->GetDesc().MipLevels,
                 .PlaneSlice = 0,
                 .ResourceMinLODClamp = 0.0f,
             }
         };
         CD3DX12_CPU_DESCRIPTOR_HANDLE hDescriptor(mHeap->GetCPUDescriptorHandleForHeapStart());
         hDescriptor.Offset(1, mCSUDescriptorSize);
-        mDevice->CreateShaderResourceView(mCreateTex.Get(), &SRVDesc, hDescriptor);
+        mDevice->CreateShaderResourceView(woodTex.Get(), &SRVDesc, hDescriptor);
     }
 
     //创建缓冲区，在堆里放 CBV
@@ -441,7 +445,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, 
     // ThrowIfFailed 失败时会抛 DxException，在这里统一接住，弹窗显示是哪句代码、第几行出的错
     try
     {
-        InitDirect3DApp theApp(hInstance);
+        CrateApp theApp(hInstance);
         if (!theApp.Initialize())
         {
             return 0;

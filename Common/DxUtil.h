@@ -138,4 +138,12 @@ namespace DX_Utils
             IndexBufferUploader = nullptr;
         }
     };
+
+    struct Texture
+    {
+        std::string Name;   //纹理的名字，查 map 时用
+        std::wstring Filename;  //dds 文件路径。注意要用宽字符串，因为 CreateDDSTextureFromFile12 要的是 wchar_t*
+        ComPtr<ID3D12Resource> Resource;    //纹理本体，放在默认堆里
+        ComPtr<ID3D12Resource> UploadHeap;  //上传缓冲区，Flush 之后就可以释放
+    };
 }
