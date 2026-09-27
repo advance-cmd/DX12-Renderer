@@ -1,9 +1,8 @@
 
-struct ObjectConstants
-{
-    float4x4 MVP;
-};
-ConstantBuffer<ObjectConstants> gObjConstants :register(b0);
+struct ObjectConstants { float4x4 World; };
+struct PassConstants   { float4x4 ViewProj; };
+ConstantBuffer<ObjectConstants> gObj  : register(b0);
+ConstantBuffer<PassConstants>   gPass : register(b1);
 
 Texture2D gDiffuseMap : register(t0);
 SamplerState gsamLinearWrap : register(s0);
@@ -23,7 +22,8 @@ struct VertexOut
 VertexOut VS(VertexIn vin)
 {
     VertexOut vOut;
-    vOut.PosH = mul(float4(vin.PosL, 1.0f), gObjConstants.MVP);
+    float4 posW = mul(float4(vin.PosL, 1.0f), gObj.World);   // 局部 → 世界
+    vOut.PosH   = mul(posW, gPass.ViewProj);                // 世界 → 裁剪空间
     vOut.TexC = vin.TexC;
     return vOut;
 }

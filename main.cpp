@@ -30,7 +30,17 @@ struct Vertex
     XMFLOAT2 TexC; //8byte
 };
 
-
+struct RenderItem
+{
+    XMFLOAT4X4 World = XMFLOAT4X4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
+    int NumFramesDirty = gNumFrameResources; // 还有几份帧资源没写过
+    UINT ObjCBIndex = -1; // 在 ObjectCB 里是第几个
+    DX_Utils::MeshGeometry* Geo = nullptr; // 用哪套顶点和索引缓冲
+    D3D12_PRIMITIVE_TOPOLOGY PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    UINT IndexCount = 0; // 下面这 3 个就是 DrawIndexedInstanced 的参数
+    UINT StartIndexLocation = 0;
+    int BaseVertexLocation = 0;
+};
 
 // 带纹理的木箱：鼠标拖动绕着它转（左键旋转，右键缩放）
 // 窗口、设备、交换链由 D3DApp 负责，这里只管木箱自己的资源、每帧更新和绘制
@@ -40,7 +50,7 @@ public:
     CrateApp(HINSTANCE hInstance) : D3DApp(hInstance)
     {
     }
-    
+
     ~CrateApp() override
     {
         if (mCommandQueue != nullptr)
@@ -48,7 +58,7 @@ public:
             FlushCommandQueue();
         }
     }
-    
+
     bool Initialize() override
     {
         if (!D3DApp::Initialize())
@@ -60,11 +70,12 @@ public:
         ThrowIfFailed(mCommandList->Reset(mCommandAllocator.Get(), nullptr));
         LoadTextures(); // 录制复制命令（纹理）
         BuildDescriptorHeaps(); //先有堆
+        BuildBoxGeometry(); // 录制复制命令（顶点/索引）
+        BuildRenderItems();
         BuildFrameResources();
         BuildShaderResourceViews();
         BuildRootSignature();
         BuildShadersAndInputLayout();
-        BuildBoxGeometry(); // 录制复制命令（顶点/索引）
         BuildPSO(); // 要用到上面三个的结果，所以放在最后
 
         // 提交命令，等 GPU 把复制做完
@@ -75,7 +86,7 @@ public:
 
         // 复制已经完成，中转站可以释放了
         mBoxGeo->DisposeUploaders();
-        for (auto & it :mTextures)
+        for (auto& it : mTextures)
         {
             it.second->UploadHeap.Reset();
         }
@@ -87,7 +98,7 @@ private:
     {
         mCurrFrameResourceIndex = (mCurrFrameResourceIndex + 1) % gNumFrameResources;
         mCurrentFrame = mFrameResources[mCurrFrameResourceIndex].get();
-        
+
         if (mCurrentFrame->Fence != 0 && mFence->GetCompletedValue() < mCurrentFrame->Fence)
         {
             HANDLE eventHandle = CreateEventEx(nullptr, nullptr, 0,EVENT_ALL_ACCESS);
@@ -99,19 +110,35 @@ private:
             WaitForSingleObject(eventHandle, INFINITE);
             CloseHandle(eventHandle);
         }
-        
-        ObjectConstants oc;
+
+        UpdateObjectCBs();
+        UpdateMainPassCB();
+    }
+
+    void UpdateObjectCBs()
+    {
+        for (auto& it : mAllItems)
+        {
+            if (it->NumFramesDirty > 0)
+            {
+                ObjectConstants oc;
+                XMStoreFloat4x4(&oc.World, XMMatrixTranspose(XMLoadFloat4x4(&it->World))); //把矩阵转置后存进 oc.World
+                mCurrentFrame->ObjectCB->CopyData(it->ObjCBIndex, oc);
+                it->NumFramesDirty--;
+            }
+        }
+    }
+
+    void UpdateMainPassCB()
+    {
+        PassConstants pc;
         // 球坐标转成 xyz（6.11 笔记里有这个公式）
         float x = mRadius * sinf(mPhi) * cosf(mTheta);
         float z = mRadius * sinf(mPhi) * sinf(mTheta);
         float y = mRadius * cosf(mPhi);
-
         XMStoreFloat4x4(&mView, XMMatrixLookAtLH(XMVectorSet(x, y, z, 1.0f), XMVectorZero(), XMVectorSet(0, 1, 0, 0)));
-        XMStoreFloat4x4(&oc.MVP, XMMatrixTranspose(
-                            XMLoadFloat4x4(&mWorld) *
-                            XMLoadFloat4x4(&mView) *
-                            XMLoadFloat4x4(&mProj))); //把矩阵转置后存进 oc.MVP
-        mCurrentFrame->ObjectCB->CopyData(0, oc);
+        XMStoreFloat4x4(&pc.ViewProj, XMMatrixTranspose(XMLoadFloat4x4(&mView) * XMLoadFloat4x4(&mProj)));
+        mCurrentFrame->PassCB->CopyData(0, pc);
     }
 
     void Draw(const GameTimer& gt) override
@@ -140,21 +167,26 @@ private:
         ID3D12DescriptorHeap* heaps[] = {mHeap.Get()};
         mCommandList->SetDescriptorHeaps(_countof(heaps), heaps); //先设置描述符堆
         mCommandList->SetGraphicsRootSignature(mRootSignature.Get()); // 着色器的"参数列表"
-        mCommandList->SetGraphicsRootConstantBufferView(0, mCurrentFrame->ObjectCB->Resource()->GetGPUVirtualAddress());
+        mCommandList->SetGraphicsRootConstantBufferView(2, mCurrentFrame->PassCB->Resource()->GetGPUVirtualAddress());
 
         CD3DX12_GPU_DESCRIPTOR_HANDLE TexGPUHandle(mHeap->GetGPUDescriptorHandleForHeapStart());
         mCommandList->SetGraphicsRootDescriptorTable(1, TexGPUHandle); //设置描述符表srv (Tex/Sample)
 
-        // 视图是函数返回的临时对象，先存成变量才能取地址（直接 &mBoxGeo->VertexBufferView() 会报 C2102）
-        D3D12_VERTEX_BUFFER_VIEW vbv = mBoxGeo->VertexBufferView();
-        D3D12_INDEX_BUFFER_VIEW ibv = mBoxGeo->IndexBufferView();
-        mCommandList->IASetVertexBuffers(0, 1, &vbv); // 顶点从哪读（输入槽 0）
-        mCommandList->IASetIndexBuffer(&ibv); //索引
-        mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST); // 每 3 个顶点组成一个三角形
+        UINT itemSize = CalcConstantBufferByteSize(sizeof(ObjectConstants));
+        for (auto& ri : mAllItems)
+        {
+            D3D12_VERTEX_BUFFER_VIEW vbv = ri->Geo->VertexBufferView();
+            D3D12_INDEX_BUFFER_VIEW ibv = ri->Geo->IndexBufferView();
+            mCommandList->IASetVertexBuffers(0, 1, &vbv); // 顶点从哪读（输入槽 0）
+            mCommandList->IASetIndexBuffer(&ibv); //索引
+            mCommandList->IASetPrimitiveTopology(ri->PrimitiveType); // 每 3 个顶点组成一个三角形
 
-        // 按名字取出立方体在缓冲区里的那一段
-        const DX_Utils::SubmeshGeometry& box = mBoxGeo->DrawArgs["box"];
-        mCommandList->DrawIndexedInstanced(box.IndexCount, 1, box.StartIndexLocation, box.BaseVertexLocation, 0);
+            auto ConstantAdds = mCurrentFrame->ObjectCB->Resource()->GetGPUVirtualAddress() + ri->ObjCBIndex * itemSize;
+            mCommandList->SetGraphicsRootConstantBufferView(0, ConstantAdds);
+
+            mCommandList->DrawIndexedInstanced(
+                ri->IndexCount, 1, ri->StartIndexLocation, ri->BaseVertexLocation, 0);
+        }
 
         //屏障：Render_Target -> Present
         auto toPresent = CD3DX12_RESOURCE_BARRIER::Transition(
@@ -182,30 +214,59 @@ private:
 
     ComPtr<ID3D12DescriptorHeap> mHeap;
 
-    //M
-    XMFLOAT4X4 mWorld = XMFLOAT4X4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
     //V
     XMFLOAT4X4 mView = XMFLOAT4X4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
     //P
     XMFLOAT4X4 mProj = XMFLOAT4X4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
     float mTheta = 1.5f * XM_PI; // 绕 y 轴转的角度
     float mPhi = XM_PIDIV4; // 和 +y 轴的夹角
-    float mRadius = 5.0f; // 离原点多远
+    float mRadius = 40.0f; // 离原点多远（10×10 的木箱约 30 个单位宽，要离远一点才看得全）
 
     POINT mLastMousePos = {};
 
     std::unordered_map<std::string, std::unique_ptr<DX_Utils::Texture>> mTextures;
-    
-    static constexpr int gNumFrameResources = 3;    //帧资源的份数
+
     std::vector<std::unique_ptr<FrameResource>> mFrameResources;
     FrameResource* mCurrentFrame = nullptr; //当前这一帧用的那一份
     int mCurrFrameResourceIndex = 0;
-    
+
+    std::vector<std::unique_ptr<RenderItem>> mAllItems;
+
+    // 10×10 个木箱铺在 xz 平面上：共用同一个 mBoxGeo，只有 World（位置）和 ObjCBIndex 不同
+    void BuildRenderItems()
+    {
+        const int gridCount = 10;       // 每行、每列几个
+        const float spacing = 3.0f;     // 相邻两个木箱中心的距离（木箱边长是 2）
+        const DX_Utils::SubmeshGeometry& box = mBoxGeo->DrawArgs["box"];
+
+        UINT objCBIndex = 0;
+        for (int i = 0; i < gridCount; i++)
+        {
+            for (int j = 0; j < gridCount; j++)
+            {
+                // 减去 (gridCount - 1) / 2，让整片木箱以原点为中心
+                float x = (i - (gridCount - 1) * 0.5f) * spacing;
+                float z = (j - (gridCount - 1) * 0.5f) * spacing;
+
+                std::unique_ptr<RenderItem> pWoodBox = std::make_unique<RenderItem>();
+                XMStoreFloat4x4(&pWoodBox->World, XMMatrixTranslation(x, 0.0f, z));
+                pWoodBox->ObjCBIndex = objCBIndex++;    // 每个木箱在 ObjectCB 里占自己的一格
+                pWoodBox->Geo = mBoxGeo.get();
+                pWoodBox->IndexCount = box.IndexCount;
+                pWoodBox->BaseVertexLocation = box.BaseVertexLocation;
+                pWoodBox->StartIndexLocation = box.StartIndexLocation;
+                mAllItems.push_back(std::move(pWoodBox));
+            }
+        }
+    }
+
     void BuildFrameResources()
     {
         for (int i = 0; i < gNumFrameResources; i++)
         {
-            mFrameResources.push_back(std::make_unique<FrameResource>(mDevice.Get(),1));    //第二个参数是 1，因为现在只有一个木箱，每份帧资源只需要 1 个常量。
+            // ObjectCB 要给每个渲染项留一格，所以必须在 BuildRenderItems 之后调用
+            mFrameResources.push_back(
+                std::make_unique<FrameResource>(mDevice.Get(), 1, (UINT)mAllItems.size()));
         }
     }
 
@@ -214,8 +275,9 @@ private:
         auto Tex = std::make_unique<DX_Utils::Texture>();
         Tex->Name = "woodCrateTex";
         Tex->Filename = L"Textures\\WoodCrate01.dds";
-        ThrowIfFailed(CreateDDSTextureFromFile12(mDevice.Get(), mCommandList.Get(), Tex->Filename.c_str(), Tex->Resource,
-                                   Tex->UploadHeap));
+        ThrowIfFailed(
+            CreateDDSTextureFromFile12(mDevice.Get(), mCommandList.Get(), Tex->Filename.c_str(), Tex->Resource,
+                Tex->UploadHeap));
         mTextures[Tex->Name] = std::move(Tex);
     }
 
@@ -330,16 +392,17 @@ private:
 
     void BuildRootSignature()
     {
-        CD3DX12_ROOT_PARAMETER slotRootParameter[2];
+        CD3DX12_ROOT_PARAMETER slotRootParameter[3];
         slotRootParameter[0].InitAsConstantBufferView(0);
         CD3DX12_DESCRIPTOR_RANGE srvRange;
         srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
         slotRootParameter[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        slotRootParameter[2].InitAsConstantBufferView(1);
 
         CD3DX12_STATIC_SAMPLER_DESC sampler_desc(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
 
         CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(
-            2,
+            3,
             slotRootParameter,
             1,
             &sampler_desc,
@@ -451,10 +514,10 @@ protected:
         }
         else if ((btnState & MK_RBUTTON) != 0) // 右键：缩放
         {
-            float dx = 0.005f * static_cast<float>(x - mLastMousePos.x); // 每像素 0.005 个单位
-            float dy = 0.005f * static_cast<float>(y - mLastMousePos.y);
+            float dx = 0.05f * static_cast<float>(x - mLastMousePos.x); // 每像素 0.05 个单位（场景变大了，0.005 拉不动）
+            float dy = 0.05f * static_cast<float>(y - mLastMousePos.y);
             mRadius -= dx - dy;
-            mRadius = std::clamp(mRadius, 3.0f, 15.0f);
+            mRadius = std::clamp(mRadius, 3.0f, 80.0f);
         }
         mLastMousePos.x = x; // 这两行必须放在最后
         mLastMousePos.y = y;
