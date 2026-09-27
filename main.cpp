@@ -11,6 +11,7 @@
 
 #include "Common/UploadBuffer.h"
 #include "Common/DDSTextureLoader.h"
+#include "FrameResource.h"
 
 extern "C" {
 __declspec(dllexport) extern const UINT D3D12SDKVersion = 619;
@@ -29,11 +30,7 @@ struct Vertex
     XMFLOAT2 TexC; //8byte
 };
 
-//HLSL常量
-struct ObjectConstants
-{
-    XMFLOAT4X4 MVP; //需要和HLSL的Cbuffer对应
-};
+
 
 // 带纹理的木箱：鼠标拖动绕着它转（左键旋转，右键缩放）
 // 窗口、设备、交换链由 D3DApp 负责，这里只管木箱自己的资源、每帧更新和绘制
@@ -43,7 +40,15 @@ public:
     CrateApp(HINSTANCE hInstance) : D3DApp(hInstance)
     {
     }
-
+    
+    ~CrateApp() override
+    {
+        if (mCommandQueue != nullptr)
+        {
+            FlushCommandQueue();
+        }
+    }
+    
     bool Initialize() override
     {
         if (!D3DApp::Initialize())
@@ -55,7 +60,7 @@ public:
         ThrowIfFailed(mCommandList->Reset(mCommandAllocator.Get(), nullptr));
         LoadTextures(); // 录制复制命令（纹理）
         BuildDescriptorHeaps(); //先有堆
-        BuildConstantBuffers(); //建UploadBuffer，并把CBV写进堆里
+        BuildFrameResources();
         BuildShaderResourceViews();
         BuildRootSignature();
         BuildShadersAndInputLayout();
@@ -80,6 +85,21 @@ public:
 private:
     void Update(const GameTimer& gt) override
     {
+        mCurrFrameResourceIndex = (mCurrFrameResourceIndex + 1) % gNumFrameResources;
+        mCurrentFrame = mFrameResources[mCurrFrameResourceIndex].get();
+        
+        if (mCurrentFrame->Fence != 0 && mFence->GetCompletedValue() < mCurrentFrame->Fence)
+        {
+            HANDLE eventHandle = CreateEventEx(nullptr, nullptr, 0,EVENT_ALL_ACCESS);
+            if (eventHandle == nullptr)
+            {
+                ThrowIfFailed(HRESULT_FROM_WIN32(GetLastError()));
+            }
+            ThrowIfFailed(mFence->SetEventOnCompletion(mCurrentFrame->Fence,eventHandle));
+            WaitForSingleObject(eventHandle, INFINITE);
+            CloseHandle(eventHandle);
+        }
+        
         ObjectConstants oc;
         // 球坐标转成 xyz（6.11 笔记里有这个公式）
         float x = mRadius * sinf(mPhi) * cosf(mTheta);
@@ -91,14 +111,15 @@ private:
                             XMLoadFloat4x4(&mWorld) *
                             XMLoadFloat4x4(&mView) *
                             XMLoadFloat4x4(&mProj))); //把矩阵转置后存进 oc.MVP
-        mObjectCB->CopyData(0, oc); //把整个 oc 复制进常量缓冲区的第 0 个元素
+        mCurrentFrame->ObjectCB->CopyData(0, oc);
     }
 
     void Draw(const GameTimer& gt) override
     {
         //准备录制
-        ThrowIfFailed(mCommandAllocator->Reset());
-        ThrowIfFailed(mCommandList->Reset(mCommandAllocator.Get(),mPSO.Get())); //相当于 Reset 之后立刻设置好这条流水线。
+        ThrowIfFailed(mCurrentFrame->CmdListAlloc->Reset());
+        ThrowIfFailed(
+            mCommandList->Reset(mCurrentFrame->CmdListAlloc.Get(), mPSO.Get()));
         //屏障 Present -> Render_Target
         auto toRenderTarget = CD3DX12_RESOURCE_BARRIER::Transition(
             CurrentBackBuffer(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -119,10 +140,9 @@ private:
         ID3D12DescriptorHeap* heaps[] = {mHeap.Get()};
         mCommandList->SetDescriptorHeaps(_countof(heaps), heaps); //先设置描述符堆
         mCommandList->SetGraphicsRootSignature(mRootSignature.Get()); // 着色器的"参数列表"
-        mCommandList->SetGraphicsRootDescriptorTable(0, mHeap->GetGPUDescriptorHandleForHeapStart()); //设置描述符表 cbv
+        mCommandList->SetGraphicsRootConstantBufferView(0, mCurrentFrame->ObjectCB->Resource()->GetGPUVirtualAddress());
 
         CD3DX12_GPU_DESCRIPTOR_HANDLE TexGPUHandle(mHeap->GetGPUDescriptorHandleForHeapStart());
-        TexGPUHandle.Offset(1, mCSUDescriptorSize);
         mCommandList->SetGraphicsRootDescriptorTable(1, TexGPUHandle); //设置描述符表srv (Tex/Sample)
 
         // 视图是函数返回的临时对象，先存成变量才能取地址（直接 &mBoxGeo->VertexBufferView() 会报 C2102）
@@ -144,9 +164,13 @@ private:
         ThrowIfFailed(mCommandList->Close());
         ID3D12CommandList* cmdLists[] = {mCommandList.Get()};
         mCommandQueue->ExecuteCommandLists(_countof(cmdLists), cmdLists);
-        //显示，然后等GPU
+        //显示；给这份帧资源记下 Fence 值，GPU 执行到这里时 Fence 会变成这个值
         ThrowIfFailed(mSwapChain->Present(0,0));
-        FlushCommandQueue();
+        ++mCurrentFence;
+        mCurrentFrame->Fence = mCurrentFence;
+
+        ThrowIfFailed(
+            mCommandQueue->Signal(mFence.Get(), mCurrentFence));
     }
 
     std::unique_ptr<DX_Utils::MeshGeometry> mBoxGeo; //立方体的顶点/索引缓冲、视图参数和 DrawArgs 都在这里面
@@ -157,7 +181,6 @@ private:
     ComPtr<ID3D12PipelineState> mPSO;
 
     ComPtr<ID3D12DescriptorHeap> mHeap;
-    std::unique_ptr<UploadBuffer<ObjectConstants>> mObjectCB;
 
     //M
     XMFLOAT4X4 mWorld = XMFLOAT4X4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
@@ -172,6 +195,19 @@ private:
     POINT mLastMousePos = {};
 
     std::unordered_map<std::string, std::unique_ptr<DX_Utils::Texture>> mTextures;
+    
+    static constexpr int gNumFrameResources = 3;    //帧资源的份数
+    std::vector<std::unique_ptr<FrameResource>> mFrameResources;
+    FrameResource* mCurrentFrame = nullptr; //当前这一帧用的那一份
+    int mCurrFrameResourceIndex = 0;
+    
+    void BuildFrameResources()
+    {
+        for (int i = 0; i < gNumFrameResources; i++)
+        {
+            mFrameResources.push_back(std::make_unique<FrameResource>(mDevice.Get(),1));    //第二个参数是 1，因为现在只有一个木箱，每份帧资源只需要 1 个常量。
+        }
+    }
 
     void LoadTextures()
     {
@@ -188,7 +224,7 @@ private:
     {
         D3D12_DESCRIPTOR_HEAP_DESC HeapDesc = {
             .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            .NumDescriptors = 2,
+            .NumDescriptors = 1,
             .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, //着色器要从这个堆里读。RTV/DSV 堆不需要着色器访问，所以之前写的是 NONE
             .NodeMask = 0,
         };
@@ -210,19 +246,7 @@ private:
             }
         };
         CD3DX12_CPU_DESCRIPTOR_HANDLE hDescriptor(mHeap->GetCPUDescriptorHandleForHeapStart());
-        hDescriptor.Offset(1, mCSUDescriptorSize);
         mDevice->CreateShaderResourceView(woodTex.Get(), &SRVDesc, hDescriptor);
-    }
-
-    //创建缓冲区，在堆里放 CBV
-    void BuildConstantBuffers()
-    {
-        mObjectCB = std::make_unique<UploadBuffer<ObjectConstants>>(mDevice.Get(), 1, true);
-        D3D12_CONSTANT_BUFFER_VIEW_DESC cbvViewDesc = {
-            .BufferLocation = mObjectCB->Resource()->GetGPUVirtualAddress(),
-            .SizeInBytes = CalcConstantBufferByteSize(sizeof(ObjectConstants)),
-        };
-        mDevice->CreateConstantBufferView(&cbvViewDesc, mHeap->GetCPUDescriptorHandleForHeapStart());
     }
 
     void BuildBoxGeometry()
@@ -307,9 +331,7 @@ private:
     void BuildRootSignature()
     {
         CD3DX12_ROOT_PARAMETER slotRootParameter[2];
-        CD3DX12_DESCRIPTOR_RANGE cbvRange;
-        cbvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0); // 1 个 CBV，从 b0 开始
-        slotRootParameter[0].InitAsDescriptorTable(1, &cbvRange);
+        slotRootParameter[0].InitAsConstantBufferView(0);
         CD3DX12_DESCRIPTOR_RANGE srvRange;
         srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
         slotRootParameter[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);

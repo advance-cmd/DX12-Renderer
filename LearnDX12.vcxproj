@@ -146,6 +146,7 @@
     <ClCompile Include="Common\DxUtil.cpp" />
     <ClCompile Include="Common\GameTimer.cpp" />
     <None Include="HLSL\Triangle.hlsl" />
+    <ClCompile Include="FrameResource.cpp" />
     <ClCompile Include="main.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -154,6 +155,7 @@
     <ClInclude Include="Common\DxUtil.h" />
     <ClInclude Include="Common\GameTimer.h" />
     <ClInclude Include="Common\UploadBuffer.h" />
+    <ClInclude Include="FrameResource.h" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="Textures\WoodCrate01.dds" />
