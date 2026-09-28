@@ -18,5 +18,12 @@
     <ClCompile Include="main.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="Waves.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClInclude Include="Waves.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <None Include="HLSL\Color.hlsl" />
   </ItemGroup>
 </Project>
