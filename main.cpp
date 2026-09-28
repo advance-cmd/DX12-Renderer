@@ -81,7 +81,7 @@ public:
 
         LoadTextures();                 // 录制复制命令（纹理）
         BuildDescriptorHeaps();
-        BuildShapeGeometry();             // 录制复制命令（顶点/索引）
+        BuildShapeGeometry();           // 录制复制命令（顶点/索引）
         BuildRenderItems();             // 要用到几何体
         BuildFrameResources();          // ObjectCB 按渲染项个数建，所以排在 BuildRenderItems 之后
         BuildShaderResourceViews();     // 要用到纹理和堆
@@ -96,7 +96,7 @@ public:
         FlushCommandQueue();
 
         // 复制已经完成，中转站（上传堆）可以释放了
-        mBoxGeo->DisposeUploaders();
+        mShapeGeo->DisposeUploaders();
         for (auto& [name, tex] : mTextures)
         {
             tex->UploadHeap.Reset();
@@ -311,60 +311,82 @@ private:
 
     void BuildShapeGeometry()
     {
-        // 边长 2、中心在原点的盒子：24 个顶点（每面 4 个），36 个索引
+        // 盒子：边长 2、中心在原点，24 个顶点、36 个索引
+        // 地板：32×32、17×17 个顶点，正好盖住 100 个木箱
         GeometryGenerator geoGen;
         GeometryGenerator::MeshData box = geoGen.CreateBox(2.0f, 2.0f, 2.0f);
+        GeometryGenerator::MeshData grid = geoGen.CreateGrid(32.0f, 32.0f, 17, 17);
+
+        // 两个形状前后接在同一对缓冲里：地板排在盒子后面，所以它的起点 = 盒子的顶点数 / 索引数
+        // 偏移量会越加越大，用 UINT，不能用 uint16_t（16 位只限制一个形状内部的索引值）
+        const UINT gridVertexOffset = (UINT)box.Vertices.size();
+        const UINT gridIndexOffset = (UINT)box.Indices32.size();
 
         // GeometryGenerator 的顶点有位置、法线、uv；我们的 Vertex（和输入布局）只有位置和 uv，法线先不要
-        std::vector<Vertex> vertices(box.Vertices.size());
+        std::vector<Vertex> vertices(box.Vertices.size() + grid.Vertices.size());
         for (size_t i = 0; i < box.Vertices.size(); i++)
         {
             vertices[i].Pos = box.Vertices[i].Position;
             vertices[i].TexC = box.Vertices[i].TexC;
         }
+        for (size_t i = 0; i < grid.Vertices.size(); i++)
+        {
+            vertices[gridVertexOffset + i].Pos = grid.Vertices[i].Position;
+            vertices[gridVertexOffset + i].TexC = grid.Vertices[i].TexC;
+        }
 
-        // 顶点不到 65536 个，16 位索引够用
-        const std::vector<std::uint16_t>& indices = box.GetIndices16();
+        // 地板的索引原样接在后面，不用加偏移：画的时候 GPU 会给每个索引加上 BaseVertexLocation
+        // 每个形状各自的顶点都不到 65536 个，16 位索引够用
+        std::vector<std::uint16_t> indices = box.GetIndices16();
+        indices.insert(indices.end(), grid.GetIndices16().begin(), grid.GetIndices16().end());
 
         // 索引的元素类型、这里的 sizeof、IndexFormat = R16_UINT 三者必须一致
         const UINT vbByteSize = (UINT)vertices.size() * sizeof(Vertex);
         const UINT ibByteSize = (UINT)indices.size() * sizeof(std::uint16_t);
 
-        mBoxGeo = std::make_unique<DX_Utils::MeshGeometry>();
-        mBoxGeo->Name = "boxGeo";
+        mShapeGeo = std::make_unique<DX_Utils::MeshGeometry>();
+        mShapeGeo->Name = "shapeGeo";
 
         // 内存里留一份副本（以后拾取、碰撞检测用）
-        ThrowIfFailed(D3DCreateBlob(vbByteSize, &mBoxGeo->VertexBufferCPU));
-        CopyMemory(mBoxGeo->VertexBufferCPU->GetBufferPointer(), vertices.data(), vbByteSize);
-        ThrowIfFailed(D3DCreateBlob(ibByteSize, &mBoxGeo->IndexBufferCPU));
-        CopyMemory(mBoxGeo->IndexBufferCPU->GetBufferPointer(), indices.data(), ibByteSize);
+        ThrowIfFailed(D3DCreateBlob(vbByteSize, &mShapeGeo->VertexBufferCPU));
+        CopyMemory(mShapeGeo->VertexBufferCPU->GetBufferPointer(), vertices.data(), vbByteSize);
+        ThrowIfFailed(D3DCreateBlob(ibByteSize, &mShapeGeo->IndexBufferCPU));
+        CopyMemory(mShapeGeo->IndexBufferCPU->GetBufferPointer(), indices.data(), ibByteSize);
 
-        // 经上传堆复制到默认堆；中转站存在 mBoxGeo 里，Initialize 末尾 Flush 之后再 DisposeUploaders
-        mBoxGeo->VertexBufferGPU = CreateDefaultBuffer(mDevice.Get(), mCommandList.Get(),
-                                                       vertices.data(), vbByteSize, mBoxGeo->VertexBufferUploader);
-        mBoxGeo->IndexBufferGPU = CreateDefaultBuffer(mDevice.Get(), mCommandList.Get(),
-                                                      indices.data(), ibByteSize, mBoxGeo->IndexBufferUploader);
+        // 经上传堆复制到默认堆；中转站存在 mShapeGeo 里，Initialize 末尾 Flush 之后再 DisposeUploaders
+        mShapeGeo->VertexBufferGPU = CreateDefaultBuffer(mDevice.Get(), mCommandList.Get(),
+                                                       vertices.data(), vbByteSize, mShapeGeo->VertexBufferUploader);
+        mShapeGeo->IndexBufferGPU = CreateDefaultBuffer(mDevice.Get(), mCommandList.Get(),
+                                                      indices.data(), ibByteSize, mShapeGeo->IndexBufferUploader);
 
         // 算视图要用的参数，VertexBufferView() / IndexBufferView() 每次调用时现算
-        mBoxGeo->VertexByteStride = sizeof(Vertex);
-        mBoxGeo->VertexBufferByteSize = vbByteSize;
-        mBoxGeo->IndexFormat = DXGI_FORMAT_R16_UINT;
-        mBoxGeo->IndexBufferByteSize = ibByteSize;
+        mShapeGeo->VertexByteStride = sizeof(Vertex);
+        mShapeGeo->VertexBufferByteSize = vbByteSize;
+        mShapeGeo->IndexFormat = DXGI_FORMAT_R16_UINT;
+        mShapeGeo->IndexBufferByteSize = ibByteSize;
 
-        // 缓冲区里只有盒子一个形状，所以从第 0 个索引、第 0 个顶点开始
-        DX_Utils::SubmeshGeometry submesh;
-        submesh.IndexCount = (UINT)indices.size();
-        submesh.StartIndexLocation = 0;
-        submesh.BaseVertexLocation = 0;
-        mBoxGeo->DrawArgs["box"] = submesh;
+        // 每个形状在大缓冲里的位置：画几个索引、从第几个索引开始读、读到的索引再加多少
+        DX_Utils::SubmeshGeometry submesh_Box;
+        submesh_Box.IndexCount = (UINT)box.Indices32.size();
+        submesh_Box.StartIndexLocation = 0;
+        submesh_Box.BaseVertexLocation = 0;
+        mShapeGeo->DrawArgs["box"] = submesh_Box;
+
+        DX_Utils::SubmeshGeometry submesh_Grid;
+        submesh_Grid.IndexCount = (UINT)grid.Indices32.size();
+        submesh_Grid.StartIndexLocation = gridIndexOffset;
+        submesh_Grid.BaseVertexLocation = (INT)gridVertexOffset;
+        mShapeGeo->DrawArgs["grid"] = submesh_Grid;
     }
 
-    // 10×10 个木箱铺在 xz 平面上：共用同一个 mBoxGeo，只有 World（位置）和 ObjCBIndex 不同
+    // 10×10 个木箱铺在 xz 平面上，再加一块地板托住它们。
+    // 所有渲染项共用 mShapeGeo 这一对缓冲，靠 DrawArgs 里的偏移区分画哪个形状
     void BuildRenderItems()
     {
         const int gridCount = 10;       // 每行、每列几个
         const float spacing = 3.0f;     // 相邻两个木箱中心的距离（木箱边长是 2）
-        const DX_Utils::SubmeshGeometry& box = mBoxGeo->DrawArgs["box"];
+        const DX_Utils::SubmeshGeometry& box = mShapeGeo->DrawArgs["box"];
+        const DX_Utils::SubmeshGeometry& grid = mShapeGeo->DrawArgs["grid"];
 
         UINT objCBIndex = 0;
         for (int i = 0; i < gridCount; i++)
@@ -378,13 +400,23 @@ private:
                 auto crate = std::make_unique<RenderItem>();
                 XMStoreFloat4x4(&crate->World, XMMatrixTranslation(x, 0.0f, z));
                 crate->ObjCBIndex = objCBIndex++;   // 每个木箱在 ObjectCB 里占自己的一格
-                crate->Geo = mBoxGeo.get();
+                crate->Geo = mShapeGeo.get();
                 crate->IndexCount = box.IndexCount;
                 crate->StartIndexLocation = box.StartIndexLocation;
                 crate->BaseVertexLocation = box.BaseVertexLocation;
                 mAllItems.push_back(std::move(crate));
             }
         }
+
+        // 地板：木箱中心在 y = 0、边长 2，所以地板下移到 y = -1，正好托住木箱底面
+        auto floor = std::make_unique<RenderItem>();
+        XMStoreFloat4x4(&floor->World, XMMatrixTranslation(0.0f, -1.0f, 0.0f));
+        floor->ObjCBIndex = objCBIndex++;   // 接在 100 个木箱后面，是第 100 格
+        floor->Geo = mShapeGeo.get();
+        floor->IndexCount = grid.IndexCount;
+        floor->StartIndexLocation = grid.StartIndexLocation;
+        floor->BaseVertexLocation = grid.BaseVertexLocation;
+        mAllItems.push_back(std::move(floor));
     }
 
     // 3 份帧资源，每份：1 个 Pass 常量 + 每个渲染项 1 个物体常量
@@ -498,7 +530,7 @@ private:
 
     // 资源：纹理、几何体、渲染项
     std::unordered_map<std::string, std::unique_ptr<DX_Utils::Texture>> mTextures;
-    std::unique_ptr<DX_Utils::MeshGeometry> mBoxGeo;    // 盒子的顶点/索引缓冲、视图参数和 DrawArgs
+    std::unique_ptr<DX_Utils::MeshGeometry> mShapeGeo;  // 盒子 + 地板共用的顶点/索引缓冲、视图参数和 DrawArgs
     std::vector<std::unique_ptr<RenderItem>> mAllItems;
 
     // 帧资源：3 份轮流用，CPU 最多领先 GPU 3 帧
