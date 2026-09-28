@@ -6,10 +6,10 @@
 #include "Common/D3DApp.h"
 #include "Common/UploadBuffer.h"
 #include "Common/DDSTextureLoader.h"
+#include "Common/GeometryGenerator.h"
 #include "FrameResource.h"
 
 #include <algorithm>        // std::clamp
-#include <array>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -81,7 +81,7 @@ public:
 
         LoadTextures();                 // 录制复制命令（纹理）
         BuildDescriptorHeaps();
-        BuildBoxGeometry();             // 录制复制命令（顶点/索引）
+        BuildShapeGeometry();             // 录制复制命令（顶点/索引）
         BuildRenderItems();             // 要用到几何体
         BuildFrameResources();          // ObjectCB 按渲染项个数建，所以排在 BuildRenderItems 之后
         BuildShaderResourceViews();     // 要用到纹理和堆
@@ -309,53 +309,22 @@ private:
         ThrowIfFailed(mDevice->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(mHeap.GetAddressOf())));
     }
 
-    void BuildBoxGeometry()
+    void BuildShapeGeometry()
     {
-        // 24 个顶点：每个面 4 个，各自带 uv（一个角在 3 个面上的 uv 不同，所以不能共用）
-        // 数据来自书上 GeometryGenerator::CreateBox，w2 = h2 = d2 = 1；uv 的 v 轴朝下，左上角是 (0, 0)
-        std::array<Vertex, 24> vertices = {{
-            // 前表面（z = -1）：左下、左上、右上、右下
-            {XMFLOAT3(-1.0f, -1.0f, -1.0f), XMFLOAT2(0.0f, 1.0f)},
-            {XMFLOAT3(-1.0f, +1.0f, -1.0f), XMFLOAT2(0.0f, 0.0f)},
-            {XMFLOAT3(+1.0f, +1.0f, -1.0f), XMFLOAT2(1.0f, 0.0f)},
-            {XMFLOAT3(+1.0f, -1.0f, -1.0f), XMFLOAT2(1.0f, 1.0f)},
-            // 后表面（z = +1）
-            {XMFLOAT3(-1.0f, -1.0f, +1.0f), XMFLOAT2(1.0f, 1.0f)},
-            {XMFLOAT3(+1.0f, -1.0f, +1.0f), XMFLOAT2(0.0f, 1.0f)},
-            {XMFLOAT3(+1.0f, +1.0f, +1.0f), XMFLOAT2(0.0f, 0.0f)},
-            {XMFLOAT3(-1.0f, +1.0f, +1.0f), XMFLOAT2(1.0f, 0.0f)},
-            // 上表面（y = +1）
-            {XMFLOAT3(-1.0f, +1.0f, -1.0f), XMFLOAT2(0.0f, 1.0f)},
-            {XMFLOAT3(-1.0f, +1.0f, +1.0f), XMFLOAT2(0.0f, 0.0f)},
-            {XMFLOAT3(+1.0f, +1.0f, +1.0f), XMFLOAT2(1.0f, 0.0f)},
-            {XMFLOAT3(+1.0f, +1.0f, -1.0f), XMFLOAT2(1.0f, 1.0f)},
-            // 下表面（y = -1）
-            {XMFLOAT3(-1.0f, -1.0f, -1.0f), XMFLOAT2(1.0f, 1.0f)},
-            {XMFLOAT3(+1.0f, -1.0f, -1.0f), XMFLOAT2(0.0f, 1.0f)},
-            {XMFLOAT3(+1.0f, -1.0f, +1.0f), XMFLOAT2(0.0f, 0.0f)},
-            {XMFLOAT3(-1.0f, -1.0f, +1.0f), XMFLOAT2(1.0f, 0.0f)},
-            // 左表面（x = -1）
-            {XMFLOAT3(-1.0f, -1.0f, +1.0f), XMFLOAT2(0.0f, 1.0f)},
-            {XMFLOAT3(-1.0f, +1.0f, +1.0f), XMFLOAT2(0.0f, 0.0f)},
-            {XMFLOAT3(-1.0f, +1.0f, -1.0f), XMFLOAT2(1.0f, 0.0f)},
-            {XMFLOAT3(-1.0f, -1.0f, -1.0f), XMFLOAT2(1.0f, 1.0f)},
-            // 右表面（x = +1）
-            {XMFLOAT3(+1.0f, -1.0f, -1.0f), XMFLOAT2(0.0f, 1.0f)},
-            {XMFLOAT3(+1.0f, +1.0f, -1.0f), XMFLOAT2(0.0f, 0.0f)},
-            {XMFLOAT3(+1.0f, +1.0f, +1.0f), XMFLOAT2(1.0f, 0.0f)},
-            {XMFLOAT3(+1.0f, -1.0f, +1.0f), XMFLOAT2(1.0f, 1.0f)},
-        }};
+        // 边长 2、中心在原点的盒子：24 个顶点（每面 4 个），36 个索引
+        GeometryGenerator geoGen;
+        GeometryGenerator::MeshData box = geoGen.CreateBox(2.0f, 2.0f, 2.0f);
 
-        // 每个面的 4 个顶点从外面看都是"左下、左上、右上、右下"，所以索引规律都一样：
-        // 4f, 4f+1, 4f+2,  4f, 4f+2, 4f+3（两个三角形都是顺时针）
-        std::array<std::uint16_t, 36> indices = {
-            0, 1, 2, 0, 2, 3,           // 前
-            4, 5, 6, 4, 6, 7,           // 后
-            8, 9, 10, 8, 10, 11,        // 上
-            12, 13, 14, 12, 14, 15,     // 下
-            16, 17, 18, 16, 18, 19,     // 左
-            20, 21, 22, 20, 22, 23,     // 右
-        };
+        // GeometryGenerator 的顶点有位置、法线、uv；我们的 Vertex（和输入布局）只有位置和 uv，法线先不要
+        std::vector<Vertex> vertices(box.Vertices.size());
+        for (size_t i = 0; i < box.Vertices.size(); i++)
+        {
+            vertices[i].Pos = box.Vertices[i].Position;
+            vertices[i].TexC = box.Vertices[i].TexC;
+        }
+
+        // 顶点不到 65536 个，16 位索引够用
+        const std::vector<std::uint16_t>& indices = box.GetIndices16();
 
         // 索引的元素类型、这里的 sizeof、IndexFormat = R16_UINT 三者必须一致
         const UINT vbByteSize = (UINT)vertices.size() * sizeof(Vertex);

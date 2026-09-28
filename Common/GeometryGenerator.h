@@ -23,4 +23,8 @@ public:
     
     // width 沿 x，depth 沿 z，m 行 × n 列个顶点，平面在 y = 0 上，中心在原点
     MeshData CreateGrid(float width, float depth, std::uint32_t m, std::uint32_t n);
+
+    // 中心在原点，width 沿 x，height 沿 y，depth 沿 z。24 个顶点（每面 4 个），36 个索引
+    // 书上还有第 4 个参数 numSubdivisions（把每个面再细分），配合 Subdivide 用，暂不需要
+    MeshData CreateBox(float width, float height, float depth);
 };
