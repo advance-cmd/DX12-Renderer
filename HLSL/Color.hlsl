@@ -12,14 +12,6 @@ struct ObjectConstants
     float4x4 World;
     float4x4 WorldInvTranspose;
 };
-struct PassConstants
-{
-    float4x4 ViewProj;
-    float3 EyePosW;
-    float padding;
-    float4 AmbientLight;
-    Light Lights[MaxLights];
-};
 
 ConstantBuffer<ObjectConstants> gObj : register(b0);
 ConstantBuffer<PassConstants> gPass : register(b1);
@@ -52,9 +44,17 @@ VertexOut VS(VertexIn vin)
 float4 PS(VertexOut pin) : SV_Target
 {
     // 没有贴图，材质原样拿来用
+    float4 res=float4(0,0,0,0);
     float3 ambient = gPass.AmbientLight.rgb * gMat.DiffuseAlbedo.rgb;
-    float3 toEye = normalize(gPass.EyePosW - pin.PosW);
+    float3 toEye = gPass.EyePosW - pin.PosW;
+    float distToEye = length(toEye);
+    toEye /= distToEye;
     float3 normal = normalize(pin.NormalW);   // 插值之后长度不一定是 1
     float3 direct = ComputeLighting(gPass.Lights, gMat, pin.PosW, normal, toEye);
-    return float4(ambient + direct, gMat.DiffuseAlbedo.a);
+    
+    res = float4(ambient + direct, gMat.DiffuseAlbedo.a);
+#ifdef FOG
+    res.rgb = ApplyFog(res.rgb, distToEye, gPass.FogColor, gPass.FogStart, gPass.FogRange);
+#endif
+    return res;
 }

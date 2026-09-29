@@ -78,6 +78,7 @@ public:
             FlushCommandQueue();
         }
     }
+
     bool Initialize() override
     {
         if (!D3DApp::Initialize())
@@ -128,7 +129,7 @@ protected:
         D3DApp::OnResize(); // 先让基类重建交换链缓冲、RTV、深度缓冲、视口
 
         // 宽高比变了，投影矩阵要跟着重算
-        mCamera.SetLens(0.25f * XM_PI,AspectRatio(),1.0f,1000.f);
+        mCamera.SetLens(0.25f * XM_PI, AspectRatio(), 1.0f, 1000.f);
     }
 
     // WASD 前后左右，Q 下降、E 上升（沿世界 y 轴，和朝向无关）
@@ -291,7 +292,7 @@ private:
     {
         for (auto& e : mMaterials)
         {
-            Material* mat = e.second.get();   // e.first 是名字 "crate"，e.second 才是 unique_ptr<Material>
+            Material* mat = e.second.get(); // e.first 是名字 "crate"，e.second 才是 unique_ptr<Material>
             if (mat->NumFramesDirty > 0)
             {
                 MaterialConstants mc;
@@ -300,7 +301,7 @@ private:
                 mc.FresnelR0 = mat->FresnelR0;
                 mc.Roughness = mat->Roughness;
                 // 2) CopyData：第几格用 mat->MatCBIndex
-                mCurrentFrame->MaterialCB->CopyData(mat->MatCBIndex,mc);
+                mCurrentFrame->MaterialCB->CopyData(mat->MatCBIndex, mc);
                 // 3) NumFramesDirty--
                 mat->NumFramesDirty--;
             }
@@ -316,7 +317,8 @@ private:
             {
                 ObjectConstants oc;
                 XMStoreFloat4x4(&oc.World, XMMatrixTranspose(XMLoadFloat4x4(&ri->World))); // HLSL 按列主序读，要转置
-                XMStoreFloat4x4(&oc.WorldInvTranspose, XMMatrixInverse(nullptr, XMLoadFloat4x4(&ri->World))); // 只存逆矩阵：逆转置 + 上传前的转置，两次转置抵消
+                XMStoreFloat4x4(&oc.WorldInvTranspose, XMMatrixInverse(nullptr, XMLoadFloat4x4(&ri->World)));
+                // 只存逆矩阵：逆转置 + 上传前的转置，两次转置抵消
                 mCurrentFrame->ObjectCB->CopyData(ri->ObjCBIndex, oc);
                 ri->NumFramesDirty--;
             }
@@ -329,9 +331,12 @@ private:
         mCamera.UpdateViewMatrix();
 
         PassConstants pc = {};
-        XMStoreFloat4x4(&pc.ViewProj, XMMatrixTranspose(mCamera.GetView()*mCamera.GetProj()));
+        XMStoreFloat4x4(&pc.ViewProj, XMMatrixTranspose(mCamera.GetView() * mCamera.GetProj()));
         pc.EyePosW = mCamera.GetPosition3f();
         pc.AmbientLight = {0.25f, 0.25f, 0.35f, 1.0f};
+        pc.FogColor = XMFLOAT4(Colors::LightSteelBlue.f);
+        pc.FogStart = 70.f;
+        pc.FogRange = 120.f;
         /*struct Light
         {
         XMFLOAT3 Strength;
@@ -343,11 +348,11 @@ private:
         XMFLOAT3 Position;
         float SpotPower;
         };*/
-        pc.Lights[0].Strength = {1,1,1};
+        pc.Lights[0].Strength = {1, 1, 1};
         pc.Lights[0].FalloffStart = 5;
         pc.Lights[0].Direction = {0.0f, -0.14834f, -0.98893f}; // 太阳在场景后方、压得很低，朝镜头斜着照过来，水面的镜面反射点才会进入画面
         pc.Lights[0].FalloffEnd = 100;
-        pc.Lights[0].Position = {0,50,0};
+        pc.Lights[0].Position = {0, 50, 0};
         pc.Lights[0].SpotPower = 0.2f;
 
         // Lights[1]：点光源，悬在水面上方，暖白色。FalloffStart 以内全亮，FalloffEnd 以外照不到
@@ -400,7 +405,7 @@ private:
     {
         const UINT objCBByteSize = CalcConstantBufferByteSize(sizeof(ObjectConstants)); // 256 字节对齐
         const D3D12_GPU_VIRTUAL_ADDRESS objCBStart = mCurrentFrame->ObjectCB->Resource()->GetGPUVirtualAddress();
-        
+
         const UINT MatCBByteSize = CalcConstantBufferByteSize(sizeof(MaterialConstants));
         const D3D12_GPU_VIRTUAL_ADDRESS MatCBStart = mCurrentFrame->MaterialCB->Resource()->GetGPUVirtualAddress();
 
@@ -696,7 +701,7 @@ private:
                 mAllItems.push_back(std::move(crate));
             }
         }
-        
+
         //水面
         auto water = std::make_unique<RenderItem>();
         XMStoreFloat4x4(&water->World, XMMatrixIdentity());
@@ -710,7 +715,6 @@ private:
 
         mWavesItem = water.get();
         mAllItems.push_back(std::move(water));
-        
     }
 
     // 3 份帧资源，每份：1 个 Pass 常量 + 每个渲染项 1 个物体常量
@@ -791,7 +795,9 @@ private:
             {"NUM_DIR_LIGHTS", "1"},
             {"NUM_POINT_LIGHTS", "1"},
             {"NUM_SPOT_LIGHTS", "1"},
-            {nullptr, nullptr}};
+            {"FOG", "1"},
+            {nullptr, nullptr}
+        };
         // 用到了 ConstantBuffer<T>，需要 Shader Model 5.1
         mCrateVSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "VS", "vs_5_1");
         mCratePSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "PS", "ps_5_1");
@@ -842,11 +848,13 @@ private:
         psoDesc.PS = {mColorPSByteCode->GetBufferPointer(), mColorPSByteCode->GetBufferSize()};
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&psoDesc,IID_PPV_ARGS(&mColorPSO)));
         D3D12_RENDER_TARGET_BLEND_DESC t = {};
-        t.BlendEnable = true;               // 开常规混合（和 LogicOpEnable 只能开一个）
-        t.SrcBlend  = D3D12_BLEND_SRC_ALPHA;
+        t.BlendEnable = true; // 开常规混合（和 LogicOpEnable 只能开一个）
+        t.SrcBlend = D3D12_BLEND_SRC_ALPHA;
         t.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-        t.BlendOp   = D3D12_BLEND_OP_ADD;
-        t.SrcBlendAlpha = D3D12_BLEND_ONE;  t.DestBlendAlpha = D3D12_BLEND_ZERO;  t.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        t.BlendOp = D3D12_BLEND_OP_ADD;
+        t.SrcBlendAlpha = D3D12_BLEND_ONE;
+        t.DestBlendAlpha = D3D12_BLEND_ZERO;
+        t.BlendOpAlpha = D3D12_BLEND_OP_ADD;
         t.LogicOp = D3D12_LOGIC_OP_NOOP;
         t.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
         psoDesc.BlendState.RenderTarget[0] = t;
@@ -877,7 +885,7 @@ private:
     // 管线：描述符堆、根签名、着色器、输入布局、PSO（两套：木箱一套，陆地/水面共用一套）
     ComPtr<ID3D12DescriptorHeap> mHeap; // 着色器可见的 CBV/SRV/UAV 堆（现在只有 1 个 SRV）
     ComPtr<ID3D12RootSignature> mRootSignature;
-    
+
     ComPtr<ID3D12PipelineState> mCratePSO;
     ComPtr<ID3DBlob> mCrateVSByteCode;
     ComPtr<ID3DBlob> mCratePSByteCode;
@@ -891,7 +899,6 @@ private:
     // 相机：绕原点转的球坐标 (θ, φ, r)
     Camera mCamera;
     POINT mLastMousePos = {};
-    
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, int nShowCmd)

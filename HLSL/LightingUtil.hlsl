@@ -24,6 +24,18 @@ struct MaterialConstants
     float Roughness;
 };
 
+struct PassConstants
+{
+    float4x4 ViewProj;
+    float3 EyePosW;
+    float padding;
+    float4 AmbientLight;
+    float4 FogColor;
+    float FogStart;
+    float FogRange;
+    Light Lights[MaxLights];
+};
+
 // Blinn-Phong：漫反射 + 高光，三种灯共用。各种灯只负责算出
 //   lightStrength：这盏灯到达这个点时的强度（已经乘过衰减、聚光的锥形因子，还没乘夹角余弦）
 //   lightVec：从表面指向灯的单位向量
@@ -118,4 +130,12 @@ float3 ComputeLighting(Light lights[MaxLights], MaterialConstants mat, float3 po
 #endif
 
     return result;
+}
+
+// 线性雾：距离 <= fogStart 不受影响，>= fogStart + fogRange 完全变成雾色，中间线性过渡。
+// 只处理 RGB，alpha 由调用方保留（半透明的水不能被雾改掉透明度）
+float3 ApplyFog(float3 color, float distToEye, float4 fogColor, float fogStart, float fogRange)
+{
+    float s = saturate((distToEye - fogStart) / fogRange);
+    return lerp(color, fogColor.rgb, s);
 }

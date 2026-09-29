@@ -38,6 +38,10 @@ struct PassConstants
     float padding;
 
     XMFLOAT4 AmbientLight;
+    XMFLOAT4 FogColor;
+    float FogStart;
+    float FogRange;
+    XMFLOAT2 FogPad;
     Light Lights[MaxLights];
 };
 
