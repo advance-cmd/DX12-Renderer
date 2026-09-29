@@ -149,6 +149,7 @@
     <None Include="HLSL\Color.hlsl" />
     <ClCompile Include="Common\GeometryGenerator.cpp" />
     <ClCompile Include="FrameResource.cpp" />
+    <None Include="HLSL\LightingUtil.hlsl" />
     <ClCompile Include="Waves.cpp" />
     <ClCompile Include="main.cpp" />
   </ItemGroup>

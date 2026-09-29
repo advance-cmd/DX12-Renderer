@@ -25,13 +25,12 @@ __declspec(dllexport) extern const UINT D3D12SDKVersion = 619;
 __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\";
 }
 
-using namespace DirectX;
-
 // 顶点格式，必须和 BuildShadersAndInputLayout 里的输入布局、HLSL 里的 VertexIn 一致
 struct Vertex
 {
-    XMFLOAT3 Pos; // 偏移 0，12 字节
-    XMFLOAT2 TexC; // 偏移 12，8 字节
+    XMFLOAT3 Pos;
+    XMFLOAT3 Normal;
+    XMFLOAT2 TexC;
 };
 
 // 渲染项：画一个物体需要的全部信息
@@ -56,6 +55,8 @@ struct RenderItem
     // 画这个物体用哪个 PSO。顶点格式和着色器不同，PSO 就不能共用，
     // 所以画之前要按物体切
     ComPtr<ID3D12PipelineState> PSO;
+
+    Material* Mat = nullptr;
 };
 
 class CrateApp : public D3DApp
@@ -94,6 +95,7 @@ public:
         BuildRootSignature(); // PSO 要用根签名
         BuildShadersAndInputLayout(); // PSO 要用着色器和输入布局
         BuildPSO(); // 上面两样都有了才能建 PSO；渲染项要记住用哪个 PSO，所以再排在它前面
+        BuildMaterials(); //FrameResources要用到这个
         BuildRenderItems(); // 要用到几何体 和 PSO
         BuildFrameResources(); // ObjectCB 按渲染项个数、WavesVB 按水面顶点数，所以排在最后
 
@@ -134,7 +136,7 @@ protected:
         WaitForCurrentFrameResource();
         UpdateWaves(gt);
 
-        // 现在这份帧资源归 CPU 了，可以放心往里写
+        UpdateMaterialCBs();
         UpdateObjectCBs();
         UpdateMainPassCB();
     }
@@ -246,6 +248,27 @@ private:
         CloseHandle(eventHandle);
     }
 
+    //材质
+    void UpdateMaterialCBs()
+    {
+        for (auto& e : mMaterials)
+        {
+            Material* mat = e.second.get();   // e.first 是名字 "crate"，e.second 才是 unique_ptr<Material>
+            if (mat->NumFramesDirty > 0)
+            {
+                MaterialConstants mc;
+                // 1) 把 mat 的 3 个字段抄进 mc
+                mc.DiffuseAlbedo = mat->DiffuseAlbedo;
+                mc.FresnelR0 = mat->FresnelR0;
+                mc.Roughness = mat->Roughness;
+                // 2) CopyData：第几格用 mat->MatCBIndex
+                mCurrentFrame->MaterialCB->CopyData(mat->MatCBIndex,mc);
+                // 3) NumFramesDirty--
+                mat->NumFramesDirty--;
+            }
+        }
+    }
+
     // 物体常量：只写还"脏"的渲染项，每写一份帧资源减 1，减到 0 就不再写
     void UpdateObjectCBs()
     {
@@ -255,6 +278,7 @@ private:
             {
                 ObjectConstants oc;
                 XMStoreFloat4x4(&oc.World, XMMatrixTranspose(XMLoadFloat4x4(&ri->World))); // HLSL 按列主序读，要转置
+                XMStoreFloat4x4(&oc.WorldInvTranspose, XMMatrixInverse(nullptr, XMLoadFloat4x4(&ri->World))); // 只存逆矩阵：逆转置 + 上传前的转置，两次转置抵消
                 mCurrentFrame->ObjectCB->CopyData(ri->ObjCBIndex, oc);
                 ri->NumFramesDirty--;
             }
@@ -270,8 +294,27 @@ private:
         float y = mRadius * cosf(mPhi);
         XMStoreFloat4x4(&mView, XMMatrixLookAtLH(XMVectorSet(x, y, z, 1.0f), XMVectorZero(), XMVectorSet(0, 1, 0, 0)));
 
-        PassConstants pc;
+        PassConstants pc = {};
         XMStoreFloat4x4(&pc.ViewProj, XMMatrixTranspose(XMLoadFloat4x4(&mView) * XMLoadFloat4x4(&mProj)));
+        pc.EyePosW = {x, y, z};
+        pc.AmbientLight = {0.25f, 0.25f, 0.35f, 1.0f};
+        /*struct Light
+        {
+        XMFLOAT3 Strength;
+        float FalloffStart;
+
+        XMFLOAT3 Direction;
+        float FalloffEnd;
+
+        XMFLOAT3 Position;
+        float SpotPower;
+        };*/
+        pc.Lights[0].Strength = {1,1,1};
+        pc.Lights[0].FalloffStart = 5;
+        pc.Lights[0].Direction = {-0.57735f, -0.57735f, -0.57735f};
+        pc.Lights[0].FalloffEnd = 100;
+        pc.Lights[0].Position = {0,50,0};
+        pc.Lights[0].SpotPower = 0.2f;
         mCurrentFrame->PassCB->CopyData(0, pc);
     }
 
@@ -295,6 +338,7 @@ private:
         {
             ColorVertex vertex;
             vertex.Pos = mWaves->Position(i);
+            vertex.Normal = mWaves->Normal(i);
             vertex.Color = XMFLOAT4(0.0f, 0.25f, 0.6f, 1.0f);
             mCurrentFrame->WavesVB->CopyData(i, vertex);
         }
@@ -308,6 +352,9 @@ private:
     {
         const UINT objCBByteSize = CalcConstantBufferByteSize(sizeof(ObjectConstants)); // 256 字节对齐
         const D3D12_GPU_VIRTUAL_ADDRESS objCBStart = mCurrentFrame->ObjectCB->Resource()->GetGPUVirtualAddress();
+        
+        const UINT MatCBByteSize = CalcConstantBufferByteSize(sizeof(MaterialConstants));
+        const D3D12_GPU_VIRTUAL_ADDRESS MatCBStart = mCurrentFrame->MaterialCB->Resource()->GetGPUVirtualAddress();
 
         for (auto& ri : mAllItems)
         {
@@ -322,6 +369,8 @@ private:
 
             // 根 CBV 直接给 GPU 地址：ObjectCB 起始地址 + 第几个 × 每个的大小
             mCommandList->SetGraphicsRootConstantBufferView(0, objCBStart + ri->ObjCBIndex * objCBByteSize);
+            //材质CBV绑定
+            mCommandList->SetGraphicsRootConstantBufferView(3, MatCBStart + ri->Mat->MatCBIndex * MatCBByteSize);
 
             mCommandList->DrawIndexedInstanced(ri->IndexCount, 1, ri->StartIndexLocation, ri->BaseVertexLocation, 0);
         }
@@ -358,11 +407,12 @@ private:
         GeometryGenerator geoGen;
         GeometryGenerator::MeshData box = geoGen.CreateBox(2.0f, 2.0f, 2.0f);
 
-        // GeometryGenerator 的顶点有位置、法线、uv；我们的 Vertex（和输入布局）只有位置和 uv，法线先不要
+        // GeometryGenerator 的顶点有位置、法线、uv，我们的 Vertex 也一样，逐个字段拷过来
         std::vector<Vertex> vertices(box.Vertices.size());
         for (size_t i = 0; i < box.Vertices.size(); i++)
         {
             vertices[i].Pos = box.Vertices[i].Position;
+            vertices[i].Normal = box.Vertices[i].Normal;
             vertices[i].TexC = box.Vertices[i].TexC;
         }
 
@@ -416,6 +466,7 @@ private:
             p.y = GetHillsHeight(p.x, p.z); // 把平的网格变成起伏的丘陵
 
             vertices[i].Pos = p;
+            vertices[i].Normal = GetHillsNormal(vertices[i].Pos.x, vertices[i].Pos.z);
             // 按高度分带上色：沙滩 → 草绿 → 深绿 → 土黄 → 雪白
             if (p.y < -10.0f) vertices[i].Color = XMFLOAT4(1.0f, 0.96f, 0.62f, 1.0f);
             else if (p.y < 5.0f) vertices[i].Color = XMFLOAT4(0.48f, 0.77f, 0.46f, 1.0f);
@@ -523,6 +574,35 @@ private:
         return n;
     }
 
+    void BuildMaterials()
+    {
+        std::unique_ptr<Material> LMaterial_crate = std::make_unique<Material>();
+        std::unique_ptr<Material> LMaterial_grass = std::make_unique<Material>();
+        std::unique_ptr<Material> LMaterial_water = std::make_unique<Material>();
+
+        LMaterial_crate->Name = "crate";
+        LMaterial_crate->MatCBIndex = 0;
+        LMaterial_crate->DiffuseAlbedo = {1, 1, 1, 1};
+        LMaterial_crate->FresnelR0 = {0.05f, 0.05f, 0.05f};
+        LMaterial_crate->Roughness = 0.2f;
+
+        LMaterial_grass->Name = "grass";
+        LMaterial_grass->MatCBIndex = 1;
+        LMaterial_grass->DiffuseAlbedo = {0.2f, 0.6f, 0.2f, 1};
+        LMaterial_grass->FresnelR0 = {0.01f, 0.01f, 0.01f};
+        LMaterial_grass->Roughness = 0.125f;
+
+        LMaterial_water->Name = "water";
+        LMaterial_water->MatCBIndex = 2;
+        LMaterial_water->DiffuseAlbedo = {0.0f, 0.2f, 0.6f, 1};
+        LMaterial_water->FresnelR0 = {0.1f, 0.1f, 0.1f};
+        LMaterial_water->Roughness = 0;
+
+        mMaterials[LMaterial_crate->Name] = std::move(LMaterial_crate);
+        mMaterials[LMaterial_grass->Name] = std::move(LMaterial_grass);
+        mMaterials[LMaterial_water->Name] = std::move(LMaterial_water);
+    }
+
     // 只放木箱和陆地两种渲染项（水面在第 5 步加进来）。
     // 木箱和陆地各用一对顶点/索引缓冲、各用一套 PSO
     void BuildRenderItems()
@@ -538,6 +618,7 @@ private:
         water->IndexCount = mWaterGeo->DrawArgs["grid"].IndexCount;
         water->StartIndexLocation = mWaterGeo->DrawArgs["grid"].StartIndexLocation;
         water->BaseVertexLocation = mWaterGeo->DrawArgs["grid"].BaseVertexLocation;
+        water->Mat = mMaterials.at("water").get();
 
         mWavesItem = water.get();
         mAllItems.push_back(std::move(water));
@@ -552,6 +633,7 @@ private:
         land->IndexCount = mLandGeo->DrawArgs["grid"].IndexCount;
         land->StartIndexLocation = mLandGeo->DrawArgs["grid"].StartIndexLocation;
         land->BaseVertexLocation = mLandGeo->DrawArgs["grid"].BaseVertexLocation;
+        land->Mat = mMaterials.at("grass").get();
         mAllItems.push_back(std::move(land));
 
         // 10×10 个木箱铺在 xz 平面上，顺带当尺度参照物
@@ -576,6 +658,7 @@ private:
                 crate->IndexCount = box.IndexCount;
                 crate->StartIndexLocation = box.StartIndexLocation;
                 crate->BaseVertexLocation = box.BaseVertexLocation;
+                crate->Mat = mMaterials.at("crate").get();
                 mAllItems.push_back(std::move(crate));
             }
         }
@@ -591,7 +674,8 @@ private:
                     mDevice.Get(),
                     1,
                     (UINT)mAllItems.size(),
-                    (UINT)mWaves->VertexCount()));
+                    (UINT)mWaves->VertexCount(),
+                    (UINT)mMaterials.size()));
         }
     }
 
@@ -623,10 +707,11 @@ private:
         CD3DX12_DESCRIPTOR_RANGE srvRange;
         srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // 1 个 SRV，从 t0 开始
 
-        CD3DX12_ROOT_PARAMETER slotRootParameter[3];
+        CD3DX12_ROOT_PARAMETER slotRootParameter[4];
         slotRootParameter[0].InitAsConstantBufferView(0);
         slotRootParameter[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
         slotRootParameter[2].InitAsConstantBufferView(1);
+        slotRootParameter[3].InitAsConstantBufferView(2);
 
         CD3DX12_STATIC_SAMPLER_DESC linearWrap(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
 
@@ -658,7 +743,8 @@ private:
         // 语义名, 语义索引, 格式, 输入槽, 在顶点里的字节偏移, 按顶点/按实例, 实例步进
         mCrateInputLayout = {
             {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-            {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+            {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         };
         // 陆地和水面用另一对着色器：除了变换，直接把顶点色输出
         mColorVSByteCode = CompileShader(L"HLSL\\Color.hlsl", nullptr, "VS", "vs_5_1");
@@ -667,7 +753,8 @@ private:
         // 输入布局必须和顶点结构体、以及对应的 HLSL VertexIn 三者对齐
         mColorInputLayout = {
             {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-            {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+            {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+            {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         };
     }
 
@@ -705,6 +792,8 @@ private:
 
     // 资源：纹理、几何体、渲染项
     std::unordered_map<std::string, std::unique_ptr<DX_Utils::Texture>> mTextures;
+    // 材质
+    std::unordered_map<std::string, std::unique_ptr<Material>> mMaterials;
     // 木箱：位置 + 贴图坐标，静态数据，放在默认堆里
     std::unique_ptr<DX_Utils::MeshGeometry> mShapeGeo;
     // 陆地：位置 + 顶点色，静态数据，放在默认堆里
@@ -756,6 +845,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, 
     catch (DxException& e)
     {
         MessageBox(nullptr, e.ToString().c_str(), L"HR Failed", MB_OK | MB_ICONERROR);
+        return 0;
+    }
+    catch (const std::exception& e)
+    {
+        MessageBoxA(nullptr, e.what(), "Exception", MB_OK);
         return 0;
     }
 }
