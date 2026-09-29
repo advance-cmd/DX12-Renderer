@@ -49,9 +49,12 @@ public:
     DirectX::XMFLOAT4X4 GetView4x4f() const;
     DirectX::XMFLOAT4X4 GetProj4x4f() const;
 
-    // 沿右向量左右平移 / 沿前向量前后走 d 个单位
+    // 沿右向量左右平移 / 沿前向量前后走，走的距离 = d × 移速（d 一般传 DeltaTime，移速就是每秒几个单位）
     void Strafe(float d);
     void Walk(float d);
+
+    // 沿世界 y 轴升降（d 为负就下降），和朝向无关：低着头按 E 也是笔直往上（UE 编辑器视口 Q / E 的手感）
+    void Ascend(float d);
 
     // 抬头低头：绕自己的右向量转；左右转头：绕世界 y 轴转（地平线保持水平）
     void Pitch(float angle);
@@ -59,6 +62,10 @@ public:
 
     // 改过位置或朝向后调一次，重建观察矩阵（没改过就什么都不做）
     void UpdateViewMatrix();
+    
+    // 移速（单位 / 秒）：Walk、Strafe、Ascend 走的距离都会乘上它
+    void SetMoveSpeed(float speed);
+    float GetMoveSpeed() const;
 
 private:
     // 摄像机坐标系（世界坐标）
@@ -81,4 +88,6 @@ private:
     // 单位矩阵（书上用 MathHelper::Identity4x4()，我们的项目里没有 MathHelper）
     DirectX::XMFLOAT4X4 mView = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     DirectX::XMFLOAT4X4 mProj = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    
+    float MoveSpeed = 1.0f;
 };

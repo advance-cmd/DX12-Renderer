@@ -99,7 +99,7 @@ XMFLOAT4X4 Camera::GetProj4x4f() const { return mProj; }
 void Camera::Strafe(float d)
 {
     // mPosition += d * mRight
-    XMVECTOR s = XMVectorReplicate(d);
+    XMVECTOR s = XMVectorReplicate(d*MoveSpeed);
     XMStoreFloat3(&mPosition, XMVectorMultiplyAdd(s, XMLoadFloat3(&mRight), XMLoadFloat3(&mPosition)));
     mViewDirty = true;
 }
@@ -107,8 +107,15 @@ void Camera::Strafe(float d)
 void Camera::Walk(float d)
 {
     // mPosition += d * mLook
-    XMVECTOR s = XMVectorReplicate(d);
+    XMVECTOR s = XMVectorReplicate(d*MoveSpeed);
     XMStoreFloat3(&mPosition, XMVectorMultiplyAdd(s, XMLoadFloat3(&mLook), XMLoadFloat3(&mPosition)));
+    mViewDirty = true;
+}
+
+void Camera::Ascend(float d)
+{
+    // 世界的"上"永远是 (0, 1, 0)，所以只改 y，不用管摄像机的三根轴
+    mPosition.y += d * MoveSpeed;
     mViewDirty = true;
 }
 
@@ -137,13 +144,12 @@ void Camera::UpdateViewMatrix()
         return;
 
     XMVECTOR R = XMLoadFloat3(&mRight);
-    XMVECTOR U = XMLoadFloat3(&mUp);
     XMVECTOR L = XMLoadFloat3(&mLook);
     XMVECTOR P = XMLoadFloat3(&mPosition);
 
     // 一直转来转去，浮点误差会让三根轴慢慢不垂直、不是单位长度，每次都拉回来
     L = XMVector3Normalize(L);
-    U = XMVector3Normalize(XMVector3Cross(L, R));
+    XMVECTOR U = XMVector3Normalize(XMVector3Cross(L, R));
     R = XMVector3Cross(U, L);   // U、L 已经是互相垂直的单位向量，不用再归一化
 
     XMStoreFloat3(&mRight, R);
@@ -162,3 +168,10 @@ void Camera::UpdateViewMatrix()
 
     mViewDirty = false;
 }
+
+void Camera::SetMoveSpeed(float speed)
+{
+    MoveSpeed = speed;
+}
+
+float Camera::GetMoveSpeed() const { return MoveSpeed; }

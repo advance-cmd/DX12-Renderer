@@ -50,6 +50,8 @@ protected:
     virtual void OnMouseDown(WPARAM btnState,int x,int y){}
     virtual void OnMouseUp(WPARAM btnState,int x,int y){}
     virtual void OnMouseMove(WPARAM btnState,int x,int y){}
+    // 滚轮：往前滚 delta 为正。普通滚轮一格 = WHEEL_DELTA（120），高精度滚轮一次可能只有几十
+    virtual void OnMouseWheel(int delta){}
 
 protected:
     //封装初始化Windows应用程序所需的代码

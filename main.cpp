@@ -7,10 +7,13 @@
 #include "Common/UploadBuffer.h"
 #include "Common/DDSTextureLoader.h"
 #include "Common/GeometryGenerator.h"
+#include "Common/Camera.h"
 #include "FrameResource.h"
 #include "Waves.h"
 
 #include <algorithm>        // std::clamp
+#include <cmath>            // powf
+#include <format>           // std::format：窗口标题里显示移速
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -75,7 +78,6 @@ public:
             FlushCommandQueue();
         }
     }
-
     bool Initialize() override
     {
         if (!D3DApp::Initialize())
@@ -85,7 +87,7 @@ public:
 
         // 框架初始化结束时命令列表是关着的；上传纹理和顶点/索引数据要录制复制命令，先把它打开
         ThrowIfFailed(mCommandList->Reset(mCommandAllocator.Get(), nullptr));
-
+        mCamera.SetMoveSpeed(5.f);
         LoadTextures(); // 录制复制命令（纹理）
         BuildDescriptorHeaps();
         BuildShapeGeometry(); // 录制复制命令（木箱）
@@ -124,8 +126,31 @@ protected:
         D3DApp::OnResize(); // 先让基类重建交换链缓冲、RTV、深度缓冲、视口
 
         // 宽高比变了，投影矩阵要跟着重算
-        XMMATRIX P = XMMatrixPerspectiveFovLH(0.25f * XM_PI, AspectRatio(), 1.0f, 1000.0f);
-        XMStoreFloat4x4(&mProj, P);
+        mCamera.SetLens(0.25f * XM_PI,AspectRatio(),1.0f,1000.f);
+    }
+
+    void OnKeyboardInput(const GameTimer& gt)
+    {
+        if (GetAsyncKeyState('W') & 0x8000)
+        {
+            mCamera.Walk(gt.DeltaTime());
+        }else if (GetAsyncKeyState('S') & 0x8000)
+        {
+            mCamera.Walk(-gt.DeltaTime());
+        }else if (GetAsyncKeyState('D') & 0x8000)
+        {
+            mCamera.Strafe(gt.DeltaTime());
+        }else if (GetAsyncKeyState('A') & 0x8000)
+        {
+            mCamera.Strafe(-gt.DeltaTime());
+        }
+
+        // Q 下降、E 上升：沿世界 y 轴，和朝向无关。
+        // 单独写 if、不接在上面的 else if 后面，这样能和 WASD 同时按（比如 W + E 斜着往上飞）
+        if (GetAsyncKeyState('E') & 0x8000)
+            mCamera.Ascend(gt.DeltaTime());
+        if (GetAsyncKeyState('Q') & 0x8000)
+            mCamera.Ascend(-gt.DeltaTime());
     }
 
     void Update(const GameTimer& gt) override
@@ -139,6 +164,7 @@ protected:
         UpdateMaterialCBs();
         UpdateObjectCBs();
         UpdateMainPassCB();
+        OnKeyboardInput(gt);
     }
 
     void Draw(const GameTimer& gt) override
@@ -210,20 +236,23 @@ protected:
         {
             float dx = XMConvertToRadians(0.25f * static_cast<float>(x - mLastMousePos.x));
             float dy = XMConvertToRadians(0.25f * static_cast<float>(y - mLastMousePos.y));
-            mTheta -= dx;
-            mPhi -= dy;
-            mPhi = std::clamp(mPhi, 0.1f, XM_PI - 0.1f); // 不能转到正上方/正下方，否则 LookAt 的 up 向量失效
-        }
-        else if ((btnState & MK_RBUTTON) != 0) // 右键：缩放，每像素 0.05 个单位
-        {
-            float dx = 0.05f * static_cast<float>(x - mLastMousePos.x);
-            float dy = 0.05f * static_cast<float>(y - mLastMousePos.y);
-            mRadius -= dx - dy;
-            mRadius = std::clamp(mRadius, 3.0f, 80.0f);
+            mCamera.Pitch(dy);
+            mCamera.RotateY(dx);
         }
         // 必须放在最后：下一次 MouseMove 要用这次的位置算差值
         mLastMousePos.x = x;
         mLastMousePos.y = y;
+    }
+
+    // 滚轮调移速：往前滚一格 ×1.25，往后滚一格 ÷1.25。
+    // 按倍数而不是按加减调：慢的时候每格变化小、调得细，快的时候每格变化大、调得快
+    void OnMouseWheel(int delta) override
+    {
+        float speed = mCamera.GetMoveSpeed() * powf(1.25f, delta / static_cast<float>(WHEEL_DELTA));
+        speed = std::clamp(speed, 0.5f, 200.0f);
+        mCamera.SetMoveSpeed(speed);
+        // 基类每秒刷新一次标题（CalculateFrameStats），会把这段文字带上
+        mMainWndCaption = std::format(L"LearnDX12    移速 {:.1f}", speed);
     }
 
 private:
@@ -288,15 +317,11 @@ private:
     // Pass 常量：相机每帧都可能动，所以每帧都写
     void UpdateMainPassCB()
     {
-        // 球坐标 → 相机位置（6.11 笔记里有这个公式），看向原点
-        float x = mRadius * sinf(mPhi) * cosf(mTheta);
-        float z = mRadius * sinf(mPhi) * sinf(mTheta);
-        float y = mRadius * cosf(mPhi);
-        XMStoreFloat4x4(&mView, XMMatrixLookAtLH(XMVectorSet(x, y, z, 1.0f), XMVectorZero(), XMVectorSet(0, 1, 0, 0)));
+        mCamera.UpdateViewMatrix();
 
         PassConstants pc = {};
-        XMStoreFloat4x4(&pc.ViewProj, XMMatrixTranspose(XMLoadFloat4x4(&mView) * XMLoadFloat4x4(&mProj)));
-        pc.EyePosW = {x, y, z};
+        XMStoreFloat4x4(&pc.ViewProj, XMMatrixTranspose(mCamera.GetView()*mCamera.GetProj()));
+        pc.EyePosW = mCamera.GetPosition3f();
         pc.AmbientLight = {0.25f, 0.25f, 0.35f, 1.0f};
         /*struct Light
         {
@@ -842,12 +867,9 @@ private:
     ComPtr<ID3D12PipelineState> mColorPSO;
 
     // 相机：绕原点转的球坐标 (θ, φ, r)
-    XMFLOAT4X4 mView = XMFLOAT4X4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
-    XMFLOAT4X4 mProj = XMFLOAT4X4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
-    float mTheta = 1.5f * XM_PI; // 绕 y 轴转的角度
-    float mPhi = XM_PIDIV2 - 0.1f; // 和 +y 轴的夹角：快贴着地平线看，才看得出地形起伏
-    float mRadius = 50.0f; // 离原点多远（地形 160 宽、水面 128 宽，站远了才看得全）
+    Camera mCamera;
     POINT mLastMousePos = {};
+    
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, int nShowCmd)
