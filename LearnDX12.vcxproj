@@ -145,6 +145,7 @@
     <ClCompile Include="Common\DDSTextureLoader.cpp" />
     <ClCompile Include="Common\DxUtil.cpp" />
     <ClCompile Include="Common\GameTimer.cpp" />
+    <ClCompile Include="Common\Camera.cpp" />
     <None Include="HLSL\Triangle.hlsl" />
     <None Include="HLSL\Color.hlsl" />
     <ClCompile Include="Common\GeometryGenerator.cpp" />
@@ -158,6 +159,7 @@
     <ClInclude Include="Common\DDSTextureLoader.h" />
     <ClInclude Include="Common\DxUtil.h" />
     <ClInclude Include="Common\GameTimer.h" />
+    <ClInclude Include="Common\Camera.h" />
     <ClInclude Include="Common\GeometryGenerator.h" />
     <ClInclude Include="Common\UploadBuffer.h" />
     <ClInclude Include="FrameResource.h" />
