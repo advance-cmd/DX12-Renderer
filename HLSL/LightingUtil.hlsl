@@ -24,10 +24,70 @@ struct MaterialConstants
     float Roughness;
 };
 
-// 平行光：现在只有漫反射。toEye（表面指向眼睛的方向）留给高光用
+// Blinn-Phong：漫反射 + 高光，三种灯共用。各种灯只负责算出
+//   lightStrength：这盏灯在这个点的有效强度（已经乘过夹角、衰减这些）
+//   lightVec：从表面指向灯的单位向量
+// 约定：normal、lightVec、toEye 都是单位向量
+float3 BlinnPhong(float3 lightStrength, float3 lightVec, float3 normal, float3 toEye, MaterialConstants mat)
+{
+    float m = (1 - mat.Roughness) * 256;                // 光泽度：越光滑，高光越小越亮
+    float3 h = normalize(toEye + lightVec);             // 半角向量
+    float roughnessFactor = (m + 8) / 8 * pow(max(dot(h, normal), 0), m);
+    // Schlick 近似的 Fresnel：夹角用 h 和 lightVec（Blinn-Phong 里微表面的法线就是 h）
+    float3 fresnel = mat.FresnelR0 + (1 - mat.FresnelR0) * pow(1 - max(dot(h, lightVec), 0), 5);
+    float3 specAlbedo = fresnel * roughnessFactor;
+    specAlbedo = specAlbedo / (specAlbedo + 1);         // LDR：把可能超过 1 的高光压回 [0, 1)
+    return (mat.DiffuseAlbedo.rgb + specAlbedo) * lightStrength;
+}
+
+// 平行光：光向量处处一样，没有衰减
 float3 ComputeDirectionalLight(Light L, MaterialConstants mat, float3 normal, float3 toEye)
 {
-    float3 LightDir = -L.Direction;
-    float3 VertexNormal = normalize(normal);
-    return mat.DiffuseAlbedo.rgb * L.Strength * max(dot(LightDir, VertexNormal), 0.0f);
+    float3 lightVec = -L.Direction;
+    float3 lightStrength = L.Strength * max(dot(lightVec, normal), 0.0f);
+    return BlinnPhong(lightStrength, lightVec, normal, toEye, mat);
+}
+
+// 衰减：距离 <= falloffStart 时是 1，>= falloffEnd 时是 0，中间线性过渡
+float CalcAttenuation(float d, float falloffStart, float falloffEnd)
+{
+    return saturate((falloffEnd - d) / (falloffEnd - falloffStart));
+}
+
+// 点光源：灯挂在 L.Position，光向量每个点都不同，所以需要这个点的世界坐标 pos
+float3 ComputePointLight(Light L, MaterialConstants mat, float3 pos, float3 normal, float3 toEye)
+{
+    float3 result = float3(0.0f, 0.0f, 0.0f);           // 太远的点照不到，结果就是 0
+    float3 lightVec = L.Position - pos;                 // 从表面指向灯
+    float d = length(lightVec);
+    if (d <= L.FalloffEnd)
+    {
+        lightVec /= d;                                  // 归一化（前面已经算过长度，直接除）
+        float3 lightStrength = L.Strength * max(dot(lightVec, normal), 0.0f);
+        lightStrength *= CalcAttenuation(d, L.FalloffStart, L.FalloffEnd);
+        result = BlinnPhong(lightStrength, lightVec, normal, toEye, mat);
+    }
+    return result;
+}
+
+// 把所有灯的贡献加起来。灯在 Lights[] 里的排布：先平行光，再点光源，最后聚光灯
+// NUM_DIR_LIGHTS / NUM_POINT_LIGHTS / NUM_SPOT_LIGHTS 由 C++ 编译着色器时用宏传进来
+float3 ComputeLighting(Light lights[MaxLights], MaterialConstants mat, float3 pos, float3 normal, float3 toEye)
+{
+    float3 result = 0.0f;
+    int i = 0;
+
+#if (NUM_DIR_LIGHTS > 0)
+    [unroll]
+    for (i = 0; i < NUM_DIR_LIGHTS; ++i)
+        result += ComputeDirectionalLight(lights[i], mat, normal, toEye);
+#endif
+
+#if (NUM_POINT_LIGHTS > 0)
+    [unroll]
+    for (i = NUM_DIR_LIGHTS; i < NUM_DIR_LIGHTS + NUM_POINT_LIGHTS; ++i)
+        result += ComputePointLight(lights[i], mat, pos, normal, toEye);
+#endif
+
+    return result;
 }

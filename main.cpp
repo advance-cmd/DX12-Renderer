@@ -311,10 +311,16 @@ private:
         };*/
         pc.Lights[0].Strength = {1,1,1};
         pc.Lights[0].FalloffStart = 5;
-        pc.Lights[0].Direction = {-0.57735f, -0.57735f, -0.57735f};
+        pc.Lights[0].Direction = {0.0f, -0.14834f, -0.98893f}; // 太阳在场景后方、压得很低，朝镜头斜着照过来，水面的镜面反射点才会进入画面
         pc.Lights[0].FalloffEnd = 100;
         pc.Lights[0].Position = {0,50,0};
         pc.Lights[0].SpotPower = 0.2f;
+
+        // Lights[1]：点光源，悬在水面上方，暖白色。FalloffStart 以内全亮，FalloffEnd 以外照不到
+        pc.Lights[1].Strength = {1.0f, 0.9f, 0.6f};
+        pc.Lights[1].FalloffStart = 3.0f;
+        pc.Lights[1].FalloffEnd = 14.0f;
+        pc.Lights[1].Position = {6.0f, 2.0f, -34.0f};
         mCurrentFrame->PassCB->CopyData(0, pc);
     }
 
@@ -737,9 +743,15 @@ private:
 
     void BuildShadersAndInputLayout()
     {
+        // 灯的数量用宏传给着色器，顺序必须和 UpdateMainPassCB 里填灯的顺序一致：先平行光，再点光源，最后聚光灯
+        const D3D_SHADER_MACRO lightDefines[] = {
+            {"NUM_DIR_LIGHTS", "1"},
+            {"NUM_POINT_LIGHTS", "1"},
+            {"NUM_SPOT_LIGHTS", "0"},
+            {nullptr, nullptr}};
         // 用到了 ConstantBuffer<T>，需要 Shader Model 5.1
-        mCrateVSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", nullptr, "VS", "vs_5_1");
-        mCratePSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", nullptr, "PS", "ps_5_1");
+        mCrateVSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "VS", "vs_5_1");
+        mCratePSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "PS", "ps_5_1");
         // 语义名, 语义索引, 格式, 输入槽, 在顶点里的字节偏移, 按顶点/按实例, 实例步进
         mCrateInputLayout = {
             {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
@@ -747,8 +759,8 @@ private:
             {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         };
         // 陆地和水面用另一对着色器：除了变换，直接把顶点色输出
-        mColorVSByteCode = CompileShader(L"HLSL\\Color.hlsl", nullptr, "VS", "vs_5_1");
-        mColorPSByteCode = CompileShader(L"HLSL\\Color.hlsl", nullptr, "PS", "ps_5_1");
+        mColorVSByteCode = CompileShader(L"HLSL\\Color.hlsl", lightDefines, "VS", "vs_5_1");
+        mColorPSByteCode = CompileShader(L"HLSL\\Color.hlsl", lightDefines, "PS", "ps_5_1");
         // 陆地和水面：位置（12 字节）+ 顶点色（16 字节），和 struct ColorVertex 一致。
         // 输入布局必须和顶点结构体、以及对应的 HLSL VertexIn 三者对齐
         mColorInputLayout = {

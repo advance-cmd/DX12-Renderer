@@ -39,6 +39,7 @@ struct VertexOut
     float4 PosH : SV_POSITION; // H = Homogeneous，齐次裁剪空间
     float3 NormalW : NORMAL;
     float2 TexC : TEXCOORD;
+    float3 PosW : TEXCOORD1;
 };
 
 VertexOut VS(VertexIn vin)
@@ -48,6 +49,7 @@ VertexOut VS(VertexIn vin)
     vout.PosH = mul(posW, gPass.ViewProj); // 世界 → 裁剪空间
     vout.NormalW = mul(vin.NormalL, (float3x3)gObj.WorldInvTranspose); // 转到世界空间
     vout.TexC = vin.TexC;
+    vout.PosW = posW.xyz;
     return vout;
 }
 
@@ -60,6 +62,8 @@ float4 PS(VertexOut pin) : SV_Target
     mat.DiffuseAlbedo = TexColor * gMat.DiffuseAlbedo;
 
     float3 ambient = gPass.AmbientLight.rgb * mat.DiffuseAlbedo.rgb;
-    float3 direct = ComputeDirectionalLight(gPass.Lights[0], mat, pin.NormalW, float3(0, 0, 0));
+    float3 toEye = normalize(gPass.EyePosW - pin.PosW);
+    float3 normal = normalize(pin.NormalW);   // 插值之后长度不一定是 1
+    float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye);
     return float4(ambient + direct, mat.DiffuseAlbedo.a);
 }
