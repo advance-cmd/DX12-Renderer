@@ -88,6 +88,8 @@ public:
         // 框架初始化结束时命令列表是关着的；上传纹理和顶点/索引数据要录制复制命令，先把它打开
         ThrowIfFailed(mCommandList->Reset(mCommandAllocator.Get(), nullptr));
         mCamera.SetMoveSpeed(5.f);
+        // 初始位置：站在换摄像机之前的老位置（离原点 50、略高于水面），看向原点
+        mCamera.LookAt(XMFLOAT3(0.0f, 4.99f, -49.75f), XMFLOAT3(0.0f, 0.0f, 0.0f), XMFLOAT3(0.0f, 1.0f, 0.0f));
         LoadTextures(); // 录制复制命令（纹理）
         BuildDescriptorHeaps();
         BuildShapeGeometry(); // 录制复制命令（木箱）
@@ -633,7 +635,7 @@ private:
 
         LMaterial_water->Name = "water";
         LMaterial_water->MatCBIndex = 2;
-        LMaterial_water->DiffuseAlbedo = {0.0f, 0.2f, 0.6f, 1};
+        LMaterial_water->DiffuseAlbedo = {0.0f, 0.2f, 0.6f, .5f};
         LMaterial_water->FresnelR0 = {0.1f, 0.1f, 0.1f};
         LMaterial_water->Roughness = 0;
 
@@ -647,20 +649,6 @@ private:
     void BuildRenderItems()
     {
         UINT objCBIndex = 0;
-
-        //水面
-        auto water = std::make_unique<RenderItem>();
-        XMStoreFloat4x4(&water->World, XMMatrixIdentity());
-        water->PSO = mColorPSO;
-        water->ObjCBIndex = objCBIndex++;
-        water->Geo = mWaterGeo.get();
-        water->IndexCount = mWaterGeo->DrawArgs["grid"].IndexCount;
-        water->StartIndexLocation = mWaterGeo->DrawArgs["grid"].StartIndexLocation;
-        water->BaseVertexLocation = mWaterGeo->DrawArgs["grid"].BaseVertexLocation;
-        water->Mat = mMaterials.at("water").get();
-
-        mWavesItem = water.get();
-        mAllItems.push_back(std::move(water));
 
         // 陆地：顶点里已经把高度算进去了（BuildLandGeometry），世界矩阵用单位阵。
         // 顶点格式是位置 + 顶点色，所以用 mColorPSO
@@ -701,6 +689,21 @@ private:
                 mAllItems.push_back(std::move(crate));
             }
         }
+        
+        //水面
+        auto water = std::make_unique<RenderItem>();
+        XMStoreFloat4x4(&water->World, XMMatrixIdentity());
+        water->PSO = mBlendPSO;
+        water->ObjCBIndex = objCBIndex++;
+        water->Geo = mWaterGeo.get();
+        water->IndexCount = mWaterGeo->DrawArgs["grid"].IndexCount;
+        water->StartIndexLocation = mWaterGeo->DrawArgs["grid"].StartIndexLocation;
+        water->BaseVertexLocation = mWaterGeo->DrawArgs["grid"].BaseVertexLocation;
+        water->Mat = mMaterials.at("water").get();
+
+        mWavesItem = water.get();
+        mAllItems.push_back(std::move(water));
+        
     }
 
     // 3 份帧资源，每份：1 个 Pass 常量 + 每个渲染项 1 个物体常量
@@ -831,6 +834,16 @@ private:
         psoDesc.VS = {mColorVSByteCode->GetBufferPointer(), mColorVSByteCode->GetBufferSize()};
         psoDesc.PS = {mColorPSByteCode->GetBufferPointer(), mColorPSByteCode->GetBufferSize()};
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&psoDesc,IID_PPV_ARGS(&mColorPSO)));
+        D3D12_RENDER_TARGET_BLEND_DESC t = {};
+        t.BlendEnable = true;               // 开常规混合（和 LogicOpEnable 只能开一个）
+        t.SrcBlend  = D3D12_BLEND_SRC_ALPHA;
+        t.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        t.BlendOp   = D3D12_BLEND_OP_ADD;
+        t.SrcBlendAlpha = D3D12_BLEND_ONE;  t.DestBlendAlpha = D3D12_BLEND_ZERO;  t.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        t.LogicOp = D3D12_LOGIC_OP_NOOP;
+        t.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        psoDesc.BlendState.RenderTarget[0] = t;
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&psoDesc,IID_PPV_ARGS(&mBlendPSO)));
     }
 
     // ======================== 成员变量 ========================
@@ -857,14 +870,16 @@ private:
     // 管线：描述符堆、根签名、着色器、输入布局、PSO（两套：木箱一套，陆地/水面共用一套）
     ComPtr<ID3D12DescriptorHeap> mHeap; // 着色器可见的 CBV/SRV/UAV 堆（现在只有 1 个 SRV）
     ComPtr<ID3D12RootSignature> mRootSignature;
+    
+    ComPtr<ID3D12PipelineState> mCratePSO;
     ComPtr<ID3DBlob> mCrateVSByteCode;
     ComPtr<ID3DBlob> mCratePSByteCode;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> mCrateInputLayout;
+    ComPtr<ID3D12PipelineState> mColorPSO;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> mColorInputLayout;
     ComPtr<ID3DBlob> mColorVSByteCode;
     ComPtr<ID3DBlob> mColorPSByteCode;
-    std::vector<D3D12_INPUT_ELEMENT_DESC> mCrateInputLayout;
-    std::vector<D3D12_INPUT_ELEMENT_DESC> mColorInputLayout;
-    ComPtr<ID3D12PipelineState> mCratePSO;
-    ComPtr<ID3D12PipelineState> mColorPSO;
+    ComPtr<ID3D12PipelineState> mBlendPSO;
 
     // 相机：绕原点转的球坐标 (θ, φ, r)
     Camera mCamera;
