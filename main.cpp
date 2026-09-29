@@ -321,6 +321,14 @@ private:
         pc.Lights[1].FalloffStart = 3.0f;
         pc.Lights[1].FalloffEnd = 14.0f;
         pc.Lights[1].Position = {6.0f, 2.0f, -34.0f};
+
+        // Lights[2]：聚光灯，挂在左边山坡上方 8 个单位，竖直朝下照，冷白色
+        pc.Lights[2].Strength = {0.7f, 0.8f, 1.0f};
+        pc.Lights[2].FalloffStart = 8.0f;
+        pc.Lights[2].FalloffEnd = 16.0f;
+        pc.Lights[2].Position = {-2.8f, 11.9f, -40.0f};
+        pc.Lights[2].Direction = {0.0f, -1.0f, 0.0f};
+        pc.Lights[2].SpotPower = 32.0f;
         mCurrentFrame->PassCB->CopyData(0, pc);
     }
 
@@ -747,7 +755,7 @@ private:
         const D3D_SHADER_MACRO lightDefines[] = {
             {"NUM_DIR_LIGHTS", "1"},
             {"NUM_POINT_LIGHTS", "1"},
-            {"NUM_SPOT_LIGHTS", "0"},
+            {"NUM_SPOT_LIGHTS", "1"},
             {nullptr, nullptr}};
         // 用到了 ConstantBuffer<T>，需要 Shader Model 5.1
         mCrateVSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "VS", "vs_5_1");
