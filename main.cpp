@@ -131,32 +131,40 @@ protected:
         mCamera.SetLens(0.25f * XM_PI,AspectRatio(),1.0f,1000.f);
     }
 
+    // WASD 前后左右，Q 下降、E 上升（沿世界 y 轴，和朝向无关）
     void OnKeyboardInput(const GameTimer& gt)
     {
-        if (GetAsyncKeyState('W') & 0x8000)
+        auto down = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
+
+        // 每个键单独判断、各记一个方向：W + D 同时按就是斜着走，W + S 同时按互相抵消
+        float forward = 0.0f, right = 0.0f, up = 0.0f;
+        if (down('W')) forward += 1.0f;
+        if (down('S')) forward -= 1.0f;
+        if (down('D')) right += 1.0f;
+        if (down('A')) right -= 1.0f;
+        if (down('E')) up += 1.0f;
+        if (down('Q')) up -= 1.0f;
+
+        // 斜着走时 (1, 1) 的长度是 √2，不处理的话斜走比直走快 41%。把水平方向缩回长度 1
+        float len = sqrtf(forward * forward + right * right);
+        if (len > 1.0f)
         {
-            mCamera.Walk(gt.DeltaTime());
-        }else if (GetAsyncKeyState('S') & 0x8000)
-        {
-            mCamera.Walk(-gt.DeltaTime());
-        }else if (GetAsyncKeyState('D') & 0x8000)
-        {
-            mCamera.Strafe(gt.DeltaTime());
-        }else if (GetAsyncKeyState('A') & 0x8000)
-        {
-            mCamera.Strafe(-gt.DeltaTime());
+            forward /= len;
+            right /= len;
         }
 
-        // Q 下降、E 上升：沿世界 y 轴，和朝向无关。
-        // 单独写 if、不接在上面的 else if 后面，这样能和 WASD 同时按（比如 W + E 斜着往上飞）
-        if (GetAsyncKeyState('E') & 0x8000)
-            mCamera.Ascend(gt.DeltaTime());
-        if (GetAsyncKeyState('Q') & 0x8000)
-            mCamera.Ascend(-gt.DeltaTime());
+        // 没按的方向不调用：Walk / Strafe / Ascend 都会把观察矩阵标成"脏"，不动就别让它每帧重建
+        const float dt = gt.DeltaTime();
+        if (forward != 0.0f) mCamera.Walk(forward * dt);
+        if (right != 0.0f) mCamera.Strafe(right * dt);
+        if (up != 0.0f) mCamera.Ascend(up * dt);
     }
 
     void Update(const GameTimer& gt) override
     {
+        // 先处理输入、移动摄像机，这一帧的 ViewProj 才是移动后的（放在最后会晚一帧）
+        OnKeyboardInput(gt);
+
         // 轮换到下一份帧资源；GPU 如果还在用它，就先等
         mCurrFrameResourceIndex = (mCurrFrameResourceIndex + 1) % gNumFrameResources;
         mCurrentFrame = mFrameResources[mCurrFrameResourceIndex].get();
@@ -166,7 +174,6 @@ protected:
         UpdateMaterialCBs();
         UpdateObjectCBs();
         UpdateMainPassCB();
-        OnKeyboardInput(gt);
     }
 
     void Draw(const GameTimer& gt) override

@@ -89,5 +89,5 @@ private:
     DirectX::XMFLOAT4X4 mView = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     DirectX::XMFLOAT4X4 mProj = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     
-    float MoveSpeed = 1.0f;
+    float mMoveSpeed = 1.0f;
 };

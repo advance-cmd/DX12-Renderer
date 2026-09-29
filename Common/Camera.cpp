@@ -99,7 +99,7 @@ XMFLOAT4X4 Camera::GetProj4x4f() const { return mProj; }
 void Camera::Strafe(float d)
 {
     // mPosition += d * mRight
-    XMVECTOR s = XMVectorReplicate(d*MoveSpeed);
+    XMVECTOR s = XMVectorReplicate(d * mMoveSpeed);
     XMStoreFloat3(&mPosition, XMVectorMultiplyAdd(s, XMLoadFloat3(&mRight), XMLoadFloat3(&mPosition)));
     mViewDirty = true;
 }
@@ -107,7 +107,7 @@ void Camera::Strafe(float d)
 void Camera::Walk(float d)
 {
     // mPosition += d * mLook
-    XMVECTOR s = XMVectorReplicate(d*MoveSpeed);
+    XMVECTOR s = XMVectorReplicate(d * mMoveSpeed);
     XMStoreFloat3(&mPosition, XMVectorMultiplyAdd(s, XMLoadFloat3(&mLook), XMLoadFloat3(&mPosition)));
     mViewDirty = true;
 }
@@ -115,7 +115,7 @@ void Camera::Walk(float d)
 void Camera::Ascend(float d)
 {
     // 世界的"上"永远是 (0, 1, 0)，所以只改 y，不用管摄像机的三根轴
-    mPosition.y += d * MoveSpeed;
+    mPosition.y += d * mMoveSpeed;
     mViewDirty = true;
 }
 
@@ -171,7 +171,7 @@ void Camera::UpdateViewMatrix()
 
 void Camera::SetMoveSpeed(float speed)
 {
-    MoveSpeed = speed;
+    mMoveSpeed = speed;
 }
 
-float Camera::GetMoveSpeed() const { return MoveSpeed; }
+float Camera::GetMoveSpeed() const { return mMoveSpeed; }
