@@ -205,7 +205,6 @@ protected:
         mCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
         mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
         mCommandList->SetGraphicsRootConstantBufferView(2, mCurrentFrame->PassCB->Resource()->GetGPUVirtualAddress());
-        mCommandList->SetGraphicsRootDescriptorTable(1, mHeap->GetGPUDescriptorHandleForHeapStart()); // SRV 在第 0 格
 
         DrawRenderItems();
 
@@ -425,20 +424,32 @@ private:
             //材质CBV绑定
             mCommandList->SetGraphicsRootConstantBufferView(3, MatCBStart + ri->Mat->MatCBIndex * MatCBByteSize);
 
+            // 算出"堆起点往后数 N 格"的 GPU 地址：N 从材质里取，每格的字节数是 mCSUDescriptorSize
+            CD3DX12_GPU_DESCRIPTOR_HANDLE tex(mHeap->GetGPUDescriptorHandleForHeapStart(), ri->Mat->DiffuseSrvHeapIndex,
+                                              mCSUDescriptorSize);
+            // 把书签夹到这里
+            mCommandList->SetGraphicsRootDescriptorTable(1, tex);
+
             mCommandList->DrawIndexedInstanced(ri->IndexCount, 1, ri->StartIndexLocation, ri->BaseVertexLocation, 0);
         }
     }
 
     // ======================== 初始化（按 Initialize 里的调用顺序） ========================
 
+    void LoadTextureHelper(std::string Name, std::wstring FileName)
+    {
+        auto Tex = std::make_unique<DX_Utils::Texture>();
+        Tex->Name = Name;
+        Tex->Filename = FileName;
+        ThrowIfFailed(CreateDDSTextureFromFile12(mDevice.Get(), mCommandList.Get(), Tex->Filename.c_str(),
+            Tex->Resource, Tex->UploadHeap));
+        mTextures[Tex->Name] = std::move(Tex);
+    }
+
     void LoadTextures()
     {
-        auto tex = std::make_unique<DX_Utils::Texture>();
-        tex->Name = "woodCrateTex";
-        tex->Filename = L"Textures\\WoodCrate01.dds";
-        ThrowIfFailed(CreateDDSTextureFromFile12(mDevice.Get(), mCommandList.Get(), tex->Filename.c_str(),
-            tex->Resource, tex->UploadHeap));
-        mTextures[tex->Name] = std::move(tex);
+        LoadTextureHelper("woodCrateTex", L"Textures\\WoodCrate01.dds");
+        LoadTextureHelper("WireFenceTex", L"Textures\\WireFence.dds");
     }
 
     // 着色器可见的 CBV/SRV/UAV 堆。常量走根 CBV，不需要 CBV 描述符，所以堆里只有纹理的 1 个 SRV
@@ -446,7 +457,7 @@ private:
     {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {
             .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            .NumDescriptors = 1,
+            .NumDescriptors = 2,
             .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, // 着色器要从这个堆里读（RTV/DSV 堆不用，所以是 NONE）
             .NodeMask = 0,
         };
@@ -632,6 +643,7 @@ private:
         std::unique_ptr<Material> LMaterial_crate = std::make_unique<Material>();
         std::unique_ptr<Material> LMaterial_grass = std::make_unique<Material>();
         std::unique_ptr<Material> LMaterial_water = std::make_unique<Material>();
+        std::unique_ptr<Material> LMaterial_fence = std::make_unique<Material>();
 
         LMaterial_crate->Name = "crate";
         LMaterial_crate->MatCBIndex = 0;
@@ -651,9 +663,17 @@ private:
         LMaterial_water->FresnelR0 = {0.1f, 0.1f, 0.1f};
         LMaterial_water->Roughness = 0;
 
+        LMaterial_fence->Name = "fence";
+        LMaterial_fence->MatCBIndex = 3;
+        LMaterial_fence->DiffuseAlbedo = {1.0f, 1.0f, 1.0f, 1.0f};
+        LMaterial_fence->FresnelR0 = {0.1f, 0.1f, 0.1f};
+        LMaterial_fence->Roughness = 0.25f;
+        LMaterial_fence->DiffuseSrvHeapIndex = 1;
+
         mMaterials[LMaterial_crate->Name] = std::move(LMaterial_crate);
         mMaterials[LMaterial_grass->Name] = std::move(LMaterial_grass);
         mMaterials[LMaterial_water->Name] = std::move(LMaterial_water);
+        mMaterials[LMaterial_fence->Name] = std::move(LMaterial_fence);
     }
 
     // 只放木箱和陆地两种渲染项（水面在第 5 步加进来）。
@@ -701,6 +721,17 @@ private:
                 mAllItems.push_back(std::move(crate));
             }
         }
+        
+        auto fence = std::make_unique<RenderItem>();
+        fence->PSO = mAlphaTestedPSO;
+        fence->ObjCBIndex = objCBIndex++;
+        fence->Geo = mShapeGeo.get();
+        fence->IndexCount = box.IndexCount;
+        fence->StartIndexLocation = mShapeGeo->DrawArgs["box"].StartIndexLocation;
+        fence->BaseVertexLocation = mShapeGeo->DrawArgs["box"].BaseVertexLocation;
+        fence->Mat = mMaterials.at("fence").get();
+        XMStoreFloat4x4(&fence->World, XMMatrixScaling(4,4,4) * XMMatrixTranslation(0, 4, -20));
+        mAllItems.push_back(std::move(fence));
 
         //水面
         auto water = std::make_unique<RenderItem>();
@@ -736,7 +767,7 @@ private:
     void BuildShaderResourceViews()
     {
         auto& woodTex = mTextures.at("woodCrateTex")->Resource;
-        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+        D3D12_SHADER_RESOURCE_VIEW_DESC woodDesc = {
             .Format = woodTex->GetDesc().Format,
             .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
             .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
@@ -747,7 +778,22 @@ private:
                 .ResourceMinLODClamp = 0.0f,
             },
         };
-        mDevice->CreateShaderResourceView(woodTex.Get(), &srvDesc, mHeap->GetCPUDescriptorHandleForHeapStart());
+        mDevice->CreateShaderResourceView(woodTex.Get(), &woodDesc, mHeap->GetCPUDescriptorHandleForHeapStart());
+
+        auto& WireFenceTex = mTextures.at("WireFenceTex")->Resource;
+        D3D12_SHADER_RESOURCE_VIEW_DESC WireFenceDESC = {
+            .Format = WireFenceTex->GetDesc().Format,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .Texture2D = {
+                .MostDetailedMip = 0,
+                .MipLevels = WireFenceTex->GetDesc().MipLevels,
+                .PlaneSlice = 0,
+                .ResourceMinLODClamp = 0.0f,
+            },
+        };
+        CD3DX12_CPU_DESCRIPTOR_HANDLE fenceHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), 1, mCSUDescriptorSize);
+        mDevice->CreateShaderResourceView(WireFenceTex.Get(), &WireFenceDESC, fenceHandle);
     }
 
     // 根签名 = 着色器的"参数列表"：
@@ -798,9 +844,20 @@ private:
             {"FOG", "1"},
             {nullptr, nullptr}
         };
+
+        const D3D_SHADER_MACRO alphaTestDefines[] = {
+            {"NUM_DIR_LIGHTS", "1"},
+            {"NUM_POINT_LIGHTS", "1"},
+            {"NUM_SPOT_LIGHTS", "1"},
+            {"FOG", "1"},
+            {"ALPHA_TEST", "1"},
+            {nullptr, nullptr}
+        };
+
         // 用到了 ConstantBuffer<T>，需要 Shader Model 5.1
         mCrateVSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "VS", "vs_5_1");
         mCratePSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "PS", "ps_5_1");
+        mAlphaTestedPSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", alphaTestDefines, "PS", "ps_5_1");
         // 语义名, 语义索引, 格式, 输入槽, 在顶点里的字节偏移, 按顶点/按实例, 实例步进
         mCrateInputLayout = {
             {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
@@ -841,6 +898,12 @@ private:
         psoDesc.VS = {mCrateVSByteCode->GetBufferPointer(), mCrateVSByteCode->GetBufferSize()};
         psoDesc.PS = {mCratePSByteCode->GetBufferPointer(), mCratePSByteCode->GetBufferSize()};
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&psoDesc,IID_PPV_ARGS(&mCratePSO)));
+        
+        //AlphaTest
+        auto fenceDesc = psoDesc;
+        fenceDesc.PS = {mAlphaTestedPSByteCode->GetBufferPointer(), mAlphaTestedPSByteCode->GetBufferSize()};
+        fenceDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&fenceDesc,IID_PPV_ARGS(&mAlphaTestedPSO)));
 
         // 陆地和水面：位置 + 顶点色，PS 直接返回颜色
         psoDesc.InputLayout = {mColorInputLayout.data(), (UINT)mColorInputLayout.size()};
@@ -887,8 +950,10 @@ private:
     ComPtr<ID3D12RootSignature> mRootSignature;
 
     ComPtr<ID3D12PipelineState> mCratePSO;
+    ComPtr<ID3D12PipelineState> mAlphaTestedPSO;
     ComPtr<ID3DBlob> mCrateVSByteCode;
     ComPtr<ID3DBlob> mCratePSByteCode;
+    ComPtr<ID3DBlob> mAlphaTestedPSByteCode;
     std::vector<D3D12_INPUT_ELEMENT_DESC> mCrateInputLayout;
     ComPtr<ID3D12PipelineState> mColorPSO;
     std::vector<D3D12_INPUT_ELEMENT_DESC> mColorInputLayout;

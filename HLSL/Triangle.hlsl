@@ -53,6 +53,9 @@ float4 PS(VertexOut pin) : SV_Target
     // 光照用的材质：反照率要带上贴图颜色，其余原样照抄 gMat
     MaterialConstants mat = gMat;
     mat.DiffuseAlbedo = TexColor * gMat.DiffuseAlbedo;
+#ifdef ALPHA_TEST
+    clip(mat.DiffuseAlbedo.a -0.1f);
+#endif
 
     float3 ambient = gPass.AmbientLight.rgb * mat.DiffuseAlbedo.rgb;
     float3 toEye = gPass.EyePosW - pin.PosW;
