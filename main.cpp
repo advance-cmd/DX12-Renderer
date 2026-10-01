@@ -36,6 +36,14 @@ struct Vertex
     XMFLOAT2 TexC;
 };
 
+// 公告牌树的顶点：一棵树只有一个顶点，GS 再把它扩成四边形。
+// 必须和树的输入布局（POSITION 偏移 0、SIZE 偏移 12）、TreeSprite.hlsl 里的 VertexIn 一致
+struct TreeSpriteVertex
+{
+    XMFLOAT3 Pos; // 树的中心，直接是世界坐标
+    XMFLOAT2 Size; // 宽、高
+};
+
 // 渲染项：画一个物体需要的全部信息
 struct RenderItem
 {
@@ -108,6 +116,7 @@ public:
         BuildShapeGeometry(); // 录制复制命令（木箱）
         BuildLandGeometry(); // 录制复制命令（陆地的顶点/索引）
         BuildWaves(); // 波浪模拟（这一步只建模拟本体，第 5 步再建水面几何）
+        BuildTreeSpritesGeometry(); // 录制复制命令（树的点）
         BuildShaderResourceViews(); // 要用到纹理和堆
         BuildRootSignature(); // PSO 要用根签名
         BuildShadersAndInputLayout(); // PSO 要用着色器和输入布局
@@ -126,6 +135,7 @@ public:
         mShapeGeo->DisposeUploaders();
         mLandGeo->DisposeUploaders();
         mWaterGeo->DisposeUploaders();
+        mTreeGeo->DisposeUploaders();
         for (auto& [name, tex] : mTextures)
         {
             tex->UploadHeap.Reset();
@@ -489,6 +499,8 @@ private:
         LoadTextureHelper("WireFenceTex", L"Textures\\WireFence.dds");
         LoadTextureHelper("iceTex", L"Textures\\ice.dds");
         LoadTextureHelper("tileTex", L"Textures\\tile.dds");
+        LoadTextureHelper("treeArrayTex", L"Textures\\treeArray2.dds");
+        //书上的 DDS 加载函数认得纹理数组，建出来的资源 DepthOrArraySize 会是 3。
     }
 
     // 创建描述符堆
@@ -496,11 +508,91 @@ private:
     {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {
             .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            .NumDescriptors = 4,
+            .NumDescriptors = 5,
             .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, // 着色器要从这个堆里读（RTV/DSV 堆不用，所以是 NONE）
             .NodeMask = 0,
         };
         ThrowIfFailed(mDevice->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(mHeap.GetAddressOf())));
+    }
+
+    // 建立SRV
+    void BuildShaderResourceViews()
+    {
+        auto& woodTex = mTextures.at("woodCrateTex")->Resource;
+        D3D12_SHADER_RESOURCE_VIEW_DESC woodDesc = {
+            .Format = woodTex->GetDesc().Format,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .Texture2D = {
+                .MostDetailedMip = 0,
+                .MipLevels = woodTex->GetDesc().MipLevels,
+                .PlaneSlice = 0,
+                .ResourceMinLODClamp = 0.0f,
+            },
+        };
+        mDevice->CreateShaderResourceView(woodTex.Get(), &woodDesc, mHeap->GetCPUDescriptorHandleForHeapStart());
+
+        auto& WireFenceTex = mTextures.at("WireFenceTex")->Resource;
+        D3D12_SHADER_RESOURCE_VIEW_DESC WireFenceDESC = {
+            .Format = WireFenceTex->GetDesc().Format,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .Texture2D = {
+                .MostDetailedMip = 0,
+                .MipLevels = WireFenceTex->GetDesc().MipLevels,
+                .PlaneSlice = 0,
+                .ResourceMinLODClamp = 0.0f,
+            },
+        };
+        CD3DX12_CPU_DESCRIPTOR_HANDLE fenceHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), 1, mCSUDescriptorSize);
+        mDevice->CreateShaderResourceView(WireFenceTex.Get(), &WireFenceDESC, fenceHandle);
+
+        auto& iceTex = mTextures.at("iceTex")->Resource;
+        D3D12_SHADER_RESOURCE_VIEW_DESC iceDesc = {
+            .Format = iceTex->GetDesc().Format,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .Texture2D = {
+                .MostDetailedMip = 0,
+                .MipLevels = iceTex->GetDesc().MipLevels,
+                .PlaneSlice = 0,
+                .ResourceMinLODClamp = 0.0f,
+            }
+        };
+        CD3DX12_CPU_DESCRIPTOR_HANDLE iceHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), 2, mCSUDescriptorSize);
+        mDevice->CreateShaderResourceView(iceTex.Get(), &iceDesc, iceHandle);
+
+        auto& tileTex = mTextures.at("tileTex")->Resource;
+        D3D12_SHADER_RESOURCE_VIEW_DESC tileDesc = {
+            .Format = tileTex->GetDesc().Format,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .Texture2D = {
+                .MostDetailedMip = 0,
+                .MipLevels = tileTex->GetDesc().MipLevels,
+                .PlaneSlice = 0,
+                .ResourceMinLODClamp = 0.0f,
+            }
+        };
+        CD3DX12_CPU_DESCRIPTOR_HANDLE tileHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), 3, mCSUDescriptorSize);
+        mDevice->CreateShaderResourceView(tileTex.Get(), &tileDesc, tileHandle);
+
+        auto& treeArrayTex = mTextures.at("treeArrayTex")->Resource;
+        D3D12_SHADER_RESOURCE_VIEW_DESC treeArrayDesc = {
+            .Format = treeArrayTex->GetDesc().Format,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .Texture2DArray = {
+                .MostDetailedMip = 0, //从最清晰的那级 mip 开始
+                .MipLevels = treeArrayTex->GetDesc().MipLevels, //用几级 mip
+                .FirstArraySlice = 0, //从第几张图开始
+                .ArraySize = treeArrayTex->GetDesc().DepthOrArraySize, //一共几张（3）
+                .PlaneSlice = 0,
+                .ResourceMinLODClamp = 0.0f
+            }
+        };
+        CD3DX12_CPU_DESCRIPTOR_HANDLE treeHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), 4, mCSUDescriptorSize);
+        mDevice->CreateShaderResourceView(treeArrayTex.Get(), &treeArrayDesc, treeHandle);
     }
 
     void BuildShapeGeometry()
@@ -698,6 +790,57 @@ private:
         mWaterGeo->DrawArgs["grid"] = submesh;
     }
 
+    // 公告牌树：24 棵，每棵只存一个点（中心 + 宽高）。顶点格式和木箱、陆地都不一样，所以单独一份几何体。
+    // 位置挑在山坡上（地面比水面高出 2.5 以上，水会涨到 0.5～0.8），避开地板、铁丝网、镜子和那 100 个木箱；
+    // 前 12 棵从初始机位能整棵看到，后 12 棵散在别处，走动时能看到
+    void BuildTreeSpritesGeometry()
+    {
+        const XMFLOAT2 treeXZ[] = {
+            {17.7f, 33.7f}, {63.9f, 63.4f}, {3.2f, 67.5f}, {9.4f, 48.6f}, {14.5f, 17.6f}, {12.5f, 63.1f},
+            {25.6f, 55.2f}, {22.8f, 10.5f}, {70.6f, 50.2f}, {20.6f, 46.0f}, {4.3f, 31.9f}, {25.3f, 65.5f},
+            {-34.7f, -38.3f}, {71.4f, -4.3f}, {48.5f, -3.4f}, {58.3f, 10.0f}, {-59.3f, 43.3f}, {-29.7f, 38.7f},
+            {18.3f, -4.9f}, {-19.6f, -27.0f}, {51.2f, -47.6f}, {-53.3f, -30.0f}, {-21.3f, -43.6f}, {-71.3f, -51.3f},
+        };
+        const XMFLOAT2 treeSize = {13.0f, 16.0f}; // 树的图片是 208×256，宽高比 0.8125
+
+        std::vector<TreeSpriteVertex> vertices;
+        std::vector<std::uint16_t> indices;
+        for (const XMFLOAT2& xz : treeXZ)
+        {
+            // 中心 = 地面高度 + 半高，再往下埋 0.5：坡上的树底边是水平的，不埋一点会有一角悬空
+            const float y = GetHillsHeight(xz.x, xz.y) + 0.5f * treeSize.y - 0.5f;
+            indices.push_back((std::uint16_t)vertices.size()); // 0, 1, 2, ……：DrawRenderItems 用的是带索引的画法
+            vertices.push_back({XMFLOAT3(xz.x, y, xz.y), treeSize});
+        }
+
+        const UINT vbByteSize = (UINT)vertices.size() * sizeof(TreeSpriteVertex);
+        const UINT ibByteSize = (UINT)indices.size() * sizeof(std::uint16_t);
+
+        mTreeGeo = std::make_unique<DX_Utils::MeshGeometry>();
+        mTreeGeo->Name = "treeSpritesGeo";
+
+        ThrowIfFailed(D3DCreateBlob(vbByteSize, &mTreeGeo->VertexBufferCPU));
+        CopyMemory(mTreeGeo->VertexBufferCPU->GetBufferPointer(), vertices.data(), vbByteSize);
+        ThrowIfFailed(D3DCreateBlob(ibByteSize, &mTreeGeo->IndexBufferCPU));
+        CopyMemory(mTreeGeo->IndexBufferCPU->GetBufferPointer(), indices.data(), ibByteSize);
+
+        mTreeGeo->VertexBufferGPU = CreateDefaultBuffer(mDevice.Get(), mCommandList.Get(),
+                                                        vertices.data(), vbByteSize, mTreeGeo->VertexBufferUploader);
+        mTreeGeo->IndexBufferGPU = CreateDefaultBuffer(mDevice.Get(), mCommandList.Get(),
+                                                       indices.data(), ibByteSize, mTreeGeo->IndexBufferUploader);
+
+        mTreeGeo->VertexByteStride = sizeof(TreeSpriteVertex);
+        mTreeGeo->VertexBufferByteSize = vbByteSize;
+        mTreeGeo->IndexFormat = DXGI_FORMAT_R16_UINT;
+        mTreeGeo->IndexBufferByteSize = ibByteSize;
+
+        DX_Utils::SubmeshGeometry submesh;
+        submesh.IndexCount = (UINT)indices.size();
+        submesh.StartIndexLocation = 0;
+        submesh.BaseVertexLocation = 0;
+        mTreeGeo->DrawArgs["points"] = submesh;
+    }
+
     // 陆地高度函数（书上 7.7）：x、z 决定 y，几个正弦余弦叠一叠就有起伏和平地
     float GetHillsHeight(float x, float z) const
     {
@@ -726,6 +869,7 @@ private:
         std::unique_ptr<Material> LMaterial_floor = std::make_unique<Material>();
         std::unique_ptr<Material> LMaterial_shadow = std::make_unique<Material>();
         std::unique_ptr<Material> LMaterial_fenceShadow = std::make_unique<Material>();
+        std::unique_ptr<Material> LMaterial_tree = std::make_unique<Material>();
 
         LMaterial_crate->Name = "crate";
         LMaterial_crate->MatCBIndex = 0;
@@ -780,6 +924,13 @@ private:
         LMaterial_fenceShadow->Roughness = 0.f;
         LMaterial_fenceShadow->DiffuseSrvHeapIndex = 1;
 
+        LMaterial_tree->Name = "tree";
+        LMaterial_tree->MatCBIndex = 8;
+        LMaterial_tree->DiffuseAlbedo = {1.0f, 1.0f, 1.0f, 1.0f};
+        LMaterial_tree->FresnelR0 = {0.01f, 0.01f, 0.01f};
+        LMaterial_tree->Roughness = 0.125f;
+        LMaterial_tree->DiffuseSrvHeapIndex = 4;
+
         mMaterials[LMaterial_crate->Name] = std::move(LMaterial_crate);
         mMaterials[LMaterial_grass->Name] = std::move(LMaterial_grass);
         mMaterials[LMaterial_water->Name] = std::move(LMaterial_water);
@@ -788,6 +939,7 @@ private:
         mMaterials[LMaterial_floor->Name] = std::move(LMaterial_floor);
         mMaterials[LMaterial_shadow->Name] = std::move(LMaterial_shadow);
         mMaterials[LMaterial_fenceShadow->Name] = std::move(LMaterial_fenceShadow);
+        mMaterials[LMaterial_tree->Name] = std::move(LMaterial_tree);
     }
 
     //构建mAllItems
@@ -987,7 +1139,7 @@ private:
         XMMATRIX lift = XMMatrixTranslation(0.0f, 0.001f, 0.0f); // 抬高一点点，防止和地板深度打架
 
         auto FenceShadow = std::make_unique<RenderItem>();
-        XMStoreFloat4x4(&FenceShadow->World, XMMatrixScaling(4, 4, 4) * XMMatrixTranslation(0, 4, -20)*S*lift);
+        XMStoreFloat4x4(&FenceShadow->World, XMMatrixScaling(4, 4, 4) * XMMatrixTranslation(0, 4, -20) * S * lift);
         FenceShadow->PSO = mFenceShadowPSO.Get();
         FenceShadow->ObjCBIndex = objCBIndex++;
         FenceShadow->Geo = mShapeGeo.get();
@@ -999,7 +1151,7 @@ private:
         mAllItems.push_back(std::move(FenceShadow));
 
         auto boxShadow1 = std::make_unique<RenderItem>();
-        XMStoreFloat4x4(&boxShadow1->World, extraCrateWorlds[0]*S*lift);
+        XMStoreFloat4x4(&boxShadow1->World, extraCrateWorlds[0] * S * lift);
         boxShadow1->PSO = mShadowPSO;
         boxShadow1->ObjCBIndex = objCBIndex++;
         boxShadow1->Geo = mShapeGeo.get();
@@ -1011,7 +1163,7 @@ private:
         mAllItems.push_back(std::move(boxShadow1));
 
         auto boxShadow2 = std::make_unique<RenderItem>();
-        XMStoreFloat4x4(&boxShadow2->World, extraCrateWorlds[1]*S*lift);
+        XMStoreFloat4x4(&boxShadow2->World, extraCrateWorlds[1] * S * lift);
         boxShadow2->PSO = mShadowPSO;
         boxShadow2->ObjCBIndex = objCBIndex++;
         boxShadow2->Geo = mShapeGeo.get();
@@ -1021,6 +1173,19 @@ private:
         boxShadow2->Mat = mMaterials.at("shadow").get();
         mRitemLayer[(int)RenderLayer::Shadow].push_back(boxShadow2.get());
         mAllItems.push_back(std::move(boxShadow2));
+        
+        auto tree = std::make_unique<RenderItem>();
+        auto LGeo = mTreeGeo.get();
+        tree->PSO = mTreePSO;
+        tree->ObjCBIndex = objCBIndex++;
+        tree->Geo = LGeo;
+        tree->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+        tree->IndexCount = LGeo->DrawArgs.at("points").IndexCount;
+        tree->StartIndexLocation = LGeo->DrawArgs.at("points").StartIndexLocation;
+        tree->BaseVertexLocation = LGeo->DrawArgs.at("points").BaseVertexLocation;
+        tree->Mat = mMaterials.at("tree").get();
+        mRitemLayer[(int)RenderLayer::Opaque].push_back(tree.get());
+        mAllItems.push_back(std::move(tree));
     }
 
     // 3 份帧资源，每份：1 个 Pass 常量 + 每个渲染项 1 个物体常量
@@ -1036,69 +1201,6 @@ private:
                     (UINT)mWaves->VertexCount(),
                     (UINT)mMaterials.size()));
         }
-    }
-
-    // 在堆的第 0 格为木箱纹理建 SRV。格式和 mip 数必须取自纹理本身（不是上传堆）
-    void BuildShaderResourceViews()
-    {
-        auto& woodTex = mTextures.at("woodCrateTex")->Resource;
-        D3D12_SHADER_RESOURCE_VIEW_DESC woodDesc = {
-            .Format = woodTex->GetDesc().Format,
-            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
-            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            .Texture2D = {
-                .MostDetailedMip = 0,
-                .MipLevels = woodTex->GetDesc().MipLevels,
-                .PlaneSlice = 0,
-                .ResourceMinLODClamp = 0.0f,
-            },
-        };
-        mDevice->CreateShaderResourceView(woodTex.Get(), &woodDesc, mHeap->GetCPUDescriptorHandleForHeapStart());
-
-        auto& WireFenceTex = mTextures.at("WireFenceTex")->Resource;
-        D3D12_SHADER_RESOURCE_VIEW_DESC WireFenceDESC = {
-            .Format = WireFenceTex->GetDesc().Format,
-            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
-            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            .Texture2D = {
-                .MostDetailedMip = 0,
-                .MipLevels = WireFenceTex->GetDesc().MipLevels,
-                .PlaneSlice = 0,
-                .ResourceMinLODClamp = 0.0f,
-            },
-        };
-        CD3DX12_CPU_DESCRIPTOR_HANDLE fenceHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), 1, mCSUDescriptorSize);
-        mDevice->CreateShaderResourceView(WireFenceTex.Get(), &WireFenceDESC, fenceHandle);
-
-        auto& iceTex = mTextures.at("iceTex")->Resource;
-        D3D12_SHADER_RESOURCE_VIEW_DESC iceDesc = {
-            .Format = iceTex->GetDesc().Format,
-            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
-            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            .Texture2D = {
-                .MostDetailedMip = 0,
-                .MipLevels = iceTex->GetDesc().MipLevels,
-                .PlaneSlice = 0,
-                .ResourceMinLODClamp = 0.0f,
-            }
-        };
-        CD3DX12_CPU_DESCRIPTOR_HANDLE iceHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), 2, mCSUDescriptorSize);
-        mDevice->CreateShaderResourceView(iceTex.Get(), &iceDesc, iceHandle);
-
-        auto& tileTex = mTextures.at("tileTex")->Resource;
-        D3D12_SHADER_RESOURCE_VIEW_DESC tileDesc = {
-            .Format = tileTex->GetDesc().Format,
-            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
-            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            .Texture2D = {
-                .MostDetailedMip = 0,
-                .MipLevels = tileTex->GetDesc().MipLevels,
-                .PlaneSlice = 0,
-                .ResourceMinLODClamp = 0.0f,
-            }
-        };
-        CD3DX12_CPU_DESCRIPTOR_HANDLE tileHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), 3, mCSUDescriptorSize);
-        mDevice->CreateShaderResourceView(tileTex.Get(), &tileDesc, tileHandle);
     }
 
     // 根签名 = 着色器的"参数列表"：
@@ -1139,6 +1241,7 @@ private:
             0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&mRootSignature)));
     }
 
+    //编译着色器
     void BuildShadersAndInputLayout()
     {
         // 灯的数量用宏传给着色器，顺序必须和 UpdateMainPassCB 里填灯的顺序一致：先平行光，再点光源，最后聚光灯
@@ -1180,6 +1283,15 @@ private:
             {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
             {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
             {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        };
+
+        mTreeVSByteCode = CompileShader(L"HLSL\\TreeSprite.hlsl", alphaTestDefines, "VS", "vs_5_1");
+        mTreePSByteCode = CompileShader(L"HLSL\\TreeSprite.hlsl", alphaTestDefines, "PS", "ps_5_1");
+        mTreeGSByteCode = CompileShader(L"HLSL\\TreeSprite.hlsl", alphaTestDefines, "GS", "gs_5_1");
+
+        mTreeInputLayout = {
+            {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+            {"SIZE", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         };
     }
 
@@ -1304,6 +1416,15 @@ private:
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&LReflectedCratePSOdesc,IID_PPV_ARGS(&mReflectedCratePSO)));
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&LReflectedFencePSOdesc,IID_PPV_ARGS(&mReflectedFencePSO)));
 
+        auto LTreePSODesc = psoDesc;
+        LTreePSODesc.InputLayout = {mTreeInputLayout.data(), (UINT)mTreeInputLayout.size()};
+        LTreePSODesc.VS = {mTreeVSByteCode->GetBufferPointer(), mTreeVSByteCode->GetBufferSize()};
+        LTreePSODesc.PS = {mTreePSByteCode->GetBufferPointer(), mTreePSByteCode->GetBufferSize()};
+        LTreePSODesc.GS = {mTreeGSByteCode->GetBufferPointer(), mTreeGSByteCode->GetBufferSize()};
+        LTreePSODesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+        LTreePSODesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&LTreePSODesc,IID_PPV_ARGS(&mTreePSO)));
+
         // 陆地和水面：位置 + 顶点色，PS 直接返回颜色
         psoDesc.InputLayout = {mColorInputLayout.data(), (UINT)mColorInputLayout.size()};
         psoDesc.VS = {mColorVSByteCode->GetBufferPointer(), mColorVSByteCode->GetBufferSize()};
@@ -1328,6 +1449,8 @@ private:
     // 陆地：位置 + 顶点色，静态数据，放在默认堆里
     std::unique_ptr<DX_Utils::MeshGeometry> mLandGeo;
     std::unique_ptr<DX_Utils::MeshGeometry> mWaterGeo;
+    // 公告牌树：每棵一个点（中心 + 宽高），静态数据，放在默认堆里
+    std::unique_ptr<DX_Utils::MeshGeometry> mTreeGeo;
     // 波浪：CPU 端的模拟。只算高度和法线，不碰任何 D3D 资源
     std::unique_ptr<Waves> mWaves;
     std::vector<std::unique_ptr<RenderItem>> mAllItems;
@@ -1342,9 +1465,9 @@ private:
     // 管线：描述符堆、根签名、着色器、输入布局、PSO（两套：木箱一套，陆地/水面共用一套）
     ComPtr<ID3D12DescriptorHeap> mHeap; // 着色器可见的 CBV/SRV/UAV 堆（现在只有 1 个 SRV）
     ComPtr<ID3D12RootSignature> mRootSignature;
-
     ComPtr<ID3D12PipelineState> mCratePSO;
     ComPtr<ID3D12PipelineState> mAlphaTestedPSO;
+
     ComPtr<ID3DBlob> mCrateVSByteCode;
     ComPtr<ID3DBlob> mCratePSByteCode;
     ComPtr<ID3DBlob> mAlphaTestedPSByteCode;
@@ -1352,9 +1475,9 @@ private:
     ComPtr<ID3DBlob> mMirrorPSByteCode;
     std::vector<D3D12_INPUT_ELEMENT_DESC> mCrateInputLayout;
     ComPtr<ID3D12PipelineState> mColorPSO;
-    std::vector<D3D12_INPUT_ELEMENT_DESC> mColorInputLayout;
     ComPtr<ID3DBlob> mColorVSByteCode;
     ComPtr<ID3DBlob> mColorPSByteCode;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> mColorInputLayout;
     ComPtr<ID3D12PipelineState> mBlendPSO;
     ComPtr<ID3D12PipelineState> mMarkMirrorsPSO;
     ComPtr<ID3D12PipelineState> mMirrorClearPSO;
@@ -1363,6 +1486,12 @@ private:
     ComPtr<ID3D12PipelineState> mReflectedFencePSO;
     ComPtr<ID3D12PipelineState> mShadowPSO;
     ComPtr<ID3D12PipelineState> mFenceShadowPSO;
+
+    ComPtr<ID3DBlob> mTreeVSByteCode;
+    ComPtr<ID3DBlob> mTreePSByteCode;
+    ComPtr<ID3DBlob> mTreeGSByteCode;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> mTreeInputLayout;
+    ComPtr<ID3D12PipelineState> mTreePSO;
     XMFLOAT4 mMirrorPlane;
 
     // 相机：绕原点转的球坐标 (θ, φ, r)
