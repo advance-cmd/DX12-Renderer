@@ -62,6 +62,17 @@ struct RenderItem
     Material* Mat = nullptr;
 };
 
+// 类外面（RenderItem 结构体下面）
+enum class RenderLayer : int
+{
+    Opaque = 0, // 陆地、木箱、铁丝网
+    Mirrors, // 第 ③ 步：标记镜子
+    MirrorClear, // 第 ③b 步：我们场景多加的"重置"
+    Reflected, // 第 ④ 步：镜像
+    Transparent, // 第 ⑤ 步：半透明镜子、水
+    Count
+};
+
 class CrateApp : public D3DApp
 {
 public:
@@ -206,7 +217,18 @@ protected:
         mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
         mCommandList->SetGraphicsRootConstantBufferView(2, mCurrentFrame->PassCB->Resource()->GetGPUVirtualAddress());
 
-        DrawRenderItems();
+        DrawRenderItems(mRitemLayer[(int)RenderLayer::Opaque]);
+        mCommandList->OMSetStencilRef(1);                             // 章上刻"1"
+        DrawRenderItems(mRitemLayer[(int)RenderLayer::Mirrors]);      // ③ 看得见的镜子像素盖章
+        DrawRenderItems(mRitemLayer[(int)RenderLayer::MirrorClear]);  // ③b 盖了章的地方：深度推远、刷成天空色
+        // ④ 镜像：Ref 还是 1，只画在模板 = 1 的像素；Pass 常量换成第 1 份（反射后的灯）
+        const UINT passCBByteSize = CalcConstantBufferByteSize(sizeof(PassConstants));
+        const D3D12_GPU_VIRTUAL_ADDRESS passCB = mCurrentFrame->PassCB->Resource()->GetGPUVirtualAddress();
+        mCommandList->SetGraphicsRootConstantBufferView(2, passCB + passCBByteSize);
+        DrawRenderItems(mRitemLayer[(int)RenderLayer::Reflected]);
+        mCommandList->SetGraphicsRootConstantBufferView(2, passCB); // 换回主 Pass 常量，后面的镜子和水要用
+        mCommandList->OMSetStencilRef(0);                             // 用完恢复
+        DrawRenderItems(mRitemLayer[(int)RenderLayer::Transparent]);
 
         // 后台缓冲：RENDER_TARGET → PRESENT
         auto toPresent = CD3DX12_RESOURCE_BARRIER::Transition(
@@ -368,6 +390,19 @@ private:
         pc.Lights[2].Direction = {0.0f, -1.0f, 0.0f};
         pc.Lights[2].SpotPower = 32.0f;
         mCurrentFrame->PassCB->CopyData(0, pc);
+        
+        PassConstants reflectedPass = pc; // 其余都一样，只把灯反射一下
+        const XMMATRIX R = XMMatrixReflect(XMLoadFloat4(&mMirrorPlane));
+        for (int i = 0; i < 3; ++i)
+        {
+            // 方向：只转不平移（w = 0）；位置：要平移（w = 1）
+            XMStoreFloat3(&reflectedPass.Lights[i].Direction,
+                          XMVector3TransformNormal(XMLoadFloat3(&pc.Lights[i].Direction), R));
+            XMStoreFloat3(&reflectedPass.Lights[i].Position,
+                          XMVector3TransformCoord(XMLoadFloat3(&pc.Lights[i].Position), R));
+        }
+        mCurrentFrame->PassCB->CopyData(1, reflectedPass);
+        
     }
 
     void UpdateWaves(const GameTimer& gt)
@@ -400,7 +435,7 @@ private:
     }
 
     // 逐个画渲染项：设 IA → 把根参数 0 指到这个物体的常量 → Draw
-    void DrawRenderItems()
+    void DrawRenderItems(const std::vector<RenderItem*>& items)
     {
         const UINT objCBByteSize = CalcConstantBufferByteSize(sizeof(ObjectConstants)); // 256 字节对齐
         const D3D12_GPU_VIRTUAL_ADDRESS objCBStart = mCurrentFrame->ObjectCB->Resource()->GetGPUVirtualAddress();
@@ -408,7 +443,7 @@ private:
         const UINT MatCBByteSize = CalcConstantBufferByteSize(sizeof(MaterialConstants));
         const D3D12_GPU_VIRTUAL_ADDRESS MatCBStart = mCurrentFrame->MaterialCB->Resource()->GetGPUVirtualAddress();
 
-        for (auto& ri : mAllItems)
+        for (auto& ri : items)
         {
             // PSO 是一整包状态，只能整个换。木箱用木箱的，陆地和波浪用另一套
             mCommandList->SetPipelineState(ri->PSO.Get());
@@ -446,18 +481,20 @@ private:
         mTextures[Tex->Name] = std::move(Tex);
     }
 
+    //加载材质到mTextures成员变量
     void LoadTextures()
     {
         LoadTextureHelper("woodCrateTex", L"Textures\\WoodCrate01.dds");
         LoadTextureHelper("WireFenceTex", L"Textures\\WireFence.dds");
+        LoadTextureHelper("iceTex", L"Textures\\ice.dds");
     }
 
-    // 着色器可见的 CBV/SRV/UAV 堆。常量走根 CBV，不需要 CBV 描述符，所以堆里只有纹理的 1 个 SRV
+    // 创建描述符堆
     void BuildDescriptorHeaps()
     {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {
             .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            .NumDescriptors = 2,
+            .NumDescriptors = 3,
             .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, // 着色器要从这个堆里读（RTV/DSV 堆不用，所以是 NONE）
             .NodeMask = 0,
         };
@@ -482,6 +519,19 @@ private:
 
         // 每个形状各自的顶点都不到 65536 个，16 位索引够用
         std::vector<std::uint16_t> indices = box.GetIndices16();
+
+        // 镜子：12×10 的竖直矩形，中心在原点，正面朝 -z（从 -z 看过去四个角是顺时针）。
+        // 接在盒子后面放进同一对缓冲，所以要记下盒子占了多少顶点、多少索引
+        const UINT boxVertexCount = (UINT)vertices.size();
+        const UINT boxIndexCount = (UINT)indices.size();
+        vertices.push_back(Vertex{XMFLOAT3(-6.0f, 5.0f, 0.0f), XMFLOAT3(0.0f, 0.0f, -1.0f), XMFLOAT2(0.0f, 0.0f)});
+        vertices.push_back(Vertex{XMFLOAT3(6.0f, 5.0f, 0.0f), XMFLOAT3(0.0f, 0.0f, -1.0f), XMFLOAT2(1.0f, 0.0f)});
+        vertices.push_back(Vertex{XMFLOAT3(6.0f, -5.0f, 0.0f), XMFLOAT3(0.0f, 0.0f, -1.0f), XMFLOAT2(1.0f, 1.0f)});
+        vertices.push_back(Vertex{XMFLOAT3(-6.0f, -5.0f, 0.0f), XMFLOAT3(0.0f, 0.0f, -1.0f), XMFLOAT2(0.0f, 1.0f)});
+        for (int i : {0, 1, 2, 0, 2, 3}) // 左上 → 右上 → 右下，左上 → 右下 → 左下
+        {
+            indices.push_back((std::uint16_t)i); // 从 0 数，画的时候靠 BaseVertexLocation 偏到镜子的顶点
+        }
 
         // 索引的元素类型、这里的 sizeof、IndexFormat = R16_UINT 三者必须一致
         const UINT vbByteSize = (UINT)vertices.size() * sizeof(Vertex);
@@ -514,6 +564,12 @@ private:
         submesh_Box.StartIndexLocation = 0;
         submesh_Box.BaseVertexLocation = 0;
         mShapeGeo->DrawArgs["box"] = submesh_Box;
+
+        DX_Utils::SubmeshGeometry submesh_Mirror;
+        submesh_Mirror.IndexCount = 6;
+        submesh_Mirror.StartIndexLocation = boxIndexCount; // 索引接在盒子的 36 个后面
+        submesh_Mirror.BaseVertexLocation = (int)boxVertexCount; // 顶点接在盒子的 24 个后面
+        mShapeGeo->DrawArgs["mirror"] = submesh_Mirror;
     }
 
     // 陆地：一张 160×160 的大网格，按高度函数把 y 抬起来，再按高度上色。
@@ -638,12 +694,14 @@ private:
         return n;
     }
 
+    //构建材质
     void BuildMaterials()
     {
         std::unique_ptr<Material> LMaterial_crate = std::make_unique<Material>();
         std::unique_ptr<Material> LMaterial_grass = std::make_unique<Material>();
         std::unique_ptr<Material> LMaterial_water = std::make_unique<Material>();
         std::unique_ptr<Material> LMaterial_fence = std::make_unique<Material>();
+        std::unique_ptr<Material> LMaterial_mirror = std::make_unique<Material>();
 
         LMaterial_crate->Name = "crate";
         LMaterial_crate->MatCBIndex = 0;
@@ -668,16 +726,23 @@ private:
         LMaterial_fence->DiffuseAlbedo = {1.0f, 1.0f, 1.0f, 1.0f};
         LMaterial_fence->FresnelR0 = {0.1f, 0.1f, 0.1f};
         LMaterial_fence->Roughness = 0.25f;
-        LMaterial_fence->DiffuseSrvHeapIndex = 1;
+        LMaterial_fence->DiffuseSrvHeapIndex = 1; //材质里的一个编号，意思是"我这个材质的贴图，放在 SRV 堆的第几格"。
+
+        LMaterial_mirror->Name = "mirror";
+        LMaterial_mirror->MatCBIndex = 4;
+        LMaterial_mirror->DiffuseAlbedo = {1.0f, 1.0f, 1.0f, .3f};
+        LMaterial_mirror->FresnelR0 = {0.1f, 0.1f, 0.1f};
+        LMaterial_mirror->Roughness = 0.5f;
+        LMaterial_mirror->DiffuseSrvHeapIndex = 2;
 
         mMaterials[LMaterial_crate->Name] = std::move(LMaterial_crate);
         mMaterials[LMaterial_grass->Name] = std::move(LMaterial_grass);
         mMaterials[LMaterial_water->Name] = std::move(LMaterial_water);
         mMaterials[LMaterial_fence->Name] = std::move(LMaterial_fence);
+        mMaterials[LMaterial_mirror->Name] = std::move(LMaterial_mirror);
     }
 
-    // 只放木箱和陆地两种渲染项（水面在第 5 步加进来）。
-    // 木箱和陆地各用一对顶点/索引缓冲、各用一套 PSO
+    //构建mAllItems
     void BuildRenderItems()
     {
         UINT objCBIndex = 0;
@@ -693,6 +758,7 @@ private:
         land->StartIndexLocation = mLandGeo->DrawArgs["grid"].StartIndexLocation;
         land->BaseVertexLocation = mLandGeo->DrawArgs["grid"].BaseVertexLocation;
         land->Mat = mMaterials.at("grass").get();
+        mRitemLayer[(int)RenderLayer::Opaque].push_back(land.get());
         mAllItems.push_back(std::move(land));
 
         // 10×10 个木箱铺在 xz 平面上，顺带当尺度参照物
@@ -718,21 +784,124 @@ private:
                 crate->StartIndexLocation = box.StartIndexLocation;
                 crate->BaseVertexLocation = box.BaseVertexLocation;
                 crate->Mat = mMaterials.at("crate").get();
+                mRitemLayer[(int)RenderLayer::Opaque].push_back(crate.get());
                 mAllItems.push_back(std::move(crate));
             }
         }
-        
-        auto fence = std::make_unique<RenderItem>();
-        fence->PSO = mAlphaTestedPSO;
-        fence->ObjCBIndex = objCBIndex++;
-        fence->Geo = mShapeGeo.get();
-        fence->IndexCount = box.IndexCount;
-        fence->StartIndexLocation = mShapeGeo->DrawArgs["box"].StartIndexLocation;
-        fence->BaseVertexLocation = mShapeGeo->DrawArgs["box"].BaseVertexLocation;
-        fence->Mat = mMaterials.at("fence").get();
-        XMStoreFloat4x4(&fence->World, XMMatrixScaling(4,4,4) * XMMatrixTranslation(0, 4, -20));
-        mAllItems.push_back(std::move(fence));
 
+        auto Lfence1 = std::make_unique<RenderItem>();
+        Lfence1->PSO = mAlphaTestedPSO;
+        Lfence1->ObjCBIndex = objCBIndex++;
+        Lfence1->Geo = mShapeGeo.get();
+        Lfence1->IndexCount = box.IndexCount;
+        Lfence1->StartIndexLocation = mShapeGeo->DrawArgs["box"].StartIndexLocation;
+        Lfence1->BaseVertexLocation = mShapeGeo->DrawArgs["box"].BaseVertexLocation;
+        Lfence1->Mat = mMaterials.at("fence").get();
+        XMStoreFloat4x4(&Lfence1->World, XMMatrixScaling(4, 4, 4) * XMMatrixTranslation(0, 4, -20));
+        mRitemLayer[(int)RenderLayer::Opaque].push_back(Lfence1.get());
+        mAllItems.push_back(std::move(Lfence1));
+
+        // 镜子用的两个新木箱（边长 3），都在镜子前面：
+        //   镜前木箱 —— 第 3 步让镜子照它；挡板木箱 —— 挡住镜子的左下角，验证"被挡住的那块镜子不标记"
+        const XMMATRIX extraCrateWorlds[] = {
+            XMMatrixScaling(1.5f, 1.5f, 1.5f) * XMMatrixTranslation(5.0f, 1.5f, -22.0f), // 镜前木箱
+            XMMatrixScaling(1.5f, 1.5f, 1.5f) * XMMatrixTranslation(6.75f, 2.5f, -25.25f), // 挡板木箱
+        };
+        for (const XMMATRIX& world : extraCrateWorlds)
+        {
+            auto crate = std::make_unique<RenderItem>();
+            crate->PSO = mCratePSO;
+            XMStoreFloat4x4(&crate->World, world);
+            crate->ObjCBIndex = objCBIndex++;
+            crate->Geo = mShapeGeo.get();
+            crate->IndexCount = box.IndexCount;
+            crate->StartIndexLocation = box.StartIndexLocation;
+            crate->BaseVertexLocation = box.BaseVertexLocation;
+            crate->Mat = mMaterials.at("crate").get();
+            mRitemLayer[(int)RenderLayer::Opaque].push_back(crate.get());
+            mAllItems.push_back(std::move(crate));
+        }
+        
+        //镜面
+        
+        const float yaw = 0.9608f;
+        const float nx = -sinf(yaw), nz = -cosf(yaw);
+        mMirrorPlane = XMFLOAT4(nx, 0.0f, nz, -(nx * 11.0f + nz * (-20.0f)));
+        const XMMATRIX R = XMMatrixReflect(XMLoadFloat4(&mMirrorPlane));
+        
+        const auto& mirrorArgs = mShapeGeo->DrawArgs.at("mirror");
+        auto mMarkMirror = std::make_unique<RenderItem>();
+        XMStoreFloat4x4(&mMarkMirror->World, XMMatrixRotationY(0.9608f) * XMMatrixTranslation(11.0f, 5.0f, -20.0f));    // 转 55°，面朝相机和铁丝网
+        mMarkMirror->PSO = mMarkMirrorsPSO;
+        mMarkMirror->ObjCBIndex = objCBIndex++;
+        mMarkMirror->Geo = mShapeGeo.get();
+        mMarkMirror->IndexCount = mirrorArgs.IndexCount;
+        mMarkMirror->StartIndexLocation = mirrorArgs.StartIndexLocation;
+        mMarkMirror->BaseVertexLocation = mirrorArgs.BaseVertexLocation;
+        mMarkMirror->Mat = mMaterials.at("mirror").get();
+        mRitemLayer[(int)RenderLayer::Mirrors].push_back(mMarkMirror.get());
+        mAllItems.push_back(std::move(mMarkMirror));
+        
+        auto mMirrorClear = std::make_unique<RenderItem>();
+        XMStoreFloat4x4(&mMirrorClear->World, XMMatrixRotationY(0.9608f) * XMMatrixTranslation(11.0f, 5.0f, -20.0f));
+        mMirrorClear->PSO = mMirrorClearPSO;
+        mMirrorClear->ObjCBIndex = objCBIndex++;
+        mMirrorClear->Geo = mShapeGeo.get();
+        mMirrorClear->IndexCount = mirrorArgs.IndexCount;
+        mMirrorClear->StartIndexLocation = mirrorArgs.StartIndexLocation;
+        mMirrorClear->BaseVertexLocation = mirrorArgs.BaseVertexLocation;
+        mMirrorClear->Mat = mMaterials.at("mirror").get();
+        mRitemLayer[(int)RenderLayer::MirrorClear].push_back(mMirrorClear.get());
+        mAllItems.push_back(std::move(mMirrorClear));
+        
+        auto mMirror = std::make_unique<RenderItem>();
+        XMStoreFloat4x4(&mMirror->World, XMMatrixRotationY(0.9608f) * XMMatrixTranslation(11.0f, 5.0f, -20.0f));
+        mMirror->PSO = mMirrorPSO;
+        mMirror->ObjCBIndex = objCBIndex++;
+        mMirror->Geo = mShapeGeo.get();
+        mMirror->IndexCount = mirrorArgs.IndexCount;
+        mMirror->StartIndexLocation = mirrorArgs.StartIndexLocation;
+        mMirror->BaseVertexLocation = mirrorArgs.BaseVertexLocation;
+        mMirror->Mat = mMaterials.at("mirror").get();
+        mRitemLayer[(int)RenderLayer::Transparent].push_back(mMirror.get());
+        mAllItems.push_back(std::move(mMirror));
+        
+        auto LRefectFence1 = std::make_unique<RenderItem>();
+        LRefectFence1->PSO = mReflectedFencePSO;
+        LRefectFence1->ObjCBIndex = objCBIndex++;
+        LRefectFence1->Geo = mShapeGeo.get();
+        LRefectFence1->IndexCount = box.IndexCount;
+        LRefectFence1->StartIndexLocation = mShapeGeo->DrawArgs["box"].StartIndexLocation;
+        LRefectFence1->BaseVertexLocation = mShapeGeo->DrawArgs["box"].BaseVertexLocation;
+        LRefectFence1->Mat = mMaterials.at("fence").get();
+        XMStoreFloat4x4(&LRefectFence1->World, XMMatrixScaling(4, 4, 4) * XMMatrixTranslation(0, 4, -20)*R);
+        mRitemLayer[(int)RenderLayer::Reflected].push_back(LRefectFence1.get());
+        mAllItems.push_back(std::move(LRefectFence1));
+        
+        auto LReflectCrate1 = std::make_unique<RenderItem>();
+        LReflectCrate1->PSO = mReflectedCratePSO;
+        LReflectCrate1->ObjCBIndex = objCBIndex++;
+        LReflectCrate1->Geo = mShapeGeo.get();
+        LReflectCrate1->IndexCount = box.IndexCount;
+        LReflectCrate1->StartIndexLocation = box.StartIndexLocation;
+        LReflectCrate1->BaseVertexLocation = box.BaseVertexLocation;
+        LReflectCrate1->Mat = mMaterials.at("crate").get();
+        XMStoreFloat4x4(&LReflectCrate1->World,extraCrateWorlds[0]*R);
+        mRitemLayer[(int)RenderLayer::Reflected].push_back(LReflectCrate1.get());
+        mAllItems.push_back(std::move(LReflectCrate1));
+        
+        auto LReflectCrate2 = std::make_unique<RenderItem>();
+        LReflectCrate2->PSO = mReflectedCratePSO;
+        LReflectCrate2->ObjCBIndex = objCBIndex++;
+        LReflectCrate2->Geo = mShapeGeo.get();
+        LReflectCrate2->IndexCount = box.IndexCount;
+        LReflectCrate2->StartIndexLocation = box.StartIndexLocation;
+        LReflectCrate2->BaseVertexLocation = box.BaseVertexLocation;
+        LReflectCrate2->Mat = mMaterials.at("crate").get();
+        XMStoreFloat4x4(&LReflectCrate2->World,extraCrateWorlds[1]*R);
+        mRitemLayer[(int)RenderLayer::Reflected].push_back(LReflectCrate2.get());
+        mAllItems.push_back(std::move(LReflectCrate2));
+        
         //水面
         auto water = std::make_unique<RenderItem>();
         XMStoreFloat4x4(&water->World, XMMatrixIdentity());
@@ -743,8 +912,8 @@ private:
         water->StartIndexLocation = mWaterGeo->DrawArgs["grid"].StartIndexLocation;
         water->BaseVertexLocation = mWaterGeo->DrawArgs["grid"].BaseVertexLocation;
         water->Mat = mMaterials.at("water").get();
-
         mWavesItem = water.get();
+        mRitemLayer[(int)RenderLayer::Transparent].push_back(mWavesItem);
         mAllItems.push_back(std::move(water));
     }
 
@@ -756,7 +925,7 @@ private:
             mFrameResources.push_back(
                 std::make_unique<FrameResource>(
                     mDevice.Get(),
-                    1,
+                    2,
                     (UINT)mAllItems.size(),
                     (UINT)mWaves->VertexCount(),
                     (UINT)mMaterials.size()));
@@ -794,6 +963,21 @@ private:
         };
         CD3DX12_CPU_DESCRIPTOR_HANDLE fenceHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), 1, mCSUDescriptorSize);
         mDevice->CreateShaderResourceView(WireFenceTex.Get(), &WireFenceDESC, fenceHandle);
+        
+        auto& iceTex = mTextures.at("iceTex")->Resource;
+        D3D12_SHADER_RESOURCE_VIEW_DESC iceDesc = {
+            .Format = iceTex->GetDesc().Format,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .Texture2D = {
+                .MostDetailedMip = 0,
+                .MipLevels = iceTex->GetDesc().MipLevels,
+                .PlaneSlice = 0,
+                .ResourceMinLODClamp = 0.0f,
+            }
+        };
+        CD3DX12_CPU_DESCRIPTOR_HANDLE iceHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), 2, mCSUDescriptorSize);
+        mDevice->CreateShaderResourceView(iceTex.Get(), &iceDesc, iceHandle);
     }
 
     // 根签名 = 着色器的"参数列表"：
@@ -858,6 +1042,8 @@ private:
         mCrateVSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "VS", "vs_5_1");
         mCratePSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "PS", "ps_5_1");
         mAlphaTestedPSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", alphaTestDefines, "PS", "ps_5_1");
+        mMirrorVSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "VS_MirrorClear", "vs_5_1");
+        mMirrorPSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "PS_MirrorClear", "ps_5_1");
         // 语义名, 语义索引, 格式, 输入槽, 在顶点里的字节偏移, 按顶点/按实例, 实例步进
         mCrateInputLayout = {
             {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
@@ -899,28 +1085,85 @@ private:
         psoDesc.PS = {mCratePSByteCode->GetBufferPointer(), mCratePSByteCode->GetBufferSize()};
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&psoDesc,IID_PPV_ARGS(&mCratePSO)));
         
+        D3D12_RENDER_TARGET_BLEND_DESC alpha = {};
+        alpha.BlendEnable = true; // 开常规混合（和 LogicOpEnable 只能开一个）
+        alpha.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        alpha.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        alpha.BlendOp = D3D12_BLEND_OP_ADD;
+        alpha.SrcBlendAlpha = D3D12_BLEND_ONE;
+        alpha.DestBlendAlpha = D3D12_BLEND_ZERO;
+        alpha.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        alpha.LogicOp = D3D12_LOGIC_OP_NOOP;
+        alpha.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        
+        auto LMarkMirrorsPSOdesc=psoDesc;   //标记镜子
+        auto LMirrorClearPSOdesc=psoDesc;   //镜子重置
+        auto LMirrorPSOdesc=psoDesc;    //半透明镜子
+        LMarkMirrorsPSOdesc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0;
+        LMarkMirrorsPSOdesc.DepthStencilState.DepthWriteMask =D3D12_DEPTH_WRITE_MASK_ZERO;
+        LMarkMirrorsPSOdesc.DepthStencilState.StencilEnable =true;
+        LMarkMirrorsPSOdesc.DepthStencilState.FrontFace ={
+            .StencilFailOp = D3D12_STENCIL_OP_KEEP,
+            .StencilDepthFailOp = D3D12_STENCIL_OP_KEEP,
+            .StencilPassOp = D3D12_STENCIL_OP_REPLACE,
+            .StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS 
+        };
+        LMarkMirrorsPSOdesc.DepthStencilState.BackFace = LMarkMirrorsPSOdesc.DepthStencilState.FrontFace;
+        LMirrorClearPSOdesc.VS = {mMirrorVSByteCode->GetBufferPointer(), mMirrorVSByteCode->GetBufferSize()};
+        LMirrorClearPSOdesc.PS = {mMirrorPSByteCode->GetBufferPointer(), mMirrorPSByteCode->GetBufferSize()};
+        LMirrorClearPSOdesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        LMirrorClearPSOdesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        LMirrorClearPSOdesc.DepthStencilState.StencilEnable =true;
+        LMirrorClearPSOdesc.DepthStencilState.FrontFace ={
+            .StencilFailOp = D3D12_STENCIL_OP_KEEP,
+            .StencilDepthFailOp = D3D12_STENCIL_OP_KEEP,
+            .StencilPassOp = D3D12_STENCIL_OP_KEEP,
+            .StencilFunc = D3D12_COMPARISON_FUNC_EQUAL
+        };
+        LMirrorClearPSOdesc.DepthStencilState.BackFace = LMirrorClearPSOdesc.DepthStencilState.FrontFace;
+        LMirrorPSOdesc.BlendState.RenderTarget[0] = alpha;
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&LMarkMirrorsPSOdesc,IID_PPV_ARGS(&mMarkMirrorsPSO)));
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&LMirrorClearPSOdesc,IID_PPV_ARGS(&mMirrorClearPSO)));
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&LMirrorPSOdesc,IID_PPV_ARGS(&mMirrorPSO)));
+        
         //AlphaTest
         auto fenceDesc = psoDesc;
         fenceDesc.PS = {mAlphaTestedPSByteCode->GetBufferPointer(), mAlphaTestedPSByteCode->GetBufferSize()};
         fenceDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&fenceDesc,IID_PPV_ARGS(&mAlphaTestedPSO)));
+        
+        auto LReflectedCratePSOdesc=psoDesc;
+        auto LReflectedFencePSOdesc=fenceDesc;
+        
+        LReflectedCratePSOdesc.DepthStencilState.StencilEnable =true;
+        LReflectedCratePSOdesc.DepthStencilState.FrontFace ={
+            .StencilFailOp = D3D12_STENCIL_OP_KEEP,
+            .StencilDepthFailOp = D3D12_STENCIL_OP_KEEP,
+            .StencilPassOp = D3D12_STENCIL_OP_KEEP,
+            .StencilFunc = D3D12_COMPARISON_FUNC_EQUAL
+        };
+        LReflectedCratePSOdesc.DepthStencilState.BackFace=LReflectedCratePSOdesc.DepthStencilState.FrontFace;
+        LReflectedCratePSOdesc.RasterizerState.FrontCounterClockwise = true; // 照镜子后顺时针变逆时针
+        
+        LReflectedFencePSOdesc.DepthStencilState.StencilEnable = true;
+        LReflectedFencePSOdesc.DepthStencilState.FrontFace ={
+            .StencilFailOp = D3D12_STENCIL_OP_KEEP,
+            .StencilDepthFailOp = D3D12_STENCIL_OP_KEEP,
+            .StencilPassOp = D3D12_STENCIL_OP_KEEP,
+            .StencilFunc = D3D12_COMPARISON_FUNC_EQUAL
+        };
+        LReflectedFencePSOdesc.DepthStencilState.BackFace = LReflectedFencePSOdesc.DepthStencilState.FrontFace;
+        LReflectedFencePSOdesc.RasterizerState.FrontCounterClockwise = true;
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&LReflectedCratePSOdesc,IID_PPV_ARGS(&mReflectedCratePSO)));
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&LReflectedFencePSOdesc,IID_PPV_ARGS(&mReflectedFencePSO)));
 
         // 陆地和水面：位置 + 顶点色，PS 直接返回颜色
         psoDesc.InputLayout = {mColorInputLayout.data(), (UINT)mColorInputLayout.size()};
         psoDesc.VS = {mColorVSByteCode->GetBufferPointer(), mColorVSByteCode->GetBufferSize()};
         psoDesc.PS = {mColorPSByteCode->GetBufferPointer(), mColorPSByteCode->GetBufferSize()};
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&psoDesc,IID_PPV_ARGS(&mColorPSO)));
-        D3D12_RENDER_TARGET_BLEND_DESC t = {};
-        t.BlendEnable = true; // 开常规混合（和 LogicOpEnable 只能开一个）
-        t.SrcBlend = D3D12_BLEND_SRC_ALPHA;
-        t.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-        t.BlendOp = D3D12_BLEND_OP_ADD;
-        t.SrcBlendAlpha = D3D12_BLEND_ONE;
-        t.DestBlendAlpha = D3D12_BLEND_ZERO;
-        t.BlendOpAlpha = D3D12_BLEND_OP_ADD;
-        t.LogicOp = D3D12_LOGIC_OP_NOOP;
-        t.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-        psoDesc.BlendState.RenderTarget[0] = t;
+        
+        psoDesc.BlendState.RenderTarget[0] = alpha;
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&psoDesc,IID_PPV_ARGS(&mBlendPSO)));
     }
 
@@ -938,6 +1181,7 @@ private:
     // 波浪：CPU 端的模拟。只算高度和法线，不碰任何 D3D 资源
     std::unique_ptr<Waves> mWaves;
     std::vector<std::unique_ptr<RenderItem>> mAllItems;
+    std::vector<RenderItem*> mRitemLayer[(int)RenderLayer::Count];
     RenderItem* mWavesItem = nullptr;
 
     // 帧资源：3 份轮流用，CPU 最多领先 GPU 3 帧
@@ -954,12 +1198,20 @@ private:
     ComPtr<ID3DBlob> mCrateVSByteCode;
     ComPtr<ID3DBlob> mCratePSByteCode;
     ComPtr<ID3DBlob> mAlphaTestedPSByteCode;
+    ComPtr<ID3DBlob> mMirrorVSByteCode;
+    ComPtr<ID3DBlob> mMirrorPSByteCode;
     std::vector<D3D12_INPUT_ELEMENT_DESC> mCrateInputLayout;
     ComPtr<ID3D12PipelineState> mColorPSO;
     std::vector<D3D12_INPUT_ELEMENT_DESC> mColorInputLayout;
     ComPtr<ID3DBlob> mColorVSByteCode;
     ComPtr<ID3DBlob> mColorPSByteCode;
     ComPtr<ID3D12PipelineState> mBlendPSO;
+    ComPtr<ID3D12PipelineState> mMarkMirrorsPSO;
+    ComPtr<ID3D12PipelineState> mMirrorClearPSO;
+    ComPtr<ID3D12PipelineState> mMirrorPSO;
+    ComPtr<ID3D12PipelineState> mReflectedCratePSO;
+    ComPtr<ID3D12PipelineState> mReflectedFencePSO;
+    XMFLOAT4 mMirrorPlane;
 
     // 相机：绕原点转的球坐标 (θ, φ, r)
     Camera mCamera;

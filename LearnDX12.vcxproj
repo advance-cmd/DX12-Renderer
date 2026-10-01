@@ -168,6 +168,7 @@
   <ItemGroup>
     <Content Include="Textures\WoodCrate01.dds" />
     <Content Include="Textures\WireFence.dds" />
+    <Content Include="Textures\ice.dds" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

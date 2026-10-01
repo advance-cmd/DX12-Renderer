@@ -69,3 +69,15 @@ float4 PS(VertexOut pin) : SV_Target
 #endif
     return res;
 }
+
+VertexOut VS_MirrorClear(VertexIn vin)
+{
+    VertexOut vout = VS(vin);            // 位置照常算
+    vout.PosH.z = vout.PosH.w * 0.9999f; // 透视除法后 z/w ≈ 1，也就是最远处
+    return vout;
+}
+
+float4 PS_MirrorClear(VertexOut pin) : SV_Target
+{
+    return gPass.FogColor;
+}
