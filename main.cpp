@@ -82,6 +82,8 @@ enum class RenderLayer : int
     Count
 };
 
+static constexpr UINT kTimestampCount = 6;
+
 class CrateApp : public D3DApp
 {
 public:
@@ -114,13 +116,14 @@ public:
         LoadTextures(); // 录制复制命令（纹理）
         BuildDescriptorHeaps();
         BuildBlurResources(); // 模糊用的两张纹理和它们的 4 个描述符（要用到堆）
+        BuildTimestampQueries(); //Pass时间记录
         BuildShapeGeometry(); // 录制复制命令（木箱）
         BuildLandGeometry(); // 录制复制命令（陆地的顶点/索引）
         BuildWaves(); // 波浪模拟（这一步只建模拟本体，第 5 步再建水面几何）
         BuildTreeSpritesGeometry(); // 录制复制命令（树的点）
         BuildShaderResourceViews(); // 要用到纹理和堆
         BuildRootSignature(); // PSO 要用根签名
-        BuildBlurRootSignature();   //模糊专用的根签名
+        BuildBlurRootSignature(); //模糊专用的根签名
         BuildShadersAndInputLayout(); // PSO 要用着色器和输入布局
         BuildPSO(); // 上面两样都有了才能建 PSO；渲染项要记住用哪个 PSO，所以再排在它前面
         BuildMaterials(); //FrameResources要用到这个
@@ -214,49 +217,75 @@ protected:
             mDevice->CreateUnorderedAccessView(mBlurMap[i].Get(), nullptr, &uavDesc, uav); // 第二个参数是计数器资源，用不到
         }
     }
-    
+
+    void BuildTimestampQueries()
+    {
+        //查询堆：用来存放时间戳读数的一块显存，有点像描述符堆，只不过每格放的是一个查询结果。
+        D3D12_QUERY_HEAP_DESC query_heap_desc = {
+            .Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+            .Count = kTimestampCount * gNumFrameResources,
+            .NodeMask = 0,
+        };
+        ThrowIfFailed(mDevice->CreateQueryHeap(&query_heap_desc,IID_PPV_ARGS(&mTimestampHeap)));
+        //回读缓冲：GPU 把查询堆里的读数复制到这里，CPU 再从这里读。和截图用的回读缓冲是同一种东西。
+        CD3DX12_HEAP_PROPERTIES readBackHeap(D3D12_HEAP_TYPE_READBACK);
+        CD3DX12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(query_heap_desc.Count * sizeof(UINT64));
+        ThrowIfFailed(mDevice->CreateCommittedResource(
+            &readBackHeap,
+            D3D12_HEAP_FLAG_NONE,
+            &bufferDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,
+            IID_PPV_ARGS(&mTimestampReadback)));
+        ThrowIfFailed(mCommandQueue->GetTimestampFrequency(&mTimestampFreq)); // 每秒多少个"嘀嗒"
+    }
+
     // 后期模糊：进来时后台缓冲是 RENDER_TARGET，出去时还是；A、B 进出都是 COMMON
     void DoBlur()
     {
         // 0. 权重和半径，作为根常量传进去
         std::vector<float> weights = CalcGaussWeights(2.5f);
-        const int blurRadius = (int)weights.size() /2;
+        const int blurRadius = (int)weights.size() / 2;
         mCommandList->SetComputeRootSignature(mBlurRootSignature.Get());
-        mCommandList->SetComputeRoot32BitConstants(0, 1, &blurRadius, 0);                          // 第 0 格：半径
-        mCommandList->SetComputeRoot32BitConstants(0, (UINT)weights.size(), weights.data(), 1);    // 第 1～11 格：权重
-        
+        mCommandList->SetComputeRoot32BitConstants(0, 1, &blurRadius, 0); // 第 0 格：半径
+        mCommandList->SetComputeRoot32BitConstants(0, (UINT)weights.size(), weights.data(), 1); // 第 1～11 格：权重
+
         ID3D12Resource* back = CurrentBackBuffer();
         ID3D12Resource* A = mBlurMap[0].Get();
         ID3D12Resource* B = mBlurMap[1].Get();
-        
+
         // ① 场景复制进 A
         D3D12_RESOURCE_BARRIER b1[] = {
-            CD3DX12_RESOURCE_BARRIER::Transition(back, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            CD3DX12_RESOURCE_BARRIER::Transition(back, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                 D3D12_RESOURCE_STATE_COPY_SOURCE),
             CD3DX12_RESOURCE_BARRIER::Transition(A, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
         };
         mCommandList->ResourceBarrier(2, b1);
-        mCommandList->CopyResource(A, back);   // 参数顺序：(目标, 来源)
-        
+        mCommandList->CopyResource(A, back); // 参数顺序：(目标, 来源)
+
         D3D12_RESOURCE_BARRIER b2[] = {
-            CD3DX12_RESOURCE_BARRIER::Transition(A,D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            CD3DX12_RESOURCE_BARRIER::Transition(B,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+            CD3DX12_RESOURCE_BARRIER::Transition(A, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            CD3DX12_RESOURCE_BARRIER::Transition(B, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
         };
         mCommandList->ResourceBarrier(2, b2);
-        
+
         const UINT groupsX = (UINT)ceilf(mClientWidth / 256.0f);
         const UINT groupsY = (UINT)ceilf(mClientHeight / 256.0f);
-        for (int i=0;i<mBlurCount;i++)
+        for (int i = 0; i < mBlurCount; i++)
         {
             // ③a 横向：读 A，写 B
             mCommandList->SetPipelineState(mHorzBlurPSO.Get());
-            mCommandList->SetComputeRootDescriptorTable(1, HeapGpuHandle(5));    // 根参数 1（输入）= 堆第 5 格：A 的 SRV
+            mCommandList->SetComputeRootDescriptorTable(1, HeapGpuHandle(5)); // 根参数 1（输入）= 堆第 5 格：A 的 SRV
             mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(8)); // 空 2：根参数 2（输出）= B 的 UAV 在第几格？
-            mCommandList->Dispatch(groupsX, mClientHeight, 1);                  // 每个线程组管一行里的 256 个像素
-            
+            mCommandList->Dispatch(groupsX, mClientHeight, 1); // 每个线程组管一行里的 256 个像素
+
             // 交换：A 变成可写，B 变成可读
             D3D12_RESOURCE_BARRIER s1[] = {
-                CD3DX12_RESOURCE_BARRIER::Transition(A, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-                CD3DX12_RESOURCE_BARRIER::Transition(B, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),                        // 空 3
+                CD3DX12_RESOURCE_BARRIER::Transition(A, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                CD3DX12_RESOURCE_BARRIER::Transition(B, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE), // 空 3
             };
             mCommandList->ResourceBarrier(2, s1);
 
@@ -264,27 +293,32 @@ protected:
             mCommandList->SetPipelineState(mVertBlurPSO.Get());
             mCommandList->SetComputeRootDescriptorTable(1, HeapGpuHandle(7)); // 空 4：B 的 SRV
             mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(6)); // 空 4：A 的 UAV
-            mCommandList->Dispatch(mClientWidth,groupsY,1);                                   // 空 5：每个线程组管一列里的 256 个像素
-            
+            mCommandList->Dispatch(mClientWidth, groupsY, 1); // 空 5：每个线程组管一列里的 256 个像素
+
             // 交换回来，下一轮又从"读 A、写 B"开始
             D3D12_RESOURCE_BARRIER s2[] = {
-                CD3DX12_RESOURCE_BARRIER::Transition(A, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-                CD3DX12_RESOURCE_BARRIER::Transition(B, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                CD3DX12_RESOURCE_BARRIER::Transition(A, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                CD3DX12_RESOURCE_BARRIER::Transition(B, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             };
             mCommandList->ResourceBarrier(2, s2);
         }
-        
+
         // ④ 结果在 A 里，复制回后台缓冲
         D3D12_RESOURCE_BARRIER b4[] = {
-            CD3DX12_RESOURCE_BARRIER::Transition(back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
-            CD3DX12_RESOURCE_BARRIER::Transition(A, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            CD3DX12_RESOURCE_BARRIER::Transition(back, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                 D3D12_RESOURCE_STATE_COPY_DEST),
+            CD3DX12_RESOURCE_BARRIER::Transition(A, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                                 D3D12_RESOURCE_STATE_COPY_SOURCE),
         };
         mCommandList->ResourceBarrier(2, b4);
-        mCommandList->CopyResource(back,A);                                 // 空 6
-        
+        mCommandList->CopyResource(back, A); // 空 6
+
         // ⑤ 收尾：全部恢复成进来时的样子
         D3D12_RESOURCE_BARRIER b5[] = {
-            CD3DX12_RESOURCE_BARRIER::Transition(back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET),
+            CD3DX12_RESOURCE_BARRIER::Transition(back, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                 D3D12_RESOURCE_STATE_RENDER_TARGET),
             CD3DX12_RESOURCE_BARRIER::Transition(A, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
             CD3DX12_RESOURCE_BARRIER::Transition(B, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
         };
@@ -343,7 +377,40 @@ protected:
         // 轮换到下一份帧资源；GPU 如果还在用它，就先等
         mCurrFrameResourceIndex = (mCurrFrameResourceIndex + 1) % gNumFrameResources;
         mCurrentFrame = mFrameResources[mCurrFrameResourceIndex].get();
-        WaitForCurrentFrameResource();
+        WaitForCurrentFrameResource();  //执行完，说明上一次用这份帧资源的那一帧，GPU 已经全部做完了。
+        
+        if (mCurrentFrame->Fence !=0)
+        {
+            const UINT tsBase = mCurrFrameResourceIndex * kTimestampCount;
+            D3D12_RANGE readRange{tsBase * sizeof(UINT64), (tsBase + kTimestampCount) * sizeof(UINT64)};  // 告诉驱动：CPU 要读哪一段
+            UINT64* data = nullptr;
+            ThrowIfFailed(mTimestampReadback->Map(0, &readRange, reinterpret_cast<void**>(&data)));
+            const UINT64* t = data + tsBase; // Map 返回的是整个缓冲的开头，要自己加偏移才是这一帧的 T0
+            // 相邻两个时间戳之差 = 这一段的耗时（嘀嗒数 → 毫秒）。必须在 Unmap 之前读完
+            for (UINT k = 0; k < kTimestampCount - 1; k++)
+            {
+                mPassMsSum[k] += (t[k + 1] - t[k]) * 1000.0 / mTimestampFreq;
+            }
+            D3D12_RANGE noWrite{0, 0}; // CPU 一个字节都没写
+            mTimestampReadback->Unmap(0, &noWrite);
+
+            // 每帧的数会跳，攒 60 帧取平均再显示，然后清零重新攒
+            if (++mPassSamples == 60)
+            {
+                double avg[kTimestampCount - 1];
+                for (UINT k = 0; k < kTimestampCount - 1; k++)
+                {
+                    avg[k] = mPassMsSum[k] / mPassSamples;
+                    mPassMsSum[k] = 0.0;
+                }
+                mPassSamples = 0;
+                // 基类每秒刷新一次标题（CalculateFrameStats），会把这段文字带上
+                mMainWndCaption = std::format(
+                    L"LearnDX12    移速 {:.1f}    GPU：不透明 {:.3f} | 镜子 {:.3f} | 影子 {:.3f} | 透明 {:.3f} | 模糊 {:.3f} ms",
+                    mCamera.GetMoveSpeed(), avg[0], avg[1], avg[2], avg[3], avg[4]);
+            }
+        }
+        
         UpdateWaves(gt);
 
         UpdateMaterialCBs();
@@ -353,6 +420,7 @@ protected:
 
     void Draw(const GameTimer& gt) override
     {
+        const UINT tsBase = mCurrFrameResourceIndex * kTimestampCount; // 这份帧资源的 6 格从这里开始
         // 用这份帧资源自己的分配器录制（Update 里已经确认 GPU 用完了它）
         ThrowIfFailed(mCurrentFrame->CmdListAlloc->Reset());
         ThrowIfFailed(mCommandList->Reset(mCurrentFrame->CmdListAlloc.Get(), nullptr));
@@ -380,7 +448,9 @@ protected:
         mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
         mCommandList->SetGraphicsRootConstantBufferView(2, mCurrentFrame->PassCB->Resource()->GetGPUVirtualAddress());
 
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 0); // T0
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Opaque]);
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 1); // T1
         mCommandList->OMSetStencilRef(1); // 章上刻"1"
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Mirrors]); // ③ 看得见的镜子像素盖章
         DrawRenderItems(mRitemLayer[(int)RenderLayer::MirrorClear]); // ③b 盖了章的地方：深度推远、刷成天空色
@@ -391,12 +461,21 @@ protected:
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Reflected]);
         mCommandList->SetGraphicsRootConstantBufferView(2, passCB); // 换回主 Pass 常量，后面的镜子和水要用
         mCommandList->OMSetStencilRef(0); // 用完恢复
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 2); // T2
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Shadow]);
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 3); // T3
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Transparent]);
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 4); // T4
         if (mBlurEnabled)
         {
             DoBlur();
         }
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 5); // T5
+        mCommandList->ResolveQueryData(
+            mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+            tsBase, kTimestampCount, // 空 1：从查询堆第几格开始、复制几格
+            mTimestampReadback.Get(),
+            tsBase*sizeof(UINT64)); // 空 2：复制到回读缓冲的第几个字节
 
         // 后台缓冲：RENDER_TARGET → PRESENT
         auto toPresent = CD3DX12_RESOURCE_BARRIER::Transition(
@@ -1409,7 +1488,7 @@ private:
         CD3DX12_DESCRIPTOR_RANGE uavRange;
         uavRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); //描述符表，里面 1 个 UAV，从 u0 开始	gOutput : register(u0)
         slotRootParameter[2].InitAsDescriptorTable(1, &uavRange);
-        
+
         CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(
             _countof(slotRootParameter), slotRootParameter,
             0, nullptr, // 不用采样器：着色器里是按下标直接读像素
@@ -1624,16 +1703,16 @@ private:
 
         psoDesc.BlendState.RenderTarget[0] = alpha;
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&psoDesc,IID_PPV_ARGS(&mBlendPSO)));
-        
+
         //Horz
         D3D12_COMPUTE_PIPELINE_STATE_DESC GusBlurDesc = {
             .pRootSignature = mBlurRootSignature.Get(),
-            .CS = {mHorzBlurCSByteCode->GetBufferPointer(),mHorzBlurCSByteCode->GetBufferSize()},
+            .CS = {mHorzBlurCSByteCode->GetBufferPointer(), mHorzBlurCSByteCode->GetBufferSize()},
             .Flags = D3D12_PIPELINE_STATE_FLAG_NONE
         };
         ThrowIfFailed(mDevice->CreateComputePipelineState(&GusBlurDesc,IID_PPV_ARGS(&mHorzBlurPSO)));
         //Vert
-        GusBlurDesc.CS = {mVertBlurCSByteCode->GetBufferPointer(),mVertBlurCSByteCode->GetBufferSize()};
+        GusBlurDesc.CS = {mVertBlurCSByteCode->GetBufferPointer(), mVertBlurCSByteCode->GetBufferSize()};
         ThrowIfFailed(mDevice->CreateComputePipelineState(&GusBlurDesc,IID_PPV_ARGS(&mVertBlurPSO)));
     }
 
@@ -1687,6 +1766,7 @@ private:
     // 帧资源：3 份轮流用，CPU 最多领先 GPU 3 帧
     std::vector<std::unique_ptr<FrameResource>> mFrameResources;
     FrameResource* mCurrentFrame = nullptr; // 当前这一帧用的那一份
+    //这一帧用的是第几份帧资源
     int mCurrFrameResourceIndex = 0;
 
     // 管线：描述符堆、根签名、着色器、输入布局、PSO（两套：木箱一套，陆地/水面共用一套）
@@ -1731,7 +1811,13 @@ private:
     ComPtr<ID3DBlob> mVertBlurCSByteCode;
     ComPtr<ID3D12PipelineState> mHorzBlurPSO;
     ComPtr<ID3D12PipelineState> mVertBlurPSO;
-    
+
+    //时间戳
+    ComPtr<ID3D12QueryHeap> mTimestampHeap;
+    ComPtr<ID3D12Resource> mTimestampReadback;
+    UINT64 mTimestampFreq = 1; // 初值给 1，免得读数之前不小心除以 0
+    double mPassMsSum[kTimestampCount - 1] = {}; // 5 段各自累加的毫秒数（不透明、镜子、影子、透明、模糊）
+    int mPassSamples = 0;                        // 已经攒了几帧
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, int nShowCmd)
