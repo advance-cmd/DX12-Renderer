@@ -3,6 +3,7 @@
 #include <cassert>
 #include <format>
 #include <windowsx.h>
+#include <dxgi1_6.h>    // IDXGIFactory6::EnumAdapterByGpuPreference：按性能挑显卡
 
 // 窗口类只认普通函数指针，填不了成员函数，这里转发给当前 App 的 MsgProc
 static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -301,19 +302,50 @@ void D3DApp::InitDxgiFactory()
     ThrowIfFailed(CreateDXGIFactory2(flags, IID_PPV_ARGS(&mDxgiFactory)));
 }
 
-//创建设备：先尝试硬件设备，失败则回退到WARP
+//创建设备：优先用高性能显卡（独显），都不行再用默认显卡，最后回退到 WARP
 void D3DApp::CreateD3DDevice()
 {
-    //尝试创建硬件设备
+    //传 nullptr 用的是"默认显卡"（第 0 块），双显卡笔记本上通常是集显。
+    //所以先按"高性能优先"的顺序把显卡排一遍，挑第一块能建出 D3D12 设备的硬件显卡
+    HRESULT hardwareResult = E_FAIL;
+    ComPtr<IDXGIFactory6> factory6;
+    if (SUCCEEDED(mDxgiFactory.As(&factory6))) //IDXGIFactory6 要 Win10 1803 以上，拿不到就跳过
+    {
+        ComPtr<IDXGIAdapter1> adapter;
+        for (UINT i = 0;
+             factory6->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter)) != DXGI_ERROR_NOT_FOUND;
+             i++)
+        {
+            DXGI_ADAPTER_DESC1 desc;
+            adapter->GetDesc1(&desc);
+            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) //软件显卡（WARP）留到最后再说
+            {
+                continue;
+            }
+            hardwareResult = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&mDevice));
+            if (SUCCEEDED(hardwareResult))
+            {
+                mAdapterName = desc.Description;
+                break;
+            }
+        }
+    }
+
+    //上面没成功：退回默认显卡
     //这里不用 ThrowIfFailed：硬件设备失败是预期情况，要回退到 WARP，而不是直接报错退出
-    HRESULT hardwareResult = D3D12CreateDevice(
-        nullptr,
-        D3D_FEATURE_LEVEL_11_0,
-        IID_PPV_ARGS(&mDevice));
+    if (FAILED(hardwareResult))
+    {
+        hardwareResult = D3D12CreateDevice(
+            nullptr,
+            D3D_FEATURE_LEVEL_11_0,
+            IID_PPV_ARGS(&mDevice));
+        mAdapterName = L"默认显卡";
+    }
 
     //回退WARP
     if (FAILED(hardwareResult))
     {
+        mAdapterName = L"WARP（软件渲染）";
         //拿到软件适配器
         ComPtr<IDXGIAdapter> adapter;
         ThrowIfFailed(mDxgiFactory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)));
@@ -484,8 +516,8 @@ void D3DApp::CalculateFrameStats()
         float fps = (float)frameCnt; //一秒内画了几帧，就是帧率
         float mspf = 1000.0f / fps; //平均每帧用了多少毫秒
 
-        std::wstring windowText = std::format(L"{}    fps: {:.0f}    mspf: {:.3f}",
-                                              mMainWndCaption, fps, mspf);
+        std::wstring windowText = std::format(L"{}    fps: {:.0f}    mspf: {:.3f}    {}",
+                                              mMainWndCaption, fps, mspf, mAdapterName);
         SetWindowText(mhMainWnd, windowText.c_str());
         // 为下一秒做准备
         frameCnt = 0;

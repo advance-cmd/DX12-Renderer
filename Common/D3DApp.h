@@ -95,6 +95,7 @@ protected:
 
     ComPtr<IDXGIFactory4> mDxgiFactory;
     ComPtr<ID3D12Device> mDevice;
+    std::wstring mAdapterName;  // 实际用的是哪块显卡，显示在窗口标题上
     ComPtr<ID3D12Fence1> mFence;
     UINT64 mCurrentFence = 0;
     UINT mRTVDescriptorSize = 0;
