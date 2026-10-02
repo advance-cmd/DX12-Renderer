@@ -152,6 +152,7 @@
     <ClCompile Include="FrameResource.cpp" />
     <None Include="HLSL\LightingUtil.hlsl" />
     <None Include="HLSL\TreeSprite.hlsl" />
+    <None Include="HLSL\Blur.hlsl" />
     <ClCompile Include="Waves.cpp" />
     <ClCompile Include="main.cpp" />
   </ItemGroup>

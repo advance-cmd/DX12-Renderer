@@ -113,12 +113,14 @@ public:
         mCamera.LookAt(XMFLOAT3(0.0f, 4.99f, -49.75f), XMFLOAT3(0.0f, 0.0f, 0.0f), XMFLOAT3(0.0f, 1.0f, 0.0f));
         LoadTextures(); // 录制复制命令（纹理）
         BuildDescriptorHeaps();
+        BuildBlurResources(); // 模糊用的两张纹理和它们的 4 个描述符（要用到堆）
         BuildShapeGeometry(); // 录制复制命令（木箱）
         BuildLandGeometry(); // 录制复制命令（陆地的顶点/索引）
         BuildWaves(); // 波浪模拟（这一步只建模拟本体，第 5 步再建水面几何）
         BuildTreeSpritesGeometry(); // 录制复制命令（树的点）
         BuildShaderResourceViews(); // 要用到纹理和堆
         BuildRootSignature(); // PSO 要用根签名
+        BuildBlurRootSignature();   //模糊专用的根签名
         BuildShadersAndInputLayout(); // PSO 要用着色器和输入布局
         BuildPSO(); // 上面两样都有了才能建 PSO；渲染项要记住用哪个 PSO，所以再排在它前面
         BuildMaterials(); //FrameResources要用到这个
@@ -152,12 +154,162 @@ protected:
 
         // 宽高比变了，投影矩阵要跟着重算
         mCamera.SetLens(0.25f * XM_PI, AspectRatio(), 1.0f, 1000.f);
+
+        // 模糊纹理必须和后台缓冲一样大（要互相 CopyResource）。
+        // Initialize 里第一次调用到这里时描述符堆还没建，跳过，留给 Initialize 自己建
+        if (mHeap)
+        {
+            BuildBlurResources();
+        }
+    }
+
+    //构建Blur View
+    // 后期模糊用的两张纹理 A = mBlurMap[0]、B = mBlurMap[1]：大小、格式都和后台缓冲一样，
+    // 带 ALLOW_UNORDERED_ACCESS 标志（计算着色器要往里写，没有这个标志建不了 UAV）。
+    // 约定：每帧开始和结束时两张都在 COMMON 状态。
+    // 描述符放在堆的第 5～8 格：5 = A 的 SRV，6 = A 的 UAV，7 = B 的 SRV，8 = B 的 UAV
+    void BuildBlurResources()
+    {
+        D3D12_RESOURCE_DESC texDesc = {
+            .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            .Alignment = 0,
+            .Width = mClientWidth,
+            .Height = mClientHeight,
+            .DepthOrArraySize = 1,
+            .MipLevels = 1,
+            .Format = mBackBufferFormat,
+            .SampleDesc = {.Count = 1, .Quality = 0},
+            .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            .Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        };
+        CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+        // 先存成变量再取地址（直接 &CD3DX12_HEAP_PROPERTIES(...) 会报 C2102）
+        for (int i = 0; i < 2; i++)
+        {
+            mBlurMap[i].Reset(); // 窗口变大小时先释放旧的（D3DApp::OnResize 开头 Flush 过，GPU 已经不用它了）
+            ThrowIfFailed(mDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &texDesc,
+                D3D12_RESOURCE_STATE_COMMON, nullptr,
+                IID_PPV_ARGS(&mBlurMap[i])));
+        }
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+            .Format = mBackBufferFormat,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .Texture2D = {.MostDetailedMip = 0, .MipLevels = 1},
+        };
+        // UAV 描述：只能指定一个 mip 级别（MipSlice），计算着色器就往这一级里写
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
+            .Format = mBackBufferFormat,
+            .ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D,
+            .Texture2D = {.MipSlice = 0},
+        };
+        for (int i = 0; i < 2; i++)
+        {
+            CD3DX12_CPU_DESCRIPTOR_HANDLE srv(mHeap->GetCPUDescriptorHandleForHeapStart(), 5 + 2 * i,
+                                              mCSUDescriptorSize);
+            CD3DX12_CPU_DESCRIPTOR_HANDLE uav(mHeap->GetCPUDescriptorHandleForHeapStart(), 6 + 2 * i,
+                                              mCSUDescriptorSize);
+            mDevice->CreateShaderResourceView(mBlurMap[i].Get(), &srvDesc, srv);
+            mDevice->CreateUnorderedAccessView(mBlurMap[i].Get(), nullptr, &uavDesc, uav); // 第二个参数是计数器资源，用不到
+        }
+    }
+    
+    // 后期模糊：进来时后台缓冲是 RENDER_TARGET，出去时还是；A、B 进出都是 COMMON
+    void DoBlur()
+    {
+        // 0. 权重和半径，作为根常量传进去
+        std::vector<float> weights = CalcGaussWeights(2.5f);
+        const int blurRadius = (int)weights.size() /2;
+        mCommandList->SetComputeRootSignature(mBlurRootSignature.Get());
+        mCommandList->SetComputeRoot32BitConstants(0, 1, &blurRadius, 0);                          // 第 0 格：半径
+        mCommandList->SetComputeRoot32BitConstants(0, (UINT)weights.size(), weights.data(), 1);    // 第 1～11 格：权重
+        
+        ID3D12Resource* back = CurrentBackBuffer();
+        ID3D12Resource* A = mBlurMap[0].Get();
+        ID3D12Resource* B = mBlurMap[1].Get();
+        
+        // ① 场景复制进 A
+        D3D12_RESOURCE_BARRIER b1[] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(back, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            CD3DX12_RESOURCE_BARRIER::Transition(A, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
+        };
+        mCommandList->ResourceBarrier(2, b1);
+        mCommandList->CopyResource(A, back);   // 参数顺序：(目标, 来源)
+        
+        D3D12_RESOURCE_BARRIER b2[] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(A,D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            CD3DX12_RESOURCE_BARRIER::Transition(B,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+        };
+        mCommandList->ResourceBarrier(2, b2);
+        
+        const UINT groupsX = (UINT)ceilf(mClientWidth / 256.0f);
+        const UINT groupsY = (UINT)ceilf(mClientHeight / 256.0f);
+        for (int i=0;i<mBlurCount;i++)
+        {
+            // ③a 横向：读 A，写 B
+            mCommandList->SetPipelineState(mHorzBlurPSO.Get());
+            mCommandList->SetComputeRootDescriptorTable(1, HeapGpuHandle(5));    // 根参数 1（输入）= 堆第 5 格：A 的 SRV
+            mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(8)); // 空 2：根参数 2（输出）= B 的 UAV 在第几格？
+            mCommandList->Dispatch(groupsX, mClientHeight, 1);                  // 每个线程组管一行里的 256 个像素
+            
+            // 交换：A 变成可写，B 变成可读
+            D3D12_RESOURCE_BARRIER s1[] = {
+                CD3DX12_RESOURCE_BARRIER::Transition(A, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                CD3DX12_RESOURCE_BARRIER::Transition(B, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),                        // 空 3
+            };
+            mCommandList->ResourceBarrier(2, s1);
+
+            // ③b 纵向：读 B，写 A
+            mCommandList->SetPipelineState(mVertBlurPSO.Get());
+            mCommandList->SetComputeRootDescriptorTable(1, HeapGpuHandle(7)); // 空 4：B 的 SRV
+            mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(6)); // 空 4：A 的 UAV
+            mCommandList->Dispatch(mClientWidth,groupsY,1);                                   // 空 5：每个线程组管一列里的 256 个像素
+            
+            // 交换回来，下一轮又从"读 A、写 B"开始
+            D3D12_RESOURCE_BARRIER s2[] = {
+                CD3DX12_RESOURCE_BARRIER::Transition(A, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                CD3DX12_RESOURCE_BARRIER::Transition(B, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            };
+            mCommandList->ResourceBarrier(2, s2);
+        }
+        
+        // ④ 结果在 A 里，复制回后台缓冲
+        D3D12_RESOURCE_BARRIER b4[] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+            CD3DX12_RESOURCE_BARRIER::Transition(A, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        };
+        mCommandList->ResourceBarrier(2, b4);
+        mCommandList->CopyResource(back,A);                                 // 空 6
+        
+        // ⑤ 收尾：全部恢复成进来时的样子
+        D3D12_RESOURCE_BARRIER b5[] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET),
+            CD3DX12_RESOURCE_BARRIER::Transition(A, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+            CD3DX12_RESOURCE_BARRIER::Transition(B, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+        };
+        mCommandList->ResourceBarrier(3, b5);
+    }
+
+    // 堆里第 slot 格的 GPU 句柄（SetComputeRootDescriptorTable 要用）
+    CD3DX12_GPU_DESCRIPTOR_HANDLE HeapGpuHandle(int slot) const
+    {
+        return CD3DX12_GPU_DESCRIPTOR_HANDLE(mHeap->GetGPUDescriptorHandleForHeapStart(), slot, mCSUDescriptorSize);
     }
 
     // WASD 前后左右，Q 下降、E 上升（沿世界 y 轴，和朝向无关）
     void OnKeyboardInput(const GameTimer& gt)
     {
         auto down = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
+
+        // B 键开关后期模糊。按住不放时 GetAsyncKeyState 每帧都返回"按下"，
+        // 所以只在"上一帧没按、这一帧按了"的那一帧切换一次
+        const bool blurKey = down('B');
+        if (blurKey && !mBlurKeyWasDown)
+        {
+            mBlurEnabled = !mBlurEnabled;
+        }
+        mBlurKeyWasDown = blurKey;
 
         // 每个键单独判断、各记一个方向：W + D 同时按就是斜着走，W + S 同时按互相抵消
         float forward = 0.0f, right = 0.0f, up = 0.0f;
@@ -241,6 +393,10 @@ protected:
         mCommandList->OMSetStencilRef(0); // 用完恢复
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Shadow]);
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Transparent]);
+        if (mBlurEnabled)
+        {
+            DoBlur();
+        }
 
         // 后台缓冲：RENDER_TARGET → PRESENT
         auto toPresent = CD3DX12_RESOURCE_BARRIER::Transition(
@@ -503,19 +659,19 @@ private:
         //书上的 DDS 加载函数认得纹理数组，建出来的资源 DepthOrArraySize 会是 3。
     }
 
-    // 创建描述符堆
+    // 构建描述符堆
     void BuildDescriptorHeaps()
     {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {
             .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            .NumDescriptors = 5,
+            .NumDescriptors = 9, // 0～4 纹理，5～8 模糊用的两张纹理（各一个 SRV、一个 UAV）
             .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, // 着色器要从这个堆里读（RTV/DSV 堆不用，所以是 NONE）
             .NodeMask = 0,
         };
         ThrowIfFailed(mDevice->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(mHeap.GetAddressOf())));
     }
 
-    // 建立SRV
+    // 构建SRV
     void BuildShaderResourceViews()
     {
         auto& woodTex = mTextures.at("woodCrateTex")->Resource;
@@ -1173,7 +1329,7 @@ private:
         boxShadow2->Mat = mMaterials.at("shadow").get();
         mRitemLayer[(int)RenderLayer::Shadow].push_back(boxShadow2.get());
         mAllItems.push_back(std::move(boxShadow2));
-        
+
         auto tree = std::make_unique<RenderItem>();
         auto LGeo = mTreeGeo.get();
         tree->PSO = mTreePSO;
@@ -1241,6 +1397,39 @@ private:
             0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&mRootSignature)));
     }
 
+    //构建 Blur根签名
+    void BuildBlurRootSignature()
+    {
+        CD3DX12_ROOT_PARAMETER slotRootParameter[3];
+        slotRootParameter[0].InitAsConstants(12, 0); //InitAsConstants(12, 0)：12 个 32 位根常量	BlurSettings : register(b0)
+        CD3DX12_DESCRIPTOR_RANGE srvRange;
+        srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); //描述符表，里面 1 个 SRV，从 t0 开始	gInput : register(t0)
+        slotRootParameter[1].InitAsDescriptorTable(1, &srvRange);
+
+        CD3DX12_DESCRIPTOR_RANGE uavRange;
+        uavRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); //描述符表，里面 1 个 UAV，从 u0 开始	gOutput : register(u0)
+        slotRootParameter[2].InitAsDescriptorTable(1, &uavRange);
+        
+        CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(
+            _countof(slotRootParameter), slotRootParameter,
+            0, nullptr, // 不用采样器：着色器里是按下标直接读像素
+            D3D12_ROOT_SIGNATURE_FLAG_NONE); // 计算着色器不经过输入装配器
+
+        // 第一步：把描述序列化成一段二进制数据；出错时错误信息在 error 里
+        ComPtr<ID3DBlob> serialized;
+        ComPtr<ID3DBlob> error;
+        HRESULT hr = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &error);
+        if (error != nullptr)
+        {
+            OutputDebugStringA((char*)error->GetBufferPointer());
+        }
+        ThrowIfFailed(hr);
+
+        // 第二步：用这段二进制数据创建根签名对象
+        ThrowIfFailed(mDevice->CreateRootSignature(
+            0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&mBlurRootSignature)));
+    }
+
     //编译着色器
     void BuildShadersAndInputLayout()
     {
@@ -1293,6 +1482,8 @@ private:
             {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
             {"SIZE", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         };
+        mHorzBlurCSByteCode = CompileShader(L"HLSL\\Blur.hlsl", nullptr, "HorzBlurCS", "cs_5_1");
+        mVertBlurCSByteCode = CompileShader(L"HLSL\\Blur.hlsl", nullptr, "VertBlurCS", "cs_5_1");
     }
 
     void BuildPSO()
@@ -1433,6 +1624,37 @@ private:
 
         psoDesc.BlendState.RenderTarget[0] = alpha;
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&psoDesc,IID_PPV_ARGS(&mBlendPSO)));
+        
+        //Horz
+        D3D12_COMPUTE_PIPELINE_STATE_DESC GusBlurDesc = {
+            .pRootSignature = mBlurRootSignature.Get(),
+            .CS = {mHorzBlurCSByteCode->GetBufferPointer(),mHorzBlurCSByteCode->GetBufferSize()},
+            .Flags = D3D12_PIPELINE_STATE_FLAG_NONE
+        };
+        ThrowIfFailed(mDevice->CreateComputePipelineState(&GusBlurDesc,IID_PPV_ARGS(&mHorzBlurPSO)));
+        //Vert
+        GusBlurDesc.CS = {mVertBlurCSByteCode->GetBufferPointer(),mVertBlurCSByteCode->GetBufferSize()};
+        ThrowIfFailed(mDevice->CreateComputePipelineState(&GusBlurDesc,IID_PPV_ARGS(&mVertBlurPSO)));
+    }
+
+    // 高斯权重：G(x) = exp(-x² / 2σ²)，x 从 -半径 到 +半径，最后除以总和，让它们加起来等于 1。
+    // 半径取 ceil(2σ)，再往外的权重已经很小了。Blur.hlsl 最多支持半径 5（11 个权重），所以 σ 不能超过 2.5
+    std::vector<float> CalcGaussWeights(float sigma)
+    {
+        const int blurRadius = (int)ceilf(2.0f * sigma);
+        std::vector<float> weights(2 * blurRadius + 1);
+
+        float sum = 0.0f;
+        for (int i = -blurRadius; i <= blurRadius; i++)
+        {
+            weights[i + blurRadius] = expf(-(float)(i * i) / (2.0f * sigma * sigma));
+            sum += weights[i + blurRadius];
+        }
+        for (float& w : weights)
+        {
+            w /= sum; // 不除的话总和是 2.48（σ = 1）这种数，画面会整体变亮
+        }
+        return weights;
     }
 
     // ======================== 成员变量 ========================
@@ -1451,6 +1673,11 @@ private:
     std::unique_ptr<DX_Utils::MeshGeometry> mWaterGeo;
     // 公告牌树：每棵一个点（中心 + 宽高），静态数据，放在默认堆里
     std::unique_ptr<DX_Utils::MeshGeometry> mTreeGeo;
+    // 后期模糊：A = mBlurMap[0]（场景复制进来，最终结果也在它里面），B = mBlurMap[1]（存横向模糊的结果）
+    ComPtr<ID3D12Resource> mBlurMap[2];
+    bool mBlurEnabled = true; // B 键开关
+    bool mBlurKeyWasDown = false;
+    int mBlurCount = 4; // "横向 + 纵向"算一次，重复几次。越多越糊
     // 波浪：CPU 端的模拟。只算高度和法线，不碰任何 D3D 资源
     std::unique_ptr<Waves> mWaves;
     std::vector<std::unique_ptr<RenderItem>> mAllItems;
@@ -1497,6 +1724,14 @@ private:
     // 相机：绕原点转的球坐标 (θ, φ, r)
     Camera mCamera;
     POINT mLastMousePos = {};
+
+    // 后期模糊的根签名、两个计算着色器和两个计算 PSO
+    ComPtr<ID3D12RootSignature> mBlurRootSignature;
+    ComPtr<ID3DBlob> mHorzBlurCSByteCode;
+    ComPtr<ID3DBlob> mVertBlurCSByteCode;
+    ComPtr<ID3D12PipelineState> mHorzBlurPSO;
+    ComPtr<ID3D12PipelineState> mVertBlurPSO;
+    
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, int nShowCmd)
