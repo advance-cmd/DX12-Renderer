@@ -60,7 +60,7 @@ float4 PS(GeoOut pin) : SV_Target
     float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye,shadowFactor);
     res = float4(ambient + direct, mat.DiffuseAlbedo.a);
 #ifdef FOG
-    res.rgb = ApplyFog(res.rgb, distToEye, gPass.FogColor, gPass.FogStart, gPass.FogRange);
+    res.rgb = ApplyFog(res.rgb, distToEye, FogColorAt(toEye), gPass.FogStart, gPass.FogRange);
 #endif
     return res;
 }

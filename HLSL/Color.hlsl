@@ -58,7 +58,7 @@ float4 PS(VertexOut pin) : SV_Target
     
     res = float4(ambient + direct, gMat.DiffuseAlbedo.a);
 #ifdef FOG
-    res.rgb = ApplyFog(res.rgb, distToEye, gPass.FogColor, gPass.FogStart, gPass.FogRange);
+    res.rgb = ApplyFog(res.rgb, distToEye, FogColorAt(toEye), gPass.FogStart, gPass.FogRange);
 #endif
     return res;
 }

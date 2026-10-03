@@ -146,6 +146,24 @@ float3 ApplyFog(float3 color, float distToEye, float4 fogColor, float fogStart, 
     return lerp(color, fogColor.rgb, s);
 }
 
+// 天空图相对世界绕 y 轴转了 41.4°（让图里的太阳对上 mSunDir）
+// 世界里的方向 → 天空图里的方向：反着转回去。所有查天空图的地方都先过这一道
+static const float SkyYaw = radians(41.4f);
+
+float3 SkyDir(float3 dirW)
+{
+    float s = -sin(SkyYaw);
+    float c = cos(SkyYaw);
+    return float3(c*dirW.x+dirW.z*s, dirW.y, -s*dirW.x+c*dirW.z);
+}
+
+// 雾色：沿视线方向查天空图，用很糊的第 5 级 mip（32×32），远处的东西融进"大概的天空颜色"
+float4 FogColorAt(float3 toEye)
+{
+    float3 dir = SkyDir(-toEye);
+    return float4(gCubeMap.SampleLevel(gsamLinearWrap, dir, 5).rgb, 1.0f);
+}
+
 // 返回 0～1：1 = 全亮，0 = 全在影子里。shadowPosH = 这个点在阴影图里的 (u, v, 深度, w)
 float CalcShadowFactor(float4 shadowPosH)
 {

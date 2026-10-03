@@ -68,7 +68,7 @@ float4 PS(VertexOut pin) : SV_Target
     float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye,shadowFactor);
     res = float4(ambient + direct, mat.DiffuseAlbedo.a);
 #ifdef FOG
-    res.rgb = ApplyFog(res.rgb, distToEye, gPass.FogColor, gPass.FogStart, gPass.FogRange);
+    res.rgb = ApplyFog(res.rgb, distToEye, FogColorAt(toEye), gPass.FogStart, gPass.FogRange);
 #endif
     return res;
 }
@@ -82,7 +82,10 @@ VertexOut VS_MirrorClear(VertexIn vin)
 
 float4 PS_MirrorClear(VertexOut pin) : SV_Target
 {
-    return gPass.FogColor;
+    // 镜子后面的"背景"：视线打到镜面上弹出去，看到的是那个方向的天空
+    float3 toEye = normalize(gPass.EyePosW - pin.PosW);
+    float3 r = SkyDir(reflect(-toEye, pin.NormalW));
+    return gCubeMap.Sample(gsamLinearWrap, r);
 }
 
 // 阴影 Pass：只要深度。铁丝网的洞要 clip 掉，不然影子是一整块

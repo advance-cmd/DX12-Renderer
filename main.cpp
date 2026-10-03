@@ -1607,8 +1607,7 @@ private:
         
         auto sky = std::make_unique<RenderItem>();
         // .xyww 以后深度恒为 1，球多大其实无所谓（包住相机就行）；转 41.4° 让天空图里的太阳和 mSunDir 的方位对上
-        XMStoreFloat4x4(&sky->World, XMMatrixScaling(5000.0f, 5000.0f, 5000.0f) *
-                                     XMMatrixRotationY(XMConvertToRadians(41.4f)));
+        XMStoreFloat4x4(&sky->World, XMMatrixScaling(5000.0f, 5000.0f, 5000.0f));
         auto LSkyGeo = mShapeGeo->DrawArgs.at("sphere");
         sky->PSO = mSkyPSO;
         sky->ObjCBIndex = objCBIndex++;

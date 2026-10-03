@@ -26,7 +26,7 @@ struct VertexOut
 VertexOut VS(VertexIn vin)
 {
     VertexOut vout;
-    vout.PosL = vin.PosL; // 局部顶点位置就是查找向量
+    vout.PosL =SkyDir(vin.PosL); // 局部顶点位置就是查找向量
     float4 posW = mul(float4(vin.PosL, 1.0f), gObj.World);
     posW.xyz += gPass.EyePosW; // 球心永远在相机上，相机走不近也走不远
     vout.PosH = mul(posW, gPass.ViewProj).xyww; // 先变到裁剪空间，再把 z 换成 w：透视除法后深度恒为 1
