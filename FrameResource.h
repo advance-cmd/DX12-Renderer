@@ -33,6 +33,7 @@ struct ObjectConstants
 struct PassConstants
 {
     XMFLOAT4X4 ViewProj;
+    XMFLOAT4X4 ShadowTransform;
 
     XMFLOAT3 EyePosW;
     float padding;

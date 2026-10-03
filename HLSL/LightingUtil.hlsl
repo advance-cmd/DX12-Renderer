@@ -27,6 +27,7 @@ struct MaterialConstants
 struct PassConstants
 {
     float4x4 ViewProj;
+    float4x4 ShadowTransform;
     float3 EyePosW;
     float padding;
     float4 AmbientLight;
@@ -35,6 +36,9 @@ struct PassConstants
     float FogRange;
     Light Lights[MaxLights];
 };
+
+Texture2D gShadowMap : register(t1);
+SamplerComparisonState gsamShadow : register(s1);
 
 // Blinn-Phong：漫反射 + 高光，三种灯共用。各种灯只负责算出
 //   lightStrength：这盏灯到达这个点时的强度（已经乘过衰减、聚光的锥形因子，还没乘夹角余弦）
@@ -106,7 +110,7 @@ float3 ComputeSpotLight(Light L, MaterialConstants mat, float3 pos, float3 norma
 
 // 把所有灯的贡献加起来。灯在 Lights[] 里的排布：先平行光，再点光源，最后聚光灯
 // NUM_DIR_LIGHTS / NUM_POINT_LIGHTS / NUM_SPOT_LIGHTS 由 C++ 编译着色器时用宏传进来
-float3 ComputeLighting(Light lights[MaxLights], MaterialConstants mat, float3 pos, float3 normal, float3 toEye)
+float3 ComputeLighting(Light lights[MaxLights], MaterialConstants mat, float3 pos, float3 normal, float3 toEye,float3 shadowFactor)
 {
     float3 result = 0.0f;
     int i = 0;
@@ -114,7 +118,7 @@ float3 ComputeLighting(Light lights[MaxLights], MaterialConstants mat, float3 po
 #if (NUM_DIR_LIGHTS > 0)
     [unroll]
     for (i = 0; i < NUM_DIR_LIGHTS; ++i)
-        result += ComputeDirectionalLight(lights[i], mat, normal, toEye);
+        result += shadowFactor[i] * ComputeDirectionalLight(lights[i], mat, normal, toEye);
 #endif
 
 #if (NUM_POINT_LIGHTS > 0)
@@ -138,4 +142,24 @@ float3 ApplyFog(float3 color, float distToEye, float4 fogColor, float fogStart, 
 {
     float s = saturate((distToEye - fogStart) / fogRange);
     return lerp(color, fogColor.rgb, s);
+}
+
+// 返回 0～1：1 = 全亮，0 = 全在影子里。shadowPosH = 这个点在阴影图里的 (u, v, 深度, w)
+float CalcShadowFactor(float4 shadowPosH)
+{
+    shadowPosH.xyz /=shadowPosH.w;  //正交投影 w = 1，但是聚光灯就不一定w=1了，所以这句还是要写
+    float depth = shadowPosH.z;
+    uint width,height,numMips;
+    gShadowMap.GetDimensions(0,width,height,numMips);
+    float dx = 1.0f / (float)width;    //一个纹素在uv里有多宽
+    
+    const float2 offsets[9] = {
+        float2(-dx,-dx), float2(0,-dx), float2(dx,-dx),
+        float2(-dx, 0),  float2(0, 0),  float2(dx, 0),
+        float2(-dx, dx), float2(0, dx), float2(dx, dx) };
+    float percentLit = 0.0f;
+    [unroll] for (int i = 0; i < 9; ++i)
+        percentLit += gShadowMap.SampleCmpLevelZero(
+            gsamShadow, shadowPosH.xy + offsets[i], depth);
+    return percentLit / 9.0f;
 }

@@ -29,6 +29,7 @@ struct VertexOut
     float4 PosH : SV_POSITION; // H = Homogeneous，齐次裁剪空间
     float3 NormalW : NORMAL;
     float3 PosW : TEXCOORD;
+    float4 shadowPosH : TEXCOORD1;
 };
 
 VertexOut VS(VertexIn vin)
@@ -38,6 +39,7 @@ VertexOut VS(VertexIn vin)
     vout.PosH = mul(posW, gPass.ViewProj); // 世界 → 裁剪空间
     vout.NormalW = mul(vin.NormalL, (float3x3)gObj.WorldInvTranspose); // 转到世界空间
     vout.PosW = posW.xyz;
+    vout.shadowPosH = mul(posW,gPass.ShadowTransform);
     return vout;
 }
 
@@ -50,7 +52,9 @@ float4 PS(VertexOut pin) : SV_Target
     float distToEye = length(toEye);
     toEye /= distToEye;
     float3 normal = normalize(pin.NormalW);   // 插值之后长度不一定是 1
-    float3 direct = ComputeLighting(gPass.Lights, gMat, pin.PosW, normal, toEye);
+    float3 shadowFactor = float3(1.0f, 1.0f, 1.0f);
+    shadowFactor[0] = CalcShadowFactor(pin.shadowPosH); // Lights[0] 是太阳，阴影图是站在太阳那里画的
+    float3 direct = ComputeLighting(gPass.Lights, gMat, pin.PosW, normal, toEye,shadowFactor);
     
     res = float4(ambient + direct, gMat.DiffuseAlbedo.a);
 #ifdef FOG

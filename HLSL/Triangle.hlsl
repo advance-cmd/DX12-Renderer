@@ -32,6 +32,7 @@ struct VertexOut
     float3 NormalW : NORMAL;
     float2 TexC : TEXCOORD;
     float3 PosW : TEXCOORD1;
+    float4 shadowPosH : TEXCOORD2;
 };
 
 VertexOut VS(VertexIn vin)
@@ -42,6 +43,7 @@ VertexOut VS(VertexIn vin)
     vout.NormalW = mul(vin.NormalL, (float3x3)gObj.WorldInvTranspose); // 转到世界空间
     vout.TexC = vin.TexC;
     vout.PosW = posW.xyz;
+    vout.shadowPosH = mul(posW,gPass.ShadowTransform);
     return vout;
 }
 
@@ -62,7 +64,9 @@ float4 PS(VertexOut pin) : SV_Target
     float distToEye = length(toEye);
     toEye /= distToEye;
     float3 normal = normalize(pin.NormalW);   // 插值之后长度不一定是 1
-    float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye);
+    float3 shadowFactor = float3(1.0f, 1.0f, 1.0f);
+    shadowFactor[0] = CalcShadowFactor(pin.shadowPosH); // Lights[0] 是太阳，阴影图是站在太阳那里画的
+    float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye,shadowFactor);
     res = float4(ambient + direct, mat.DiffuseAlbedo.a);
 #ifdef FOG
     res.rgb = ApplyFog(res.rgb, distToEye, gPass.FogColor, gPass.FogStart, gPass.FogRange);
@@ -80,4 +84,11 @@ VertexOut VS_MirrorClear(VertexIn vin)
 float4 PS_MirrorClear(VertexOut pin) : SV_Target
 {
     return gPass.FogColor;
+}
+
+// 阴影 Pass：只要深度。铁丝网的洞要 clip 掉，不然影子是一整块
+void PS_Shadow(VertexOut pin)
+{
+    float4 TexColor = gDiffuseMap.Sample(gsamLinearWrap, pin.TexC); // Sample 只能在像素着色器里用
+    clip(TexColor.a * gMat.DiffuseAlbedo.a - 0.1f);
 }

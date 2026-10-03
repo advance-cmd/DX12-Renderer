@@ -27,6 +27,7 @@ struct GeoOut
     float3 NormalW : NORMAL;
     float2 TexC : TEXCOORD;
     uint PrimID : SV_PrimitiveID;
+    float4 shadowPosH : TEXCOORD1;
 };
 
 VertexOut VS(VertexIn vin)
@@ -55,7 +56,9 @@ float4 PS(GeoOut pin) : SV_Target
     float distToEye = length(toEye);
     toEye /= distToEye;
     float3 normal = normalize(pin.NormalW); // 插值之后长度不一定是 1
-    float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye);
+    float3 shadowFactor = float3(1.0f, 1.0f, 1.0f);
+    shadowFactor[0] = CalcShadowFactor(pin.shadowPosH); // Lights[0] 是太阳，阴影图是站在太阳那里画的
+    float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye,shadowFactor);
     res = float4(ambient + direct, mat.DiffuseAlbedo.a);
 #ifdef FOG
     res.rgb = ApplyFog(res.rgb, distToEye, gPass.FogColor, gPass.FogStart, gPass.FogRange);
@@ -81,9 +84,9 @@ void GS(
     float halfHeight = 0.5f * gin[0].SizeW.y;
     float4 v[4];
     v[0] = float4(gin[0].CenterW + halfWidth * right - halfHeight * up, 1.0f); // 屏幕左下
-    v[1] = float4(gin[0].CenterW + halfWidth * right + halfHeight * up, 1.0f); // 空 4：屏幕左上
-    v[2] = float4(gin[0].CenterW - halfWidth * right - halfHeight * up, 1.0f); // 空 5：屏幕右下
-    v[3] = float4(gin[0].CenterW - halfWidth * right + halfHeight * up, 1.0f); // 空 6：屏幕右上
+    v[1] = float4(gin[0].CenterW + halfWidth * right + halfHeight * up, 1.0f); // 屏幕左上
+    v[2] = float4(gin[0].CenterW - halfWidth * right - halfHeight * up, 1.0f); // 屏幕右下
+    v[3] = float4(gin[0].CenterW - halfWidth * right + halfHeight * up, 1.0f); // 屏幕右上
 
     //四个角的纹理坐标，顺序和 v 一一对应
     float2 texC[4] = {
@@ -98,12 +101,21 @@ void GS(
     [unroll]
     for (int i = 0; i < 4; ++i)
     {
-        gout.PosH = mul(v[i],gPass.ViewProj);     // 空 7：世界空间 → 裁剪空间
+        gout.PosH = mul(v[i],gPass.ViewProj);     // 世界空间 → 裁剪空间
         gout.PosW = v[i].xyz;
         gout.NormalW = look;      // 法线朝向眼睛（所以逆光的时候是暗的）
         gout.TexC = texC[i];
         gout.PrimID = primID;
+        gout.shadowPosH = mul(v[i],gPass.ShadowTransform);
         triStream.Append(gout);
     }
 
+}
+
+// 阴影 Pass：只要深度。树叶之间的空白要 clip 掉，不然影子是一整块方板
+void PS_Shadow(GeoOut pin)
+{
+    float3 uvw = float3(pin.TexC, pin.PrimID % 3); // 第 3 个坐标 = 第几张图（我们只有 3 张）
+    float4 TexColor = gTreeMapArray.Sample(gsamLinearWrap, uvw);
+    clip(TexColor.a * gMat.DiffuseAlbedo.a - 0.1f);
 }

@@ -66,6 +66,8 @@ struct RenderItem
     // 画这个物体用哪个 PSO。顶点格式和着色器不同，PSO 就不能共用，
     // 所以画之前要按物体切
     ComPtr<ID3D12PipelineState> PSO;
+    // 画阴影图时用的 PSO（只写深度）。空 = 这个物体不投影子
+    ComPtr<ID3D12PipelineState> ShadowPSO;
 
     Material* Mat = nullptr;
 };
@@ -83,6 +85,7 @@ enum class RenderLayer : int
 };
 
 static constexpr UINT kTimestampCount = 6;
+static constexpr UINT kShadowMapSize = 4096;
 
 class CrateApp : public D3DApp
 {
@@ -117,6 +120,7 @@ public:
         BuildDescriptorHeaps();
         BuildBlurResources(); // 模糊用的两张纹理和它们的 4 个描述符（要用到堆）
         BuildTimestampQueries(); //Pass时间记录
+        BuildShadowMap(); //构建阴影贴图资源和View
         BuildShapeGeometry(); // 录制复制命令（木箱）
         BuildLandGeometry(); // 录制复制命令（陆地的顶点/索引）
         BuildWaves(); // 波浪模拟（这一步只建模拟本体，第 5 步再建水面几何）
@@ -218,6 +222,64 @@ protected:
         }
     }
 
+    // 阴影图：阴影 Pass 当深度缓冲写（DSV），主 Pass 当纹理读（SRV）。约定：帧与帧之间停在 PIXEL_SHADER_RESOURCE
+    void BuildShadowMap()
+    {
+        // 资源：一份资源两种看法（DSV 按 D24S8 写，SRV 按 R24 读），所以用"无类型"的 R24G8_TYPELESS
+        D3D12_RESOURCE_DESC ShadowPassDesc = {
+            .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            .Alignment = 0,
+            .Width = kShadowMapSize,
+            .Height = kShadowMapSize,
+            .DepthOrArraySize = 1,
+            .MipLevels = 1,
+            .Format = DXGI_FORMAT_R24G8_TYPELESS,
+            .SampleDesc = {.Count = 1, .Quality = 0},
+            .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            .Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+        };
+        // 优化清除值：每帧都按这个值清（深度 1.0），格式写 DSV 的格式
+        D3D12_CLEAR_VALUE optClear = {
+            .Format = DXGI_FORMAT_D24_UNORM_S8_UINT,
+            .DepthStencil = {
+                .Depth = 1.0f,
+                .Stencil = 0
+            }
+        };
+        CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+        ThrowIfFailed(mDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &ShadowPassDesc,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &optClear,
+            IID_PPV_ARGS(&mShadowMap)));
+
+        // DSV：框架的 DSV 堆只有 1 格（屏幕的深度缓冲占着），自己建一个 1 格的小堆
+        D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {
+            .Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+            .NumDescriptors = 1,
+            .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+            .NodeMask = 0,
+        };
+        ThrowIfFailed(mDevice->CreateDescriptorHeap(&dsvHeapDesc,IID_PPV_ARGS(&mShadowDsvHeap)));
+        // D3DApp 建屏幕深度缓冲的 DSV 时传的是 nullptr：那块资源本身就是有类型的 D24S8。
+        // 阴影图是无类型的，必须告诉 DSV "按什么格式写"
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {
+            .Format = DXGI_FORMAT_D24_UNORM_S8_UINT,
+            .ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D,
+            .Flags = D3D12_DSV_FLAG_NONE,
+            .Texture2D = {.MipSlice = 0},
+        };
+        mDevice->CreateDepthStencilView(mShadowMap.Get(), &dsvDesc,
+                                        mShadowDsvHeap->GetCPUDescriptorHandleForHeapStart());
+        // SRV：放在大堆第 9 格，只读前 24 位深度，后 8 位模板不要
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+            .Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .Texture2D = {.MostDetailedMip = 0, .MipLevels = 1},
+        };
+        CD3DX12_CPU_DESCRIPTOR_HANDLE srv(mHeap->GetCPUDescriptorHandleForHeapStart(), 9, mCSUDescriptorSize);
+        mDevice->CreateShaderResourceView(mShadowMap.Get(), &srvDesc, srv);
+    }
+
     void BuildTimestampQueries()
     {
         //查询堆：用来存放时间戳读数的一块显存，有点像描述符堆，只不过每格放的是一个查询结果。
@@ -277,7 +339,7 @@ protected:
             // ③a 横向：读 A，写 B
             mCommandList->SetPipelineState(mHorzBlurPSO.Get());
             mCommandList->SetComputeRootDescriptorTable(1, HeapGpuHandle(5)); // 根参数 1（输入）= 堆第 5 格：A 的 SRV
-            mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(8)); // 空 2：根参数 2（输出）= B 的 UAV 在第几格？
+            mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(8)); // 根参数 2（输出）= 堆第 8 格：B 的 UAV
             mCommandList->Dispatch(groupsX, mClientHeight, 1); // 每个线程组管一行里的 256 个像素
 
             // 交换：A 变成可写，B 变成可读
@@ -285,15 +347,15 @@ protected:
                 CD3DX12_RESOURCE_BARRIER::Transition(A, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
                 CD3DX12_RESOURCE_BARRIER::Transition(B, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE), // 空 3
+                                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             };
             mCommandList->ResourceBarrier(2, s1);
 
             // ③b 纵向：读 B，写 A
             mCommandList->SetPipelineState(mVertBlurPSO.Get());
-            mCommandList->SetComputeRootDescriptorTable(1, HeapGpuHandle(7)); // 空 4：B 的 SRV
-            mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(6)); // 空 4：A 的 UAV
-            mCommandList->Dispatch(mClientWidth, groupsY, 1); // 空 5：每个线程组管一列里的 256 个像素
+            mCommandList->SetComputeRootDescriptorTable(1, HeapGpuHandle(7)); // 输入 = 堆第 7 格：B 的 SRV
+            mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(6)); // 输出 = 堆第 6 格：A 的 UAV
+            mCommandList->Dispatch(mClientWidth, groupsY, 1); // 每个线程组管一列里的 256 个像素
 
             // 交换回来，下一轮又从"读 A、写 B"开始
             D3D12_RESOURCE_BARRIER s2[] = {
@@ -313,7 +375,7 @@ protected:
                                                  D3D12_RESOURCE_STATE_COPY_SOURCE),
         };
         mCommandList->ResourceBarrier(2, b4);
-        mCommandList->CopyResource(back, A); // 空 6
+        mCommandList->CopyResource(back, A); // 参数顺序：(目标, 来源)
 
         // ⑤ 收尾：全部恢复成进来时的样子
         D3D12_RESOURCE_BARRIER b5[] = {
@@ -377,12 +439,14 @@ protected:
         // 轮换到下一份帧资源；GPU 如果还在用它，就先等
         mCurrFrameResourceIndex = (mCurrFrameResourceIndex + 1) % gNumFrameResources;
         mCurrentFrame = mFrameResources[mCurrFrameResourceIndex].get();
-        WaitForCurrentFrameResource();  //执行完，说明上一次用这份帧资源的那一帧，GPU 已经全部做完了。
-        
-        if (mCurrentFrame->Fence !=0)
+        WaitForCurrentFrameResource(); //执行完，说明上一次用这份帧资源的那一帧，GPU 已经全部做完了。
+
+        if (mCurrentFrame->Fence != 0)
         {
             const UINT tsBase = mCurrFrameResourceIndex * kTimestampCount;
-            D3D12_RANGE readRange{tsBase * sizeof(UINT64), (tsBase + kTimestampCount) * sizeof(UINT64)};  // 告诉驱动：CPU 要读哪一段
+            D3D12_RANGE readRange{
+                tsBase * sizeof(UINT64), (tsBase + kTimestampCount) * sizeof(UINT64)
+            }; // 告诉驱动：CPU 要读哪一段
             UINT64* data = nullptr;
             ThrowIfFailed(mTimestampReadback->Map(0, &readRange, reinterpret_cast<void**>(&data)));
             const UINT64* t = data + tsBase; // Map 返回的是整个缓冲的开头，要自己加偏移才是这一帧的 T0
@@ -406,15 +470,16 @@ protected:
                 mPassSamples = 0;
                 // 基类每秒刷新一次标题（CalculateFrameStats），会把这段文字带上
                 mMainWndCaption = std::format(
-                    L"LearnDX12    移速 {:.1f}    GPU：不透明 {:.3f} | 镜子 {:.3f} | 影子 {:.3f} | 透明 {:.3f} | 模糊 {:.3f} ms",
+                    L"LearnDX12    移速 {:.1f}    GPU：阴影图 {:.3f} | 不透明 {:.3f} | 镜子 {:.3f} | 透明 {:.3f} | 模糊 {:.3f} ms",
                     mCamera.GetMoveSpeed(), avg[0], avg[1], avg[2], avg[3], avg[4]);
             }
         }
-        
+
         UpdateWaves(gt);
 
         UpdateMaterialCBs();
         UpdateObjectCBs();
+        UpdateShadowTransform();
         UpdateMainPassCB();
     }
 
@@ -430,6 +495,22 @@ protected:
             CurrentBackBuffer(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
         mCommandList->ResourceBarrier(1, &toRenderTarget);
 
+        // 每帧只需设一次的：堆 → 根签名。阴影 Pass 和主 Pass 共用，所以放在最前面
+        // 参数 1 是描述符表，必须先 SetDescriptorHeaps；参数 0（物体常量）在 DrawRenderItems 里每个物体设一次
+        ID3D12DescriptorHeap* heaps[] = {mHeap.Get()};
+        mCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
+        mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
+
+        // 3 份 Pass 常量挨着放：passCB = 第 0 份（主 Pass），+1 份 = 镜像，+2 份 = 阴影 Pass
+        const UINT passCBByteSize = CalcConstantBufferByteSize(sizeof(PassConstants));
+        const D3D12_GPU_VIRTUAL_ADDRESS passCB = mCurrentFrame->PassCB->Resource()->GetGPUVirtualAddress();
+
+        // ① 阴影 Pass：从太阳那里把场景的深度画进阴影图
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 0); // T0
+        DrawShadowMap(passCB + 2 * passCBByteSize);
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 1); // T1
+
+        // ② 主 Pass。阴影 Pass 把视口改成了阴影图的大小，这里换回屏幕的
         mCommandList->RSSetViewports(1, &mScreenViewport);
         mCommandList->RSSetScissorRects(1, &mScissorRect);
 
@@ -441,29 +522,21 @@ protected:
                                             nullptr);
         mCommandList->OMSetRenderTargets(1, &rtv, true, &dsv);
 
-        // 每帧只需设一次的：堆 → 根签名 → 参数 1（纹理表）、参数 2（Pass 常量）
-        // 参数 1 是描述符表，必须先 SetDescriptorHeaps；参数 0（物体常量）在 DrawRenderItems 里每个物体设一次
-        ID3D12DescriptorHeap* heaps[] = {mHeap.Get()};
-        mCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
-        mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
-        mCommandList->SetGraphicsRootConstantBufferView(2, mCurrentFrame->PassCB->Resource()->GetGPUVirtualAddress());
+        mCommandList->SetGraphicsRootConstantBufferView(2, passCB); // 阴影 Pass 用的是第 2 份，换回主 Pass 的
+        mCommandList->SetGraphicsRootDescriptorTable(4,HeapGpuHandle(9));
 
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 0); // T0
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Opaque]);
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 1); // T1
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 2); // T2
         mCommandList->OMSetStencilRef(1); // 章上刻"1"
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Mirrors]); // ③ 看得见的镜子像素盖章
         DrawRenderItems(mRitemLayer[(int)RenderLayer::MirrorClear]); // ③b 盖了章的地方：深度推远、刷成天空色
         // ④ 镜像：Ref 还是 1，只画在模板 = 1 的像素；Pass 常量换成第 1 份（反射后的灯）
-        const UINT passCBByteSize = CalcConstantBufferByteSize(sizeof(PassConstants));
-        const D3D12_GPU_VIRTUAL_ADDRESS passCB = mCurrentFrame->PassCB->Resource()->GetGPUVirtualAddress();
         mCommandList->SetGraphicsRootConstantBufferView(2, passCB + passCBByteSize);
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Reflected]);
         mCommandList->SetGraphicsRootConstantBufferView(2, passCB); // 换回主 Pass 常量，后面的镜子和水要用
         mCommandList->OMSetStencilRef(0); // 用完恢复
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 2); // T2
-        DrawRenderItems(mRitemLayer[(int)RenderLayer::Shadow]);
         mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 3); // T3
+        // 平面阴影（第 11 章的 Shadow 层）已经被阴影贴图取代，不再画；再画会和阴影贴图的影子叠成双重影子
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Transparent]);
         mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 4); // T4
         if (mBlurEnabled)
@@ -473,9 +546,9 @@ protected:
         mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 5); // T5
         mCommandList->ResolveQueryData(
             mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
-            tsBase, kTimestampCount, // 空 1：从查询堆第几格开始、复制几格
+            tsBase, kTimestampCount, // 从查询堆第 tsBase 格开始，复制这一帧的 6 格
             mTimestampReadback.Get(),
-            tsBase*sizeof(UINT64)); // 空 2：复制到回读缓冲的第几个字节
+            tsBase * sizeof(UINT64)); // 复制到回读缓冲的同一位置（单位是字节）
 
         // 后台缓冲：RENDER_TARGET → PRESENT
         auto toPresent = CD3DX12_RESOURCE_BARRIER::Transition(
@@ -535,6 +608,32 @@ protected:
 
 private:
     // ======================== 每帧 ========================
+
+    // 阴影 Pass：站在灯的位置只画深度，画进阴影图。进来、出去时阴影图都是 PIXEL_SHADER_RESOURCE
+    void DrawShadowMap(D3D12_GPU_VIRTUAL_ADDRESS shadowPassCB)
+    {
+        // 视口、裁剪矩形换成阴影图的大小
+        mCommandList->RSSetViewports(1, &mShadowViewPort);
+        mCommandList->RSSetScissorRects(1, &mShadowScissorRect);
+        // 这一趟阴影图当深度缓冲写：PIXEL_SHADER_RESOURCE → DEPTH_WRITE
+        D3D12_RESOURCE_BARRIER b1[] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(mShadowMap.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                 D3D12_RESOURCE_STATE_DEPTH_WRITE),
+        };
+        mCommandList->ResourceBarrier(1, b1);
+        // 只有 DSV（堆里只有 1 格，就是开头那格），没有颜色目标
+        D3D12_CPU_DESCRIPTOR_HANDLE shadowDsv = mShadowDsvHeap->GetCPUDescriptorHandleForHeapStart();
+        mCommandList->OMSetRenderTargets(0, nullptr, false, &shadowDsv);
+        mCommandList->ClearDepthStencilView(shadowDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr); // 只清深度；最后两个 = 整张都清
+        mCommandList->SetGraphicsRootConstantBufferView(2, shadowPassCB); // 第 2 份 Pass 常量：ViewProj 是灯的
+        DrawRenderItems(mRitemLayer[(int)RenderLayer::Opaque], true);
+        // 转回 PIXEL_SHADER_RESOURCE：主 Pass 要把它当纹理读
+        D3D12_RESOURCE_BARRIER b2[] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(mShadowMap.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        };
+        mCommandList->ResourceBarrier(1, b2);
+    }
 
     // 当前帧资源上次提交后记下的 Fence 值，GPU 还没执行到，就让 CPU 睡着等
     // （Fence == 0 表示这份帧资源还没提交过命令，不用等）
@@ -600,6 +699,7 @@ private:
 
         PassConstants pc = {};
         XMStoreFloat4x4(&pc.ViewProj, XMMatrixTranspose(mCamera.GetView() * mCamera.GetProj()));
+        XMStoreFloat4x4(&pc.ShadowTransform, XMMatrixTranspose(XMLoadFloat4x4(&mShadowTransform)));
         pc.EyePosW = mCamera.GetPosition3f();
         pc.AmbientLight = {0.25f, 0.25f, 0.35f, 1.0f};
         pc.FogColor = XMFLOAT4(Colors::LightSteelBlue.f);
@@ -648,7 +748,42 @@ private:
             XMStoreFloat3(&reflectedPass.Lights[i].Position,
                           XMVector3TransformCoord(XMLoadFloat3(&pc.Lights[i].Position), R));
         }
+        XMStoreFloat4x4(&reflectedPass.ShadowTransform, XMMatrixTranspose(R * XMLoadFloat4x4(&mShadowTransform)));
         mCurrentFrame->PassCB->CopyData(1, reflectedPass);
+
+        // 阴影 Pass：只把 ViewProj 换成灯的。
+        // EyePosW 不改，保留相机位置：树的 GS 靠它决定朝向，阴影图里的树必须和屏幕上的树朝同一个方向
+        PassConstants shadowPass = pc;
+        XMStoreFloat4x4(&shadowPass.ViewProj, XMMatrixTranspose(XMLoadFloat4x4(&mLightViewProj)));
+        mCurrentFrame->PassCB->CopyData(2, shadowPass);
+    }
+
+    // 灯是固定的，其实算一次就够；放在每帧算，以后让太阳动起来也不用改
+    void UpdateShadowTransform()
+    {
+        //场景包围球：中心在原点，半径120（陆地160x160，山高+-43，最远的角离原点约117）
+        const XMVECTOR center = XMVectorZero();
+        const float radius = 120.f;
+
+        //灯的观察矩阵：灯放在球外--从球心逆着光的方向退2个半径
+        const XMVECTOR lightDir = XMLoadFloat3(&mSunDir);
+        const XMVECTOR lightPos = center - lightDir * 2 * radius;
+        const XMMATRIX V = XMMatrixLookAtLH(lightPos, center, XMVectorSet(0.f, 1.f, 0.f, 0.f)); //世界坐标换到太阳视角
+
+        //正交投影：盒子刚好框柱球。先把球心变到灯的观察空间，结果是c
+        XMFLOAT3 c;
+        XMStoreFloat3(&c, XMVector3TransformCoord(center, V));
+        const XMMATRIX P = XMMatrixOrthographicOffCenterLH(c.x - radius, c.x + radius, c.y - radius, c.y + radius,
+                                                           c.z - radius, c.z + radius); //压进盒子，得到 NDC
+        // T：NDC → 纹理坐标（u = 0.5x + 0.5，v = -0.5y + 0.5，深度不变）。行向量，平移在第 4 行
+        const XMMATRIX T(
+            .5f, 0, 0, 0,
+            0, -.5f, 0, 0,
+            0, 0, 1, 0,
+            .5f, .5f, 0, 1.f); //NDC 换成 (u, v, 深度)
+
+        XMStoreFloat4x4(&mLightViewProj, V * P);
+        XMStoreFloat4x4(&mShadowTransform, V * P * T);
     }
 
     void UpdateWaves(const GameTimer& gt)
@@ -681,7 +816,7 @@ private:
     }
 
     // 逐个画渲染项：设 IA → 把根参数 0 指到这个物体的常量 → Draw
-    void DrawRenderItems(const std::vector<RenderItem*>& items)
+    void DrawRenderItems(const std::vector<RenderItem*>& items, bool shadowPass = false)
     {
         const UINT objCBByteSize = CalcConstantBufferByteSize(sizeof(ObjectConstants)); // 256 字节对齐
         const D3D12_GPU_VIRTUAL_ADDRESS objCBStart = mCurrentFrame->ObjectCB->Resource()->GetGPUVirtualAddress();
@@ -691,8 +826,13 @@ private:
 
         for (auto& ri : items)
         {
-            // PSO 是一整包状态，只能整个换。木箱用木箱的，陆地和波浪用另一套
-            mCommandList->SetPipelineState(ri->PSO.Get());
+            // PSO 是一整包状态，只能整个换。木箱用木箱的，陆地和波浪用另一套；阴影 Pass 用 ShadowPSO
+            ID3D12PipelineState* pso = shadowPass ? ri->ShadowPSO.Get() : ri->PSO.Get();
+            if (pso == nullptr)
+            {
+                continue; // 没挂 ShadowPSO 的物体不投影子，阴影 Pass 里跳过
+            }
+            mCommandList->SetPipelineState(pso);
             // 视图是函数返回的临时对象，先存成变量才能取地址（直接 &ri->Geo->VertexBufferView() 会报 C2102）
             D3D12_VERTEX_BUFFER_VIEW vbv = ri->Geo->VertexBufferView();
             D3D12_INDEX_BUFFER_VIEW ibv = ri->Geo->IndexBufferView();
@@ -743,7 +883,7 @@ private:
     {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {
             .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            .NumDescriptors = 9, // 0～4 纹理，5～8 模糊用的两张纹理（各一个 SRV、一个 UAV）
+            .NumDescriptors = 10, // 0～4 纹理，5～8 模糊用的两张纹理（各一个 SRV、一个 UAV），9 阴影图的 SRV
             .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, // 着色器要从这个堆里读（RTV/DSV 堆不用，所以是 NONE）
             .NodeMask = 0,
         };
@@ -1187,6 +1327,7 @@ private:
         auto land = std::make_unique<RenderItem>();
         XMStoreFloat4x4(&land->World, XMMatrixIdentity());
         land->PSO = mColorPSO;
+        land->ShadowPSO = mShadowLandPSO;
         land->ObjCBIndex = objCBIndex++;
         land->Geo = mLandGeo.get();
         land->IndexCount = mLandGeo->DrawArgs["grid"].IndexCount;
@@ -1207,6 +1348,7 @@ private:
             {
                 auto crate = std::make_unique<RenderItem>();
                 crate->PSO = mCratePSO;
+                crate->ShadowPSO = mShadowCratePSO;
 
                 // 减去 (gridCount - 1) / 2，让整片木箱以原点为中心
                 float x = (i - (gridCount - 1) * 0.5f) * spacing;
@@ -1226,6 +1368,7 @@ private:
 
         auto Lfence1 = std::make_unique<RenderItem>();
         Lfence1->PSO = mAlphaTestedPSO;
+        Lfence1->ShadowPSO = mShadowCratePSO;
         Lfence1->ObjCBIndex = objCBIndex++;
         Lfence1->Geo = mShapeGeo.get();
         Lfence1->IndexCount = box.IndexCount;
@@ -1246,6 +1389,7 @@ private:
         {
             auto crate = std::make_unique<RenderItem>();
             crate->PSO = mCratePSO;
+            crate->ShadowPSO = mShadowCratePSO;
             XMStoreFloat4x4(&crate->World, world);
             crate->ObjCBIndex = objCBIndex++;
             crate->Geo = mShapeGeo.get();
@@ -1342,6 +1486,7 @@ private:
         auto water = std::make_unique<RenderItem>();
         XMStoreFloat4x4(&water->World, XMMatrixIdentity());
         water->PSO = mBlendPSO;
+        water->ShadowPSO = mShadowLandPSO;
         water->ObjCBIndex = objCBIndex++;
         water->Geo = mWaterGeo.get();
         water->IndexCount = mWaterGeo->DrawArgs["grid"].IndexCount;
@@ -1357,6 +1502,7 @@ private:
         auto propertyFloor = mShapeGeo->DrawArgs.at("floor");
         XMStoreFloat4x4(&floor->World, XMMatrixTranslation(1.0f, 0.05f, -27.0f));
         floor->PSO = mCratePSO;
+        floor->ShadowPSO = mShadowCratePSO;
         floor->ObjCBIndex = objCBIndex++;
         floor->Geo = mShapeGeo.get();
         floor->IndexCount = propertyFloor.IndexCount;
@@ -1412,6 +1558,7 @@ private:
         auto tree = std::make_unique<RenderItem>();
         auto LGeo = mTreeGeo.get();
         tree->PSO = mTreePSO;
+        tree->ShadowPSO = mShadowTreePSO;
         tree->ObjCBIndex = objCBIndex++;
         tree->Geo = LGeo;
         tree->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
@@ -1423,7 +1570,7 @@ private:
         mAllItems.push_back(std::move(tree));
     }
 
-    // 3 份帧资源，每份：1 个 Pass 常量 + 每个渲染项 1 个物体常量
+    // 3 份帧资源，每份：3 个 Pass 常量（0 主 Pass、1 镜像、2 阴影 Pass）+ 每个渲染项 1 个物体常量
     void BuildFrameResources()
     {
         for (int i = 0; i < gNumFrameResources; i++)
@@ -1431,7 +1578,7 @@ private:
             mFrameResources.push_back(
                 std::make_unique<FrameResource>(
                     mDevice.Get(),
-                    2,
+                    3,
                     (UINT)mAllItems.size(),
                     (UINT)mWaves->VertexCount(),
                     (UINT)mMaterials.size()));
@@ -1446,19 +1593,30 @@ private:
     void BuildRootSignature()
     {
         CD3DX12_DESCRIPTOR_RANGE srvRange;
-        srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // 1 个 SRV，从 t0 开始
+        srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // 1 个 SRV，从 t0 开始    漫反射纹理
 
-        CD3DX12_ROOT_PARAMETER slotRootParameter[4];
+        CD3DX12_DESCRIPTOR_RANGE shadowRange;
+        shadowRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1); // 1 个 SRV，从 t1 开始    阴影图
+
+        CD3DX12_ROOT_PARAMETER slotRootParameter[5];
         slotRootParameter[0].InitAsConstantBufferView(0);
         slotRootParameter[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
         slotRootParameter[2].InitAsConstantBufferView(1);
         slotRootParameter[3].InitAsConstantBufferView(2);
+        slotRootParameter[4].InitAsDescriptorTable(1, &shadowRange, D3D12_SHADER_VISIBILITY_PIXEL);
 
-        CD3DX12_STATIC_SAMPLER_DESC linearWrap(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
+        CD3DX12_STATIC_SAMPLER_DESC samplers[2] = {
+            CD3DX12_STATIC_SAMPLER_DESC(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR),
+            CD3DX12_STATIC_SAMPLER_DESC(
+                1, D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT, // 先比较，再把 0/1 双线性混合
+                D3D12_TEXTURE_ADDRESS_MODE_BORDER, D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+                D3D12_TEXTURE_ADDRESS_MODE_BORDER, 0.0f, 16,
+                D3D12_COMPARISON_FUNC_LESS_EQUAL) // d(p) <= s(p) 算亮；边框色用默认的 OPAQUE_WHITE（深度 1），阴影图外面算亮
+        };
 
         CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(
             _countof(slotRootParameter), slotRootParameter,
-            1, &linearWrap,
+            2, samplers,
             D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
 
         // 第一步：把描述序列化成一段二进制数据；出错时错误信息在 error 里
@@ -1563,6 +1721,9 @@ private:
         };
         mHorzBlurCSByteCode = CompileShader(L"HLSL\\Blur.hlsl", nullptr, "HorzBlurCS", "cs_5_1");
         mVertBlurCSByteCode = CompileShader(L"HLSL\\Blur.hlsl", nullptr, "VertBlurCS", "cs_5_1");
+
+        mShadowCratePSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", alphaTestDefines, "PS_Shadow", "ps_5_1");
+        mShadowTreePSByteCode = CompileShader(L"HLSL\\TreeSprite.hlsl", alphaTestDefines, "PS_Shadow", "ps_5_1");
     }
 
     void BuildPSO()
@@ -1587,6 +1748,31 @@ private:
         psoDesc.VS = {mCrateVSByteCode->GetBufferPointer(), mCrateVSByteCode->GetBufferSize()};
         psoDesc.PS = {mCratePSByteCode->GetBufferPointer(), mCratePSByteCode->GetBufferSize()};
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&psoDesc,IID_PPV_ARGS(&mCratePSO)));
+
+        auto shadowDesc = psoDesc;
+        shadowDesc.RasterizerState.DepthBias = 10000; //固定偏移(单位：24位深度最小的一格)
+        shadowDesc.RasterizerState.DepthBiasClamp = 0.0f; //0 = 不限上限
+        shadowDesc.RasterizerState.SlopeScaledDepthBias = 1.0f; //斜率偏移，表面越斜着对灯，加的越多
+        shadowDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; // 铁丝网正反两面都要挡光
+        shadowDesc.NumRenderTargets = 0; // 阴影 Pass 没有颜色目标：阴影图绑在 DSV 上，不是 RTV
+        shadowDesc.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
+        shadowDesc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT; // 和阴影图 DSV 的格式一致（R24_X8 是 SRV 读的时候用的）
+
+        auto ShadowCratePSODesc = shadowDesc;
+        ShadowCratePSODesc.PS = {mShadowCratePSByteCode->GetBufferPointer(), mShadowCratePSByteCode->GetBufferSize()};
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&ShadowCratePSODesc,IID_PPV_ARGS(&mShadowCratePSO)));
+        auto ShadowLandPSODesc = shadowDesc;
+        ShadowLandPSODesc.InputLayout = {mColorInputLayout.data(), (UINT)mColorInputLayout.size()};
+        ShadowLandPSODesc.VS = {mColorVSByteCode->GetBufferPointer(), mColorVSByteCode->GetBufferSize()};
+        ShadowLandPSODesc.PS = {nullptr, 0};
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&ShadowLandPSODesc,IID_PPV_ARGS(&mShadowLandPSO)));
+        auto ShadowTreePSODesc = shadowDesc;
+        ShadowTreePSODesc.InputLayout = {mTreeInputLayout.data(), (UINT)mTreeInputLayout.size()};
+        ShadowTreePSODesc.VS = {mTreeVSByteCode->GetBufferPointer(), mTreeVSByteCode->GetBufferSize()};
+        ShadowTreePSODesc.GS = {mTreeGSByteCode->GetBufferPointer(), mTreeGSByteCode->GetBufferSize()};
+        ShadowTreePSODesc.PS = {mShadowTreePSByteCode->GetBufferPointer(), mShadowTreePSByteCode->GetBufferSize()};
+        ShadowTreePSODesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&ShadowTreePSODesc,IID_PPV_ARGS(&mShadowTreePSO)));
 
         D3D12_RENDER_TARGET_BLEND_DESC alpha = {};
         alpha.BlendEnable = true; // 开常规混合（和 LogicOpEnable 只能开一个）
@@ -1770,7 +1956,7 @@ private:
     int mCurrFrameResourceIndex = 0;
 
     // 管线：描述符堆、根签名、着色器、输入布局、PSO（两套：木箱一套，陆地/水面共用一套）
-    ComPtr<ID3D12DescriptorHeap> mHeap; // 着色器可见的 CBV/SRV/UAV 堆（现在只有 1 个 SRV）
+    ComPtr<ID3D12DescriptorHeap> mHeap; // 着色器可见的 CBV/SRV/UAV 堆
     ComPtr<ID3D12RootSignature> mRootSignature;
     ComPtr<ID3D12PipelineState> mCratePSO;
     ComPtr<ID3D12PipelineState> mAlphaTestedPSO;
@@ -1816,8 +2002,21 @@ private:
     ComPtr<ID3D12QueryHeap> mTimestampHeap;
     ComPtr<ID3D12Resource> mTimestampReadback;
     UINT64 mTimestampFreq = 1; // 初值给 1，免得读数之前不小心除以 0
-    double mPassMsSum[kTimestampCount - 1] = {}; // 5 段各自累加的毫秒数（不透明、镜子、影子、透明、模糊）
-    int mPassSamples = 0;                        // 已经攒了几帧
+    double mPassMsSum[kTimestampCount - 1] = {}; // 5 段各自累加的毫秒数（阴影图、不透明、镜子、透明、模糊）
+    int mPassSamples = 0; // 已经攒了几帧
+
+    //阴影功能相关成员变量
+    ComPtr<ID3D12Resource> mShadowMap; //阴影贴图
+    ComPtr<ID3D12DescriptorHeap> mShadowDsvHeap; //只放阴影图的 DSV，1格
+    D3D12_VIEWPORT mShadowViewPort = {0.f, 0.f, (float)kShadowMapSize, (float)kShadowMapSize, 0.0f, 1.0f};
+    D3D12_RECT mShadowScissorRect = {0, 0, (LONG)kShadowMapSize, (LONG)kShadowMapSize};
+    XMFLOAT4X4 mLightViewProj = {}; //阴影Pass用：世界->灯的裁剪空间
+    XMFLOAT4X4 mShadowTransform = {}; //主Pass用：世界->阴影图的(u,v,深度)
+    ComPtr<ID3DBlob> mShadowCratePSByteCode;
+    ComPtr<ID3DBlob> mShadowTreePSByteCode;
+    ComPtr<ID3D12PipelineState> mShadowCratePSO; //木箱、地板、铁丝网
+    ComPtr<ID3D12PipelineState> mShadowLandPSO; //陆地
+    ComPtr<ID3D12PipelineState> mShadowTreePSO; //树
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, int nShowCmd)
