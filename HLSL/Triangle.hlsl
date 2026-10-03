@@ -84,7 +84,7 @@ float4 PS_MirrorClear(VertexOut pin) : SV_Target
 {
     // 镜子后面的"背景"：视线打到镜面上弹出去，看到的是那个方向的天空
     float3 toEye = normalize(gPass.EyePosW - pin.PosW);
-    float3 r = SkyDir(reflect(-toEye, pin.NormalW));
+    float3 r = SkyDir(reflect(-toEye, normalize(pin.NormalW)));
     return gCubeMap.Sample(gsamLinearWrap, r);
 }
 

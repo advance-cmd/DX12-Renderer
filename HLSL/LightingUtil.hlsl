@@ -164,6 +164,21 @@ float4 FogColorAt(float3 toEye)
     return float4(gCubeMap.SampleLevel(gsamLinearWrap, dir, 5).rgb, 1.0f);
 }
 
+// Schlick 近似的菲涅耳：看得越斜（n 和 l 夹角越大），反射越强
+float3 SchlickFresnel(float3 R0, float3 normal, float3 lightVec)
+{
+    float f0 = 1.0f - saturate(dot(normal, lightVec)); // 1 - cosθ，θ 是 normal 和 lightVec 的夹角
+    return R0 + (1.0f - R0) * pow(f0, 5);
+}
+
+// 环境反射：把视线在表面上弹一下，用弹出去的方向查天空图
+float3 EnvReflection(MaterialConstants mat, float3 normal, float3 toEye)
+{
+    float3 r = reflect(-toEye, normal);
+    float3 reflectionColor = gCubeMap.Sample(gsamLinearWrap, SkyDir(r)).rgb;
+    return (1.0f - mat.Roughness) * SchlickFresnel(mat.FresnelR0, normal, r) * reflectionColor;
+}
+
 // 返回 0～1：1 = 全亮，0 = 全在影子里。shadowPosH = 这个点在阴影图里的 (u, v, 深度, w)
 float CalcShadowFactor(float4 shadowPosH)
 {

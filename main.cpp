@@ -1606,7 +1606,7 @@ private:
         mAllItems.push_back(std::move(tree));
         
         auto sky = std::make_unique<RenderItem>();
-        // .xyww 以后深度恒为 1，球多大其实无所谓（包住相机就行）；转 41.4° 让天空图里的太阳和 mSunDir 的方位对上
+        // .xyww 以后深度恒为 1，球多大其实无所谓（包住相机就行）；天空图转的 41.4° 在着色器的 SkyDir 里
         XMStoreFloat4x4(&sky->World, XMMatrixScaling(5000.0f, 5000.0f, 5000.0f));
         auto LSkyGeo = mShapeGeo->DrawArgs.at("sphere");
         sky->PSO = mSkyPSO;
@@ -1732,6 +1732,15 @@ private:
             {"FOG", "1"},
             {nullptr, nullptr}
         };
+        // 水：多开一个 ENV_REFLECT，只有水做环境反射
+        const D3D_SHADER_MACRO waterDefines[] = {
+            {"NUM_DIR_LIGHTS", "1"},
+            {"NUM_POINT_LIGHTS", "1"},
+            {"NUM_SPOT_LIGHTS", "1"},
+            {"FOG", "1"},
+            {"ENV_REFLECT", "1"},
+            {nullptr, nullptr}
+        };
 
         const D3D_SHADER_MACRO alphaTestDefines[] = {
             {"NUM_DIR_LIGHTS", "1"},
@@ -1782,6 +1791,7 @@ private:
         mSkyVSByteCode = CompileShader(L"HLSL\\Sky.hlsl", lightDefines, "VS", "vs_5_1");
         mSkyPSByteCode = CompileShader(L"HLSL\\Sky.hlsl", lightDefines, "PS", "ps_5_1");
         
+        mWaterPSByteCode = CompileShader(L"HLSL\\Color.hlsl", waterDefines, "PS", "ps_5_1");
     }
 
     void BuildPSO()
@@ -1953,6 +1963,7 @@ private:
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&psoDesc,IID_PPV_ARGS(&mColorPSO)));
 
         psoDesc.BlendState.RenderTarget[0] = alpha;
+        psoDesc.PS = {mWaterPSByteCode->GetBufferPointer(), mWaterPSByteCode->GetBufferSize()};
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&psoDesc,IID_PPV_ARGS(&mBlendPSO)));
 
         //Horz
@@ -2031,6 +2042,7 @@ private:
     ComPtr<ID3DBlob> mAlphaTestedPSByteCode;
     ComPtr<ID3DBlob> mMirrorVSByteCode;
     ComPtr<ID3DBlob> mMirrorPSByteCode;
+    ComPtr<ID3DBlob> mWaterPSByteCode;
     std::vector<D3D12_INPUT_ELEMENT_DESC> mCrateInputLayout;
     ComPtr<ID3D12PipelineState> mColorPSO;
     ComPtr<ID3DBlob> mColorVSByteCode;

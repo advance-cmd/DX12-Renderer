@@ -57,6 +57,9 @@ float4 PS(VertexOut pin) : SV_Target
     float3 direct = ComputeLighting(gPass.Lights, gMat, pin.PosW, normal, toEye,shadowFactor);
     
     res = float4(ambient + direct, gMat.DiffuseAlbedo.a);
+#ifdef ENV_REFLECT
+    res.rgb += EnvReflection(gMat, normal, toEye);   // 水面多出一份"从天空反射来的光"
+#endif
 #ifdef FOG
     res.rgb = ApplyFog(res.rgb, distToEye, FogColorAt(toEye), gPass.FogStart, gPass.FogRange);
 #endif
