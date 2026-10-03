@@ -38,6 +38,8 @@ struct PassConstants
 };
 
 Texture2D gShadowMap : register(t1);
+TextureCube gCubeMap : register(t2); // 天空图：用方向去查
+SamplerState gsamLinearWrap : register(s0);
 SamplerComparisonState gsamShadow : register(s1);
 
 // Blinn-Phong：漫反射 + 高光，三种灯共用。各种灯只负责算出

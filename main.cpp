@@ -81,6 +81,7 @@ enum class RenderLayer : int
     Reflected,
     Shadow,
     Transparent,
+    Sky,
     Count
 };
 
@@ -509,6 +510,7 @@ protected:
         mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 0); // T0
         DrawShadowMap(passCB + 2 * passCBByteSize);
         mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 1); // T1
+        mCommandList->SetGraphicsRootDescriptorTable(5, HeapGpuHandle(10));
 
         // ② 主 Pass。阴影 Pass 把视口改成了阴影图的大小，这里换回屏幕的
         mCommandList->RSSetViewports(1, &mScreenViewport);
@@ -526,6 +528,7 @@ protected:
         mCommandList->SetGraphicsRootDescriptorTable(4,HeapGpuHandle(9));
 
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Opaque]);
+        DrawRenderItems(mRitemLayer[(int)RenderLayer::Sky]); // 天空：不透明之后（被挡住的像素省掉），透明之前（水要和天空混合）
         mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 2); // T2
         mCommandList->OMSetStencilRef(1); // 章上刻"1"
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Mirrors]); // ③ 看得见的镜子像素盖章
@@ -875,6 +878,7 @@ private:
         LoadTextureHelper("iceTex", L"Textures\\ice.dds");
         LoadTextureHelper("tileTex", L"Textures\\tile.dds");
         LoadTextureHelper("treeArrayTex", L"Textures\\treeArray2.dds");
+        LoadTextureHelper("skyCubeTex", L"Textures\\grasscube1024.dds");
         //书上的 DDS 加载函数认得纹理数组，建出来的资源 DepthOrArraySize 会是 3。
     }
 
@@ -883,7 +887,7 @@ private:
     {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {
             .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            .NumDescriptors = 10, // 0～4 纹理，5～8 模糊用的两张纹理（各一个 SRV、一个 UAV），9 阴影图的 SRV
+            .NumDescriptors = 11, // 0～4 纹理，5～8 模糊用的两张纹理（各一个 SRV、一个 UAV），9 阴影图的 SRV，10天空图
             .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, // 着色器要从这个堆里读（RTV/DSV 堆不用，所以是 NONE）
             .NodeMask = 0,
         };
@@ -968,6 +972,16 @@ private:
         };
         CD3DX12_CPU_DESCRIPTOR_HANDLE treeHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), 4, mCSUDescriptorSize);
         mDevice->CreateShaderResourceView(treeArrayTex.Get(), &treeArrayDesc, treeHandle);
+        
+        auto& skyTex = mTextures.at("skyCubeTex")->Resource;
+        D3D12_SHADER_RESOURCE_VIEW_DESC skyDesc = {
+            .Format = skyTex->GetDesc().Format,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE, // 资源是 6 张图的数组，SRV 把它看成立方体，用方向去查
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .TextureCube = {.MostDetailedMip = 0, .MipLevels = skyTex->GetDesc().MipLevels, .ResourceMinLODClamp = 0.0f},
+        };
+        CD3DX12_CPU_DESCRIPTOR_HANDLE skyHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), 10, mCSUDescriptorSize);
+        mDevice->CreateShaderResourceView(skyTex.Get(), &skyDesc, skyHandle);
     }
 
     void BuildShapeGeometry()
@@ -1014,6 +1028,16 @@ private:
         {
             indices.push_back((std::uint16_t)i);
         }
+        
+        GeometryGenerator::MeshData skyBox = geoGen.CreateSphere(.5f,20,20);
+        const UINT skyBoxVertexStart = (UINT)vertices.size();
+        const UINT skyBoxIndexStart = (UINT)indices.size();
+        // GeometryGenerator 的顶点还多一个切线，和我们的 Vertex 不是一个类型，只能逐个字段拷
+        for (const auto& v : skyBox.Vertices)
+        {
+            vertices.push_back(Vertex{v.Position, v.Normal, v.TexC});
+        }
+        indices.insert(indices.end(), skyBox.GetIndices16().begin(), skyBox.GetIndices16().end());
 
         // 索引的元素类型、这里的 sizeof、IndexFormat = R16_UINT 三者必须一致
         const UINT vbByteSize = (UINT)vertices.size() * sizeof(Vertex);
@@ -1058,6 +1082,12 @@ private:
         submesh_Floor.StartIndexLocation = floorIndexStart; // 接在镜子的 6 个索引后面
         submesh_Floor.BaseVertexLocation = (int)floorVertexStart; // 接在镜子的 4 个顶点后面
         mShapeGeo->DrawArgs["floor"] = submesh_Floor;
+        
+        DX_Utils::SubmeshGeometry submesh_sphere;
+        submesh_sphere.IndexCount = (UINT)skyBox.Indices32.size();
+        submesh_sphere.StartIndexLocation = skyBoxIndexStart;
+        submesh_sphere.BaseVertexLocation = (int)skyBoxVertexStart;
+        mShapeGeo->DrawArgs["sphere"] = submesh_sphere;
     }
 
     // 陆地：一张 160×160 的大网格，按高度函数把 y 抬起来，再按高度上色。
@@ -1245,6 +1275,7 @@ private:
         std::unique_ptr<Material> LMaterial_shadow = std::make_unique<Material>();
         std::unique_ptr<Material> LMaterial_fenceShadow = std::make_unique<Material>();
         std::unique_ptr<Material> LMaterial_tree = std::make_unique<Material>();
+        std::unique_ptr<Material> LMaterial_sky = std::make_unique<Material>();
 
         LMaterial_crate->Name = "crate";
         LMaterial_crate->MatCBIndex = 0;
@@ -1305,6 +1336,10 @@ private:
         LMaterial_tree->FresnelR0 = {0.01f, 0.01f, 0.01f};
         LMaterial_tree->Roughness = 0.125f;
         LMaterial_tree->DiffuseSrvHeapIndex = 4;
+        
+        LMaterial_sky->Name = "sky";
+        LMaterial_sky->MatCBIndex = 9;
+        
 
         mMaterials[LMaterial_crate->Name] = std::move(LMaterial_crate);
         mMaterials[LMaterial_grass->Name] = std::move(LMaterial_grass);
@@ -1315,6 +1350,7 @@ private:
         mMaterials[LMaterial_shadow->Name] = std::move(LMaterial_shadow);
         mMaterials[LMaterial_fenceShadow->Name] = std::move(LMaterial_fenceShadow);
         mMaterials[LMaterial_tree->Name] = std::move(LMaterial_tree);
+        mMaterials[LMaterial_sky->Name] = std::move(LMaterial_sky);
     }
 
     //构建mAllItems
@@ -1568,6 +1604,21 @@ private:
         tree->Mat = mMaterials.at("tree").get();
         mRitemLayer[(int)RenderLayer::Opaque].push_back(tree.get());
         mAllItems.push_back(std::move(tree));
+        
+        auto sky = std::make_unique<RenderItem>();
+        // .xyww 以后深度恒为 1，球多大其实无所谓（包住相机就行）；转 41.4° 让天空图里的太阳和 mSunDir 的方位对上
+        XMStoreFloat4x4(&sky->World, XMMatrixScaling(5000.0f, 5000.0f, 5000.0f) *
+                                     XMMatrixRotationY(XMConvertToRadians(41.4f)));
+        auto LSkyGeo = mShapeGeo->DrawArgs.at("sphere");
+        sky->PSO = mSkyPSO;
+        sky->ObjCBIndex = objCBIndex++;
+        sky->Geo = mShapeGeo.get();
+        sky->IndexCount = LSkyGeo.IndexCount;
+        sky->StartIndexLocation = LSkyGeo.StartIndexLocation;
+        sky->BaseVertexLocation = LSkyGeo.BaseVertexLocation;
+        sky->Mat = mMaterials.at("sky").get();
+        mRitemLayer[(int)RenderLayer::Sky].push_back(sky.get());
+        mAllItems.push_back(std::move(sky));
     }
 
     // 3 份帧资源，每份：3 个 Pass 常量（0 主 Pass、1 镜像、2 阴影 Pass）+ 每个渲染项 1 个物体常量
@@ -1597,13 +1648,17 @@ private:
 
         CD3DX12_DESCRIPTOR_RANGE shadowRange;
         shadowRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1); // 1 个 SRV，从 t1 开始    阴影图
+        
+        CD3DX12_DESCRIPTOR_RANGE skyRange;
+        skyRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2);   //1 个 SRV，从 t2 开始   天空图
 
-        CD3DX12_ROOT_PARAMETER slotRootParameter[5];
+        CD3DX12_ROOT_PARAMETER slotRootParameter[6];
         slotRootParameter[0].InitAsConstantBufferView(0);
         slotRootParameter[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
         slotRootParameter[2].InitAsConstantBufferView(1);
         slotRootParameter[3].InitAsConstantBufferView(2);
         slotRootParameter[4].InitAsDescriptorTable(1, &shadowRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        slotRootParameter[5].InitAsDescriptorTable(1, &skyRange, D3D12_SHADER_VISIBILITY_PIXEL);
 
         CD3DX12_STATIC_SAMPLER_DESC samplers[2] = {
             CD3DX12_STATIC_SAMPLER_DESC(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR),
@@ -1724,6 +1779,10 @@ private:
 
         mShadowCratePSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", alphaTestDefines, "PS_Shadow", "ps_5_1");
         mShadowTreePSByteCode = CompileShader(L"HLSL\\TreeSprite.hlsl", alphaTestDefines, "PS_Shadow", "ps_5_1");
+        
+        mSkyVSByteCode = CompileShader(L"HLSL\\Sky.hlsl", lightDefines, "VS", "vs_5_1");
+        mSkyPSByteCode = CompileShader(L"HLSL\\Sky.hlsl", lightDefines, "PS", "ps_5_1");
+        
     }
 
     void BuildPSO()
@@ -1880,6 +1939,13 @@ private:
         LTreePSODesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
         LTreePSODesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&LTreePSODesc,IID_PPV_ARGS(&mTreePSO)));
+        
+        auto LSkyPSODesc = psoDesc;
+        LSkyPSODesc.VS = {mSkyVSByteCode->GetBufferPointer(), mSkyVSByteCode->GetBufferSize()};
+        LSkyPSODesc.PS = {mSkyPSByteCode->GetBufferPointer(), mSkyPSByteCode->GetBufferSize()};
+        LSkyPSODesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; // 相机在球里面，看到的是背面
+        LSkyPSODesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL; // 天空深度恒为 1，和清屏值相等，LESS 不让它过
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&LSkyPSODesc, IID_PPV_ARGS(&mSkyPSO)));
 
         // 陆地和水面：位置 + 顶点色，PS 直接返回颜色
         psoDesc.InputLayout = {mColorInputLayout.data(), (UINT)mColorInputLayout.size()};
@@ -2017,6 +2083,11 @@ private:
     ComPtr<ID3D12PipelineState> mShadowCratePSO; //木箱、地板、铁丝网
     ComPtr<ID3D12PipelineState> mShadowLandPSO; //陆地
     ComPtr<ID3D12PipelineState> mShadowTreePSO; //树
+    
+    //Sky
+    ComPtr<ID3D12PipelineState> mSkyPSO;
+    ComPtr<ID3DBlob> mSkyVSByteCode;
+    ComPtr<ID3DBlob> mSkyPSByteCode;
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, int nShowCmd)

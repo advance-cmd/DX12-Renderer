@@ -6,7 +6,6 @@ ConstantBuffer<PassConstants> gPass : register(b1);
 ConstantBuffer<MaterialConstants> gMat : register(b2);
 
 Texture2DArray gTreeMapArray : register(t0);
-SamplerState gsamLinearWrap : register(s0);
 
 struct VertexIn
 {

@@ -16,7 +16,6 @@ ConstantBuffer<PassConstants> gPass : register(b1);
 ConstantBuffer<MaterialConstants> gMat : register(b2);
 
 Texture2D gDiffuseMap : register(t0);
-SamplerState gsamLinearWrap : register(s0);
 
 // 必须和 C++ 里的 Vertex 结构体、输入布局一致
 struct VertexIn
