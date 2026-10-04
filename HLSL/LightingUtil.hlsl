@@ -51,13 +51,13 @@ float3 BlinnPhong(float3 lightStrength, float3 lightVec, float3 normal, float3 t
     // Lambert 余弦：光斜着照，同样的光摊到更大的面积上，每一小块接到的就少；背面接不到光
     float ndotl = max(dot(lightVec, normal), 0.0f);
 
-    float m = (1 - mat.Roughness) * 256;                // 光泽度：越光滑，高光越小越亮
-    float3 h = normalize(toEye + lightVec);             // 半角向量
+    float m = (1 - mat.Roughness) * 256; // 光泽度：越光滑，高光越小越亮
+    float3 h = normalize(toEye + lightVec); // 半角向量
     float roughnessFactor = (m + 8) / 8 * pow(max(dot(h, normal), 0), m);
     // Schlick 近似的 Fresnel：夹角用 h 和 lightVec（Blinn-Phong 里微表面的法线就是 h）
     float3 fresnel = mat.FresnelR0 + (1 - mat.FresnelR0) * pow(1 - max(dot(h, lightVec), 0), 5);
     float3 specAlbedo = fresnel * roughnessFactor;
-    specAlbedo = specAlbedo / (specAlbedo + 1);         // LDR：把可能超过 1 的高光压回 [0, 1)
+    specAlbedo = specAlbedo / (specAlbedo + 1); // LDR：把可能超过 1 的高光压回 [0, 1)
     return (mat.DiffuseAlbedo.rgb + specAlbedo) * lightStrength * ndotl;
 }
 
@@ -77,12 +77,12 @@ float CalcAttenuation(float d, float falloffStart, float falloffEnd)
 // 点光源：灯挂在 L.Position，光向量每个点都不同，所以需要这个点的世界坐标 pos
 float3 ComputePointLight(Light L, MaterialConstants mat, float3 pos, float3 normal, float3 toEye)
 {
-    float3 result = float3(0.0f, 0.0f, 0.0f);           // 太远的点照不到，结果就是 0
-    float3 lightVec = L.Position - pos;                 // 从表面指向灯
+    float3 result = float3(0.0f, 0.0f, 0.0f); // 太远的点照不到，结果就是 0
+    float3 lightVec = L.Position - pos; // 从表面指向灯
     float d = length(lightVec);
     if (d <= L.FalloffEnd)
     {
-        lightVec /= d;                                  // 归一化（前面已经算过长度，直接除）
+        lightVec /= d; // 归一化（前面已经算过长度，直接除）
         float3 lightStrength = L.Strength * CalcAttenuation(d, L.FalloffStart, L.FalloffEnd);
         result = BlinnPhong(lightStrength, lightVec, normal, toEye, mat);
     }
@@ -93,7 +93,7 @@ float3 ComputePointLight(Light L, MaterialConstants mat, float3 pos, float3 norm
 float3 ComputeSpotLight(Light L, MaterialConstants mat, float3 pos, float3 normal, float3 toEye)
 {
     float3 result = float3(0.0f, 0.0f, 0.0f);
-    float3 lightVec = L.Position - pos;                 // 前半段和点光源一模一样
+    float3 lightVec = L.Position - pos; // 前半段和点光源一模一样
     float d = length(lightVec);
     if (d <= L.FalloffEnd)
     {
@@ -112,7 +112,8 @@ float3 ComputeSpotLight(Light L, MaterialConstants mat, float3 pos, float3 norma
 
 // 把所有灯的贡献加起来。灯在 Lights[] 里的排布：先平行光，再点光源，最后聚光灯
 // NUM_DIR_LIGHTS / NUM_POINT_LIGHTS / NUM_SPOT_LIGHTS 由 C++ 编译着色器时用宏传进来
-float3 ComputeLighting(Light lights[MaxLights], MaterialConstants mat, float3 pos, float3 normal, float3 toEye,float3 shadowFactor)
+float3 ComputeLighting(Light lights[MaxLights], MaterialConstants mat, float3 pos, float3 normal, float3 toEye,
+                       float3 shadowFactor)
 {
     float3 result = 0.0f;
     int i = 0;
@@ -154,7 +155,7 @@ float3 SkyDir(float3 dirW)
 {
     float s = -sin(SkyYaw);
     float c = cos(SkyYaw);
-    return float3(c*dirW.x+dirW.z*s, dirW.y, -s*dirW.x+c*dirW.z);
+    return float3(c * dirW.x + dirW.z * s, dirW.y, -s * dirW.x + c * dirW.z);
 }
 
 // 雾色：沿视线方向查天空图，用很糊的第 5 级 mip（32×32），远处的东西融进"大概的天空颜色"
@@ -179,19 +180,31 @@ float3 EnvReflection(MaterialConstants mat, float3 normal, float3 toEye)
     return (1.0f - mat.Roughness) * SchlickFresnel(mat.FresnelR0, normal, r) * reflectionColor;
 }
 
+// 法线图的一个样本（切线空间）→ 世界空间
+float3 NormalSampleToWorldSpace(float3 normalMapSample, float3 unitNormalW, float3 tangentW)
+{
+    float3 normalT = normalMapSample *2 -1; // [0,1] → [-1,1]
+    float3 N = unitNormalW;
+    float3 T = normalize(tangentW - dot(tangentW , N)*N); // 扶正：减掉 T 在 N 上的投影
+    float3 B = cross(N, T);
+    float3x3 TBN = float3x3(T, B, N); // 三行：T、B、N
+    return mul(normalT,TBN); // x·T + y·B + z·N
+}
+
 // 返回 0～1：1 = 全亮，0 = 全在影子里。shadowPosH = 这个点在阴影图里的 (u, v, 深度, w)
 float CalcShadowFactor(float4 shadowPosH)
 {
-    shadowPosH.xyz /=shadowPosH.w;  //正交投影 w = 1，但是聚光灯就不一定w=1了，所以这句还是要写
+    shadowPosH.xyz /= shadowPosH.w; //正交投影 w = 1，但是聚光灯就不一定w=1了，所以这句还是要写
     float depth = shadowPosH.z;
-    uint width,height,numMips;
-    gShadowMap.GetDimensions(0,width,height,numMips);
-    float dx = 1.0f / (float)width;    //一个纹素在uv里有多宽
-    
+    uint width, height, numMips;
+    gShadowMap.GetDimensions(0, width, height, numMips);
+    float dx = 1.0f / (float)width; //一个纹素在uv里有多宽
+
     const float2 offsets[9] = {
-        float2(-dx,-dx), float2(0,-dx), float2(dx,-dx),
-        float2(-dx, 0),  float2(0, 0),  float2(dx, 0),
-        float2(-dx, dx), float2(0, dx), float2(dx, dx) };
+        float2(-dx, -dx), float2(0, -dx), float2(dx, -dx),
+        float2(-dx, 0), float2(0, 0), float2(dx, 0),
+        float2(-dx, dx), float2(0, dx), float2(dx, dx)
+    };
     float percentLit = 0.0f;
     [unroll] for (int i = 0; i < 9; ++i)
         percentLit += gShadowMap.SampleCmpLevelZero(

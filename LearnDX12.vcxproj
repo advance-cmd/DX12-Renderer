@@ -175,6 +175,7 @@
     <Content Include="Textures\tile.dds" />
     <Content Include="Textures\treeArray2.dds" />
     <Content Include="Textures\grasscube1024.dds" />
+    <Content Include="Textures\tile_nmap.dds" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

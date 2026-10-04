@@ -1,5 +1,6 @@
 // 带纹理的物体：VS 做局部 → 世界 → 裁剪空间，PS 采样漫反射纹理
 // 根签名：b0 = 物体常量（根 CBV），t0 = 纹理（描述符表），b1 = Pass 常量（根 CBV），b2 = 材质，s0 = 静态采样器
+//         t1 = 阴影图，t2 = 天空图（LightingUtil.hlsl），t3 = 法线图（只有定义了 NORMAL_MAP 的 PS 读，现在只有地板）
 // ConstantBuffer<T> 需要 Shader Model 5.1（vs_5_1 / ps_5_1）
 
 #include "LightingUtil.hlsl"   // Light、MaterialConstants、MaxLights、ComputeDirectionalLight
@@ -16,6 +17,7 @@ ConstantBuffer<PassConstants> gPass : register(b1);
 ConstantBuffer<MaterialConstants> gMat : register(b2);
 
 Texture2D gDiffuseMap : register(t0);
+Texture2D gNormalMap : register(t3);
 
 // 必须和 C++ 里的 Vertex 结构体、输入布局一致
 struct VertexIn
@@ -23,6 +25,7 @@ struct VertexIn
     float3 PosL : POSITION; // L = Local，局部空间
     float3 NormalL : NORMAL;
     float2 TexC : TEXCOORD;
+    float3 TangentU : TANGENT;
 };
 
 struct VertexOut
@@ -32,6 +35,7 @@ struct VertexOut
     float2 TexC : TEXCOORD;
     float3 PosW : TEXCOORD1;
     float4 shadowPosH : TEXCOORD2;
+    float3 TangentW : TANGENT;
 };
 
 VertexOut VS(VertexIn vin)
@@ -43,6 +47,7 @@ VertexOut VS(VertexIn vin)
     vout.TexC = vin.TexC;
     vout.PosW = posW.xyz;
     vout.shadowPosH = mul(posW,gPass.ShadowTransform);
+    vout.TangentW = mul(vin.TangentU,(float3x3)gObj.World);
     return vout;
 }
 
@@ -63,6 +68,11 @@ float4 PS(VertexOut pin) : SV_Target
     float distToEye = length(toEye);
     toEye /= distToEye;
     float3 normal = normalize(pin.NormalW);   // 插值之后长度不一定是 1
+#ifdef NORMAL_MAP
+    float4 normalMapSample = gNormalMap.Sample(gsamLinearWrap, pin.TexC);
+    normal = NormalSampleToWorldSpace(normalMapSample.rgb, normal, pin.TangentW);
+    mat.Roughness = 1.0f - (1.0f - mat.Roughness) * normalMapSample.a; // alpha 是光泽度：1 = 照常反光，0 = 瓷砖缝里不反光
+#endif
     float3 shadowFactor = float3(1.0f, 1.0f, 1.0f);
     shadowFactor[0] = CalcShadowFactor(pin.shadowPosH); // Lights[0] 是太阳，阴影图是站在太阳那里画的
     float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye,shadowFactor);

@@ -56,6 +56,7 @@ struct Material
     XMFLOAT3 FresnelR0;
     float Roughness;
     int DiffuseSrvHeapIndex = 0;
+    int NormalSrvHeapIndex = -1;
 };
 
 struct MaterialConstants
