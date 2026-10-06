@@ -43,22 +43,48 @@ VertexOut VS(VertexIn vin)
     return vout;
 }
 
+#ifdef LAND_TEX
+Texture2D gGrassMap : register(t4);
+Texture2D gStoneMap : register(t5);
+#endif
+
 float4 PS(VertexOut pin) : SV_Target
 {
+    MaterialConstants mat = gMat; // 常量缓冲是只读的，要改就复制一份
+    
+#ifdef LAND_TEX
+    // ① 陆地的顶点没有 uv，就拿世界坐标的水平方向 (x, z) 当 uv，相当于从正上方把纹理"投"到地面上。
+    //    除以 6：每 6 个单位铺一块。比如 (x, z) = (12, -30) → uv = (2, -5)；采样器是 Wrap 模式，只看小数部分，所以每 6 个单位重复一次
+    float2 uv = pin.PosW.xz / 6.0f;
+
+    // ② 两张纹理都采样一次。石头的 uv 再乘 0.5，块就大一倍
+    float3 grass = gGrassMap.Sample(gsamLinearWrap, uv).rgb;
+    float3 stone = gStoneMap.Sample(gsamLinearWrap, uv * 0.5f).rgb;
+
+    // ③ 坡有多陡：法线的 y 分量就是坡面和水平面夹角的余弦
+    //    平地 y = 1，45° 的坡 y ≈ 0.71，竖直的崖 y = 0
+    //    想要：y ≥ 0.85 全是草（0），y ≤ 0.65 全是石头（1），中间按比例过渡
+    float steep = saturate((0.85f - normalize(pin.NormalW).y) / 0.2f);
+
+    // ④ lerp(a, b, t) = a × (1 - t) + b × t：steep = 0 是草，1 是石头
+    //    材质颜色已经改成了 (1, 1, 1)，乘完就是纹理本身的颜色
+    mat.DiffuseAlbedo.rgb *= lerp(grass, stone, steep);
+#endif
+    
     // 没有贴图，材质原样拿来用
     float4 res=float4(0,0,0,0);
-    float3 ambient = gPass.AmbientLight.rgb * gMat.DiffuseAlbedo.rgb;
+    float3 ambient = gPass.AmbientLight.rgb * mat.DiffuseAlbedo.rgb;
     float3 toEye = gPass.EyePosW - pin.PosW;
     float distToEye = length(toEye);
     toEye /= distToEye;
     float3 normal = normalize(pin.NormalW);   // 插值之后长度不一定是 1
     float3 shadowFactor = float3(1.0f, 1.0f, 1.0f);
     shadowFactor[0] = CalcShadowFactor(pin.shadowPosH); // Lights[0] 是太阳，阴影图是站在太阳那里画的
-    float3 direct = ComputeLighting(gPass.Lights, gMat, pin.PosW, normal, toEye,shadowFactor);
+    float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye,shadowFactor);
     
-    res = float4(ambient + direct, gMat.DiffuseAlbedo.a);
+    res = float4(ambient + direct, mat.DiffuseAlbedo.a);
 #ifdef ENV_REFLECT
-    res.rgb += EnvReflection(gMat, normal, toEye);   // 水面多出一份"从天空反射来的光"
+    res.rgb += EnvReflection(mat, normal, toEye);   // 水面多出一份"从天空反射来的光"
 #endif
 #ifdef FOG
     res.rgb = ApplyFog(res.rgb, distToEye, FogColorAt(toEye), gPass.FogStart, gPass.FogRange);

@@ -684,6 +684,7 @@ protected:
 
         mCommandList->SetGraphicsRootConstantBufferView(2, passCB); // 阴影 Pass 用的是第 2 份，换回主 Pass 的
         mCommandList->SetGraphicsRootDescriptorTable(4, HeapGpuHandle(9));
+        mCommandList->SetGraphicsRootDescriptorTable(7, HeapGpuHandle(16));
 
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Opaque]);
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Sky]); // 天空：不透明之后（被挡住的像素省掉），透明之前（水要和天空混合）
@@ -873,7 +874,7 @@ private:
         XMStoreFloat4x4(&pc.ViewProj, XMMatrixTranspose(mCamera.GetView() * mCamera.GetProj()));
         XMStoreFloat4x4(&pc.ShadowTransform, XMMatrixTranspose(XMLoadFloat4x4(&mShadowTransform)));
         pc.EyePosW = mCamera.GetPosition3f();
-        pc.AmbientLight = {0.25f, 0.25f, 0.35f, 1.0f};
+        pc.AmbientLight = {0.3f, 0.32f, 0.4f, 1.0f}; // 偏蓝：天空散射过来的光，阴影里带点蓝
         pc.FogColor = XMFLOAT4(Colors::LightSteelBlue.f);
         pc.FogStart = 70.f;
         pc.FogRange = 120.f;
@@ -888,7 +889,7 @@ private:
         XMFLOAT3 Position;
         float SpotPower;
         };*/
-        pc.Lights[0].Strength = {1, 1, 1};
+        pc.Lights[0].Strength = {1.35f, 1.12f, 0.85f}; // 夕阳：红多蓝少，偏暖，稍亮一点
         pc.Lights[0].FalloffStart = 5;
         pc.Lights[0].Direction = mSunDir; // 太阳在场景后方、压得很低，朝镜头斜着照过来，水面的镜面反射点才会进入画面
         pc.Lights[0].FalloffEnd = 100;
@@ -1060,6 +1061,8 @@ private:
         //书上的 DDS 加载函数认得纹理数组，建出来的资源 DepthOrArraySize 会是 3。
         LoadTextureHelper("skyCubeTex", L"Textures\\grasscube1024.dds");
         LoadTextureHelper("tileNormalTex", L"Textures\\tile_nmap.dds");
+        LoadTextureHelper("grassTex", L"Textures\\grass.dds");
+        LoadTextureHelper("stoneTex", L"Textures\\stone.dds");
     }
 
     // 构建描述符堆
@@ -1067,7 +1070,7 @@ private:
     {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {
             .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            .NumDescriptors = 16, // 0～4 纹理，5～8 模糊用的两张纹理（各一个 SRV、一个 UAV），9 阴影图的 SRV，10天空图   11是地板法线贴图 12~15 ImGui
+            .NumDescriptors = 18, // 0～4 纹理，5～8 模糊用的两张纹理（各一个 SRV、一个 UAV），9 阴影图的 SRV，10天空图   11是地板法线贴图 12~15 ImGui 16 ~ 17 grass stone
             .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, // 着色器要从这个堆里读（RTV/DSV 堆不用，所以是 NONE）
             .NodeMask = 0,
         };
@@ -1181,6 +1184,26 @@ private:
                                                        mCSUDescriptorSize);
         mDevice->CreateShaderResourceView(tileNormalTex.Get(), &tileNormalTexDesc,
                                           tileNormalHandle);
+        
+        // 陆地的两层纹理挨着放：16 草地、17 岩石。根参数 7 的表从 16 开始、管 2 格
+        const char* landLayers[] = {"grassTex", "stoneTex"};
+        for (int k = 0; k < 2; k++)
+        {
+            auto& landLayerTex = mTextures.at(landLayers[k])->Resource;
+            D3D12_SHADER_RESOURCE_VIEW_DESC landLayerTexDesc = {
+                .Format = landLayerTex->GetDesc().Format,
+                .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+                .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                .Texture2D = {
+                    .MostDetailedMip = 0,
+                    .MipLevels = landLayerTex->GetDesc().MipLevels,
+                    .PlaneSlice = 0,
+                    .ResourceMinLODClamp = 0.0f,
+                },
+            };
+            mDevice->CreateShaderResourceView(landLayerTex.Get(), &landLayerTexDesc,HeapCpuHandle(16 + k));
+        }
+        
     }
 
     void BuildShapeGeometry()
@@ -1496,9 +1519,9 @@ private:
 
         LMaterial_grass->Name = "grass";
         LMaterial_grass->MatCBIndex = 1;
-        LMaterial_grass->DiffuseAlbedo = {0.2f, 0.6f, 0.2f, 1};
+        LMaterial_grass->DiffuseAlbedo = {1, 1, 1, 1};
         LMaterial_grass->FresnelR0 = {0.01f, 0.01f, 0.01f};
-        LMaterial_grass->Roughness = 0.125f;
+        LMaterial_grass->Roughness = 0.85f;
 
         LMaterial_water->Name = "water";
         LMaterial_water->MatCBIndex = 2;
@@ -1585,34 +1608,9 @@ private:
         mRitemLayer[(int)RenderLayer::Opaque].push_back(land.get());
         mAllItems.push_back(std::move(land));
 
-        // 10×10 个木箱铺在 xz 平面上，顺带当尺度参照物
-        const int gridCount = 10; // 每行、每列几个
-        const float spacing = 3.0f; // 相邻两个木箱中心的距离（木箱边长是 2）
+        // 第 6、7 章那片 10×10 的木箱阵已经删掉（一半泡在水里，像一排踏脚石）；
+        // 下面的铁丝网、木箱还要用立方体这段几何
         const DX_Utils::SubmeshGeometry& box = mShapeGeo->DrawArgs["box"];
-
-        for (int i = 0; i < gridCount; i++)
-        {
-            for (int j = 0; j < gridCount; j++)
-            {
-                auto crate = std::make_unique<RenderItem>();
-                crate->PSO = mCratePSO.GetAddressOf();
-                crate->ShadowPSO = mShadowCratePSO.GetAddressOf();
-
-                // 减去 (gridCount - 1) / 2，让整片木箱以原点为中心
-                float x = (i - (gridCount - 1) * 0.5f) * spacing;
-                float z = (j - (gridCount - 1) * 0.5f) * spacing;
-
-                XMStoreFloat4x4(&crate->World, XMMatrixTranslation(x, 0.0f, z));
-                crate->ObjCBIndex = objCBIndex++; // 每个木箱在 ObjectCB 里占自己的一格
-                crate->Geo = mShapeGeo.get();
-                crate->IndexCount = box.IndexCount;
-                crate->StartIndexLocation = box.StartIndexLocation;
-                crate->BaseVertexLocation = box.BaseVertexLocation;
-                crate->Mat = mMaterials.at("crate").get();
-                mRitemLayer[(int)RenderLayer::Opaque].push_back(crate.get());
-                mAllItems.push_back(std::move(crate));
-            }
-        }
 
         auto Lfence1 = std::make_unique<RenderItem>();
         Lfence1->PSO = mAlphaTestedPSO.GetAddressOf();
@@ -1865,8 +1863,11 @@ private:
 
         CD3DX12_DESCRIPTOR_RANGE tileNormalRange;
         tileNormalRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3); //1 个 SRV，从t3开始 tileNormal贴图
+        
+        CD3DX12_DESCRIPTOR_RANGE landRange;
+        landRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 4); // t4 草地、t5 岩石
 
-        CD3DX12_ROOT_PARAMETER slotRootParameter[7];
+        CD3DX12_ROOT_PARAMETER slotRootParameter[8];
         slotRootParameter[0].InitAsConstantBufferView(0);
         slotRootParameter[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
         slotRootParameter[2].InitAsConstantBufferView(1);
@@ -1874,6 +1875,7 @@ private:
         slotRootParameter[4].InitAsDescriptorTable(1, &shadowRange, D3D12_SHADER_VISIBILITY_PIXEL);
         slotRootParameter[5].InitAsDescriptorTable(1, &skyRange, D3D12_SHADER_VISIBILITY_PIXEL);
         slotRootParameter[6].InitAsDescriptorTable(1, &tileNormalRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        slotRootParameter[7].InitAsDescriptorTable(1, &landRange, D3D12_SHADER_VISIBILITY_PIXEL);
 
         CD3DX12_STATIC_SAMPLER_DESC samplers[2] = {
             CD3DX12_STATIC_SAMPLER_DESC(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR),
@@ -1966,6 +1968,15 @@ private:
             {"NORMAL_MAP", "1"},
             {nullptr, nullptr}
         };
+        
+        const D3D_SHADER_MACRO landDefines[] = {
+            {"NUM_DIR_LIGHTS", "1"},
+            {"NUM_POINT_LIGHTS", "1"},
+            {"NUM_SPOT_LIGHTS", "1"},
+            {"FOG", "1"},
+            {"LAND_TEX", "1"},
+            {nullptr, nullptr}
+        };
 
         const D3D_SHADER_MACRO alphaTestDefines[] = {
             {"NUM_DIR_LIGHTS", "1"},
@@ -1991,7 +2002,7 @@ private:
         };
         // 陆地和水面用另一对着色器：除了变换，直接把顶点色输出
         mColorVSByteCode = CompileShader(L"HLSL\\Color.hlsl", lightDefines, "VS", "vs_6_6");
-        mColorPSByteCode = CompileShader(L"HLSL\\Color.hlsl", lightDefines, "PS", "ps_6_6");
+        mColorPSByteCode = CompileShader(L"HLSL\\Color.hlsl", landDefines, "PS", "ps_6_6");
         // 陆地和水面：位置（12 字节）+ 顶点色（16 字节），和 struct ColorVertex 一致。
         // 输入布局必须和顶点结构体、以及对应的 HLSL VertexIn 三者对齐
         mColorInputLayout = {
@@ -2232,8 +2243,9 @@ private:
 
     // ======================== 成员变量 ========================
 
-    // 太阳光前进的方向：从后上方斜着照下来，抬高约 33°（原来约 8.5°，影子会拖到相机后面）
-    XMFLOAT3 mSunDir = {0.2494f, -0.5486f, -0.7980f};
+    // 太阳光前进的方向：和天空图里画的太阳对上（仰角 18.6°、方位角 -17.4°），夕阳的影子拉得长
+    // 指向太阳 = (cos18.6°·sin(-17.4°), sin18.6°, cos18.6°·cos(-17.4°))，光的方向取反
+    XMFLOAT3 mSunDir = {0.2835f, -0.319f, -0.9045f};
 
     // 资源：纹理、几何体、渲染项
     std::unordered_map<std::string, std::unique_ptr<DX_Utils::Texture>> mTextures;
