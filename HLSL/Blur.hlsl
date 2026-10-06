@@ -43,6 +43,9 @@ void HorzBlurCS(int3 groupThreadID :SV_GroupThreadID, int3 dispatchThreadID :SV_
         BlurSettings.w9,
         BlurSettings.w10,
     };
+    
+    uint texW, texH;
+    gInput.GetDimensions(texW, texH);
 
     // 最左边 R 个线程多搬一个：本组左边界外面的像素，放进 gCache[0 .. R-1]
     if (groupThreadID.x < BlurSettings.gBlurRadius)
@@ -53,11 +56,11 @@ void HorzBlurCS(int3 groupThreadID :SV_GroupThreadID, int3 dispatchThreadID :SV_
     // 最右边 R 个线程多搬一个：本组右边界外面的像素，放进 gCache[N+R .. N+2R-1]
     if (groupThreadID.x >= N - BlurSettings.gBlurRadius)
     {
-        int x = min(dispatchThreadID.x + BlurSettings.gBlurRadius,gInput.Length.x - 1); // 右边越界就夹到最后一列
+        int x = min(dispatchThreadID.x + BlurSettings.gBlurRadius,(int)texW - 1); // 右边越界就夹到最后一列
         gCache[groupThreadID.x + BlurSettings.gBlurRadius*2] = gInput[int2(x, dispatchThreadID.y)]; // 放在 N + R 之后
     }
     // 每个线程搬自己的像素。最右边那个组多出来的线程，下标被夹在图里面
-    gCache[groupThreadID.x + BlurSettings.gBlurRadius] = gInput[min(dispatchThreadID.xy, gInput.Length.xy - 1)];
+    gCache[groupThreadID.x + BlurSettings.gBlurRadius] = gInput[min(dispatchThreadID.xy, int2(texW, texH) - 1)];
     
     GroupMemoryBarrierWithGroupSync();
     
@@ -86,6 +89,9 @@ void VertBlurCS(int3 groupThreadID :SV_GroupThreadID, int3 dispatchThreadID :SV_
         BlurSettings.w9,
         BlurSettings.w10,
     };
+    
+    uint texW, texH;
+    gInput.GetDimensions(texW, texH);
 
     // 最上边 R 个线程多搬一个：本组上边界外面的像素，放进 gCache[0 .. R-1]
     if (groupThreadID.y < BlurSettings.gBlurRadius)
@@ -96,11 +102,11 @@ void VertBlurCS(int3 groupThreadID :SV_GroupThreadID, int3 dispatchThreadID :SV_
     // 最下边 R 个线程多搬一个：本组下边界外面的像素，放进 gCache[N+R .. N+2R-1]
     if (groupThreadID.y >= N - BlurSettings.gBlurRadius)
     {
-        int y = min(dispatchThreadID.y + BlurSettings.gBlurRadius,gInput.Length.y - 1); // 下边越界就夹到最后一行
+        int y = min(dispatchThreadID.y + BlurSettings.gBlurRadius,(int)texH - 1); // 下边越界就夹到最后一行
         gCache[groupThreadID.y + BlurSettings.gBlurRadius*2] = gInput[int2(dispatchThreadID.x, y)]; // 放在 N + R 之后
     }
     // 每个线程搬自己的像素。最下边那个组多出来的线程，下标被夹在图里面
-    gCache[groupThreadID.y + BlurSettings.gBlurRadius] = gInput[min(dispatchThreadID.xy, gInput.Length.xy - 1)];
+    gCache[groupThreadID.y + BlurSettings.gBlurRadius] = gInput[min(dispatchThreadID.xy, int2(texW, texH) - 1)];
     
     GroupMemoryBarrierWithGroupSync();
     

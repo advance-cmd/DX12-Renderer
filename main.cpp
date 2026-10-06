@@ -21,6 +21,7 @@
 #include <DirectXMath.h>
 #include <DirectXColors.h>  // Colors::LightSteelBlue 之类的预定义颜色
 #include <d3dcompiler.h>    // D3DCompileFromFile：运行时编译 HLSL
+#include <filesystem>       // 热重载：查 HLSL 文件的修改时间
 
 // Agility SDK：告诉系统用 exe 旁边 D3D12\ 目录里的新版 D3D12 运行时
 extern "C" {
@@ -64,16 +65,14 @@ struct RenderItem
     UINT StartIndexLocation = 0;
     int BaseVertexLocation = 0;
 
-    // 画这个物体用哪个 PSO。顶点格式和着色器不同，PSO 就不能共用，
-    // 所以画之前要按物体切
-    ComPtr<ID3D12PipelineState> PSO;
+    // 指向 mXxxPSO 里那根裸指针：热重载换的是槽位里的 PSO，渲染项不用改就跟着换
+    ID3D12PipelineState* const* PSO = nullptr;
     // 画阴影图时用的 PSO（只写深度）。空 = 这个物体不投影子
-    ComPtr<ID3D12PipelineState> ShadowPSO;
+    ID3D12PipelineState* const* ShadowPSO = nullptr;
 
     Material* Mat = nullptr;
 };
 
-// 类外面（RenderItem 结构体下面）
 enum class RenderLayer : int
 {
     Opaque = 0,
@@ -110,6 +109,14 @@ public:
     {
         if (!D3DApp::Initialize())
         {
+            return false;
+        }
+        
+        D3D12_FEATURE_DATA_SHADER_MODEL sm = {D3D_SHADER_MODEL_6_6};
+        ThrowIfFailed(mDevice->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)));
+        if (sm.HighestShaderModel < D3D_SHADER_MODEL_6_6)
+        {
+            MessageBox(nullptr, L"显卡不支持 Shader Model 6.6", L"错误", MB_OK);
             return false;
         }
 
@@ -433,10 +440,59 @@ protected:
         if (up != 0.0f) mCamera.Ascend(up * dt);
     }
 
+    // HLSL 目录里所有 .hlsl 中最新的修改时间。查整个目录：改了被 include 的 LightingUtil.hlsl 也要算
+    static std::filesystem::file_time_type NewestShaderTime()
+    {
+        std::filesystem::file_time_type newest{};
+        std::error_code ec; // 用 error_code 版本：文件正被编辑器写入时不抛异常
+        for (const auto& entry : std::filesystem::directory_iterator(L"HLSL", ec))
+        {
+            if (entry.path().extension() == L".hlsl")
+            {
+                newest = (std::max)(newest, entry.last_write_time(ec)); // 加括号：躲开 windows.h 的 max 宏
+            }
+        }
+        return newest;
+    }
+
+    void CheckShaderReload(const GameTimer& gt)
+    {
+        if (gt.TotalTime() - mLastShaderPoll < 0.25f) return; // 每 0.25 秒查一次
+        mLastShaderPoll = gt.TotalTime();
+
+        const auto newest = NewestShaderTime();
+        if (newest == mShaderTime) return; // 没改过
+        // 编辑器保存时可能分几次写完：第一次看到新时间先记下，0.25 秒后还是它，才算写完
+        if (newest != mPendingShaderTime)
+        {
+            mPendingShaderTime = newest;
+            return;
+        }
+        mShaderTime = newest;
+        ReloadShaders();
+    }
+
+    void ReloadShaders()
+    {
+        try
+        {
+            BuildShadersAndInputLayout(); // 有一个编不过就抛异常，后面两步不执行，旧 PSO 照常用
+            FlushCommandQueue(); // CPU 最多领先 3 帧，GPU 可能还在用旧 PSO，等它画完
+            BuildPSO(); // IID_PPV_ARGS(&mXxxPSO) 先放掉旧的，再把新的建在同一个槽里，渲染项自动跟着换
+            OutputDebugStringW(L"[热重载] 成功\n");
+        }
+        catch (DxException& e)
+        {
+            // 弹窗抢走焦点时框架会暂停、停住计时器，关掉后接着跑，时间不会跳
+            MessageBox(mhMainWnd, e.ToString().c_str(), L"着色器热重载失败", MB_OK);
+        }
+    }
+
     void Update(const GameTimer& gt) override
     {
         // 先处理输入、移动摄像机，这一帧的 ViewProj 才是移动后的（放在最后会晚一帧）
         OnKeyboardInput(gt);
+        CheckShaderReload(gt); // HLSL 文件改过就重新编译、重建 PSO
 
         // 轮换到下一份帧资源；GPU 如果还在用它，就先等
         mCurrFrameResourceIndex = (mCurrFrameResourceIndex + 1) % gNumFrameResources;
@@ -831,7 +887,8 @@ private:
         for (auto& ri : items)
         {
             // PSO 是一整包状态，只能整个换。木箱用木箱的，陆地和波浪用另一套；阴影 Pass 用 ShadowPSO
-            ID3D12PipelineState* pso = shadowPass ? ri->ShadowPSO.Get() : ri->PSO.Get();
+            ID3D12PipelineState* const* slot = shadowPass ? ri->ShadowPSO : ri->PSO;
+            ID3D12PipelineState* pso = slot != nullptr ? *slot : nullptr; // 取槽里现在放的那个 PSO
             if (pso == nullptr)
             {
                 continue; // 没挂 ShadowPSO 的物体不投影子，阴影 Pass 里跳过
@@ -1405,8 +1462,8 @@ private:
         // 顶点格式是位置 + 顶点色，所以用 mColorPSO
         auto land = std::make_unique<RenderItem>();
         XMStoreFloat4x4(&land->World, XMMatrixIdentity());
-        land->PSO = mColorPSO;
-        land->ShadowPSO = mShadowLandPSO;
+        land->PSO = mColorPSO.GetAddressOf();
+        land->ShadowPSO = mShadowLandPSO.GetAddressOf();
         land->ObjCBIndex = objCBIndex++;
         land->Geo = mLandGeo.get();
         land->IndexCount = mLandGeo->DrawArgs["grid"].IndexCount;
@@ -1426,8 +1483,8 @@ private:
             for (int j = 0; j < gridCount; j++)
             {
                 auto crate = std::make_unique<RenderItem>();
-                crate->PSO = mCratePSO;
-                crate->ShadowPSO = mShadowCratePSO;
+                crate->PSO = mCratePSO.GetAddressOf();
+                crate->ShadowPSO = mShadowCratePSO.GetAddressOf();
 
                 // 减去 (gridCount - 1) / 2，让整片木箱以原点为中心
                 float x = (i - (gridCount - 1) * 0.5f) * spacing;
@@ -1446,8 +1503,8 @@ private:
         }
 
         auto Lfence1 = std::make_unique<RenderItem>();
-        Lfence1->PSO = mAlphaTestedPSO;
-        Lfence1->ShadowPSO = mShadowCratePSO;
+        Lfence1->PSO = mAlphaTestedPSO.GetAddressOf();
+        Lfence1->ShadowPSO = mShadowCratePSO.GetAddressOf();
         Lfence1->ObjCBIndex = objCBIndex++;
         Lfence1->Geo = mShapeGeo.get();
         Lfence1->IndexCount = box.IndexCount;
@@ -1467,8 +1524,8 @@ private:
         for (const XMMATRIX& world : extraCrateWorlds)
         {
             auto crate = std::make_unique<RenderItem>();
-            crate->PSO = mCratePSO;
-            crate->ShadowPSO = mShadowCratePSO;
+            crate->PSO = mCratePSO.GetAddressOf();
+            crate->ShadowPSO = mShadowCratePSO.GetAddressOf();
             XMStoreFloat4x4(&crate->World, world);
             crate->ObjCBIndex = objCBIndex++;
             crate->Geo = mShapeGeo.get();
@@ -1491,7 +1548,7 @@ private:
         auto mMarkMirror = std::make_unique<RenderItem>();
         XMStoreFloat4x4(&mMarkMirror->World, XMMatrixRotationY(0.9608f) * XMMatrixTranslation(11.0f, 5.0f, -20.0f));
         // 转 55°，面朝相机和铁丝网
-        mMarkMirror->PSO = mMarkMirrorsPSO;
+        mMarkMirror->PSO = mMarkMirrorsPSO.GetAddressOf();
         mMarkMirror->ObjCBIndex = objCBIndex++;
         mMarkMirror->Geo = mShapeGeo.get();
         mMarkMirror->IndexCount = mirrorArgs.IndexCount;
@@ -1503,7 +1560,7 @@ private:
 
         auto mMirrorClear = std::make_unique<RenderItem>();
         XMStoreFloat4x4(&mMirrorClear->World, XMMatrixRotationY(0.9608f) * XMMatrixTranslation(11.0f, 5.0f, -20.0f));
-        mMirrorClear->PSO = mMirrorClearPSO;
+        mMirrorClear->PSO = mMirrorClearPSO.GetAddressOf();
         mMirrorClear->ObjCBIndex = objCBIndex++;
         mMirrorClear->Geo = mShapeGeo.get();
         mMirrorClear->IndexCount = mirrorArgs.IndexCount;
@@ -1515,7 +1572,7 @@ private:
 
         auto mMirror = std::make_unique<RenderItem>();
         XMStoreFloat4x4(&mMirror->World, XMMatrixRotationY(0.9608f) * XMMatrixTranslation(11.0f, 5.0f, -20.0f));
-        mMirror->PSO = mMirrorPSO;
+        mMirror->PSO = mMirrorPSO.GetAddressOf();
         mMirror->ObjCBIndex = objCBIndex++;
         mMirror->Geo = mShapeGeo.get();
         mMirror->IndexCount = mirrorArgs.IndexCount;
@@ -1526,7 +1583,7 @@ private:
         mAllItems.push_back(std::move(mMirror));
 
         auto LRefectFence1 = std::make_unique<RenderItem>();
-        LRefectFence1->PSO = mReflectedFencePSO;
+        LRefectFence1->PSO = mReflectedFencePSO.GetAddressOf();
         LRefectFence1->ObjCBIndex = objCBIndex++;
         LRefectFence1->Geo = mShapeGeo.get();
         LRefectFence1->IndexCount = box.IndexCount;
@@ -1538,7 +1595,7 @@ private:
         mAllItems.push_back(std::move(LRefectFence1));
 
         auto LReflectCrate1 = std::make_unique<RenderItem>();
-        LReflectCrate1->PSO = mReflectedCratePSO;
+        LReflectCrate1->PSO = mReflectedCratePSO.GetAddressOf();
         LReflectCrate1->ObjCBIndex = objCBIndex++;
         LReflectCrate1->Geo = mShapeGeo.get();
         LReflectCrate1->IndexCount = box.IndexCount;
@@ -1550,7 +1607,7 @@ private:
         mAllItems.push_back(std::move(LReflectCrate1));
 
         auto LReflectCrate2 = std::make_unique<RenderItem>();
-        LReflectCrate2->PSO = mReflectedCratePSO;
+        LReflectCrate2->PSO = mReflectedCratePSO.GetAddressOf();
         LReflectCrate2->ObjCBIndex = objCBIndex++;
         LReflectCrate2->Geo = mShapeGeo.get();
         LReflectCrate2->IndexCount = box.IndexCount;
@@ -1564,8 +1621,8 @@ private:
         //水面
         auto water = std::make_unique<RenderItem>();
         XMStoreFloat4x4(&water->World, XMMatrixIdentity());
-        water->PSO = mBlendPSO;
-        water->ShadowPSO = mShadowLandPSO;
+        water->PSO = mBlendPSO.GetAddressOf();
+        water->ShadowPSO = mShadowLandPSO.GetAddressOf();
         water->ObjCBIndex = objCBIndex++;
         water->Geo = mWaterGeo.get();
         water->IndexCount = mWaterGeo->DrawArgs["grid"].IndexCount;
@@ -1580,8 +1637,8 @@ private:
         auto floor = std::make_unique<RenderItem>();
         auto propertyFloor = mShapeGeo->DrawArgs.at("floor");
         XMStoreFloat4x4(&floor->World, XMMatrixTranslation(1.0f, 0.05f, -27.0f));
-        floor->PSO = mFloorPSO;
-        floor->ShadowPSO = mShadowCratePSO;
+        floor->PSO = mFloorPSO.GetAddressOf();
+        floor->ShadowPSO = mShadowCratePSO.GetAddressOf();
         floor->ObjCBIndex = objCBIndex++;
         floor->Geo = mShapeGeo.get();
         floor->IndexCount = propertyFloor.IndexCount;
@@ -1600,7 +1657,7 @@ private:
 
         auto FenceShadow = std::make_unique<RenderItem>();
         XMStoreFloat4x4(&FenceShadow->World, XMMatrixScaling(4, 4, 4) * XMMatrixTranslation(0, 4, -20) * S * lift);
-        FenceShadow->PSO = mFenceShadowPSO.Get();
+        FenceShadow->PSO = mFenceShadowPSO.GetAddressOf();
         FenceShadow->ObjCBIndex = objCBIndex++;
         FenceShadow->Geo = mShapeGeo.get();
         FenceShadow->IndexCount = box.IndexCount;
@@ -1612,7 +1669,7 @@ private:
 
         auto boxShadow1 = std::make_unique<RenderItem>();
         XMStoreFloat4x4(&boxShadow1->World, extraCrateWorlds[0] * S * lift);
-        boxShadow1->PSO = mShadowPSO;
+        boxShadow1->PSO = mShadowPSO.GetAddressOf();
         boxShadow1->ObjCBIndex = objCBIndex++;
         boxShadow1->Geo = mShapeGeo.get();
         boxShadow1->IndexCount = box.IndexCount;
@@ -1624,7 +1681,7 @@ private:
 
         auto boxShadow2 = std::make_unique<RenderItem>();
         XMStoreFloat4x4(&boxShadow2->World, extraCrateWorlds[1] * S * lift);
-        boxShadow2->PSO = mShadowPSO;
+        boxShadow2->PSO = mShadowPSO.GetAddressOf();
         boxShadow2->ObjCBIndex = objCBIndex++;
         boxShadow2->Geo = mShapeGeo.get();
         boxShadow2->IndexCount = box.IndexCount;
@@ -1636,8 +1693,8 @@ private:
 
         auto tree = std::make_unique<RenderItem>();
         auto LGeo = mTreeGeo.get();
-        tree->PSO = mTreePSO;
-        tree->ShadowPSO = mShadowTreePSO;
+        tree->PSO = mTreePSO.GetAddressOf();
+        tree->ShadowPSO = mShadowTreePSO.GetAddressOf();
         tree->ObjCBIndex = objCBIndex++;
         tree->Geo = LGeo;
         tree->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
@@ -1652,7 +1709,7 @@ private:
         // .xyww 以后深度恒为 1，球多大其实无所谓（包住相机就行）；天空图转的 41.4° 在着色器的 SkyDir 里
         XMStoreFloat4x4(&sky->World, XMMatrixScaling(5000.0f, 5000.0f, 5000.0f));
         auto LSkyGeo = mShapeGeo->DrawArgs.at("sphere");
-        sky->PSO = mSkyPSO;
+        sky->PSO = mSkyPSO.GetAddressOf();
         sky->ObjCBIndex = objCBIndex++;
         sky->Geo = mShapeGeo.get();
         sky->IndexCount = LSkyGeo.IndexCount;
@@ -1807,12 +1864,12 @@ private:
             {nullptr, nullptr}
         };
 
-        // 用到了 ConstantBuffer<T>，需要 Shader Model 5.1
-        mCrateVSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "VS", "vs_5_1");
-        mCratePSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "PS", "ps_5_1");
-        mAlphaTestedPSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", alphaTestDefines, "PS", "ps_5_1");
-        mMirrorVSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "VS_MirrorClear", "vs_5_1");
-        mMirrorPSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "PS_MirrorClear", "ps_5_1");
+        // DXC 编译，Shader Model 6.6（Initialize 里检查过显卡支持）
+        mCrateVSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "VS", "vs_6_6");
+        mCratePSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "PS", "ps_6_6");
+        mAlphaTestedPSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", alphaTestDefines, "PS", "ps_6_6");
+        mMirrorVSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "VS_MirrorClear", "vs_6_6");
+        mMirrorPSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "PS_MirrorClear", "ps_6_6");
         // 语义名, 语义索引, 格式, 输入槽, 在顶点里的字节偏移, 按顶点/按实例, 实例步进
         mCrateInputLayout = {
             {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
@@ -1821,8 +1878,8 @@ private:
             {"TANGENT", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         };
         // 陆地和水面用另一对着色器：除了变换，直接把顶点色输出
-        mColorVSByteCode = CompileShader(L"HLSL\\Color.hlsl", lightDefines, "VS", "vs_5_1");
-        mColorPSByteCode = CompileShader(L"HLSL\\Color.hlsl", lightDefines, "PS", "ps_5_1");
+        mColorVSByteCode = CompileShader(L"HLSL\\Color.hlsl", lightDefines, "VS", "vs_6_6");
+        mColorPSByteCode = CompileShader(L"HLSL\\Color.hlsl", lightDefines, "PS", "ps_6_6");
         // 陆地和水面：位置（12 字节）+ 顶点色（16 字节），和 struct ColorVertex 一致。
         // 输入布局必须和顶点结构体、以及对应的 HLSL VertexIn 三者对齐
         mColorInputLayout = {
@@ -1831,26 +1888,26 @@ private:
             {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         };
 
-        mTreeVSByteCode = CompileShader(L"HLSL\\TreeSprite.hlsl", alphaTestDefines, "VS", "vs_5_1");
-        mTreePSByteCode = CompileShader(L"HLSL\\TreeSprite.hlsl", alphaTestDefines, "PS", "ps_5_1");
-        mTreeGSByteCode = CompileShader(L"HLSL\\TreeSprite.hlsl", alphaTestDefines, "GS", "gs_5_1");
+        mTreeVSByteCode = CompileShader(L"HLSL\\TreeSprite.hlsl", alphaTestDefines, "VS", "vs_6_6");
+        mTreePSByteCode = CompileShader(L"HLSL\\TreeSprite.hlsl", alphaTestDefines, "PS", "ps_6_6");
+        mTreeGSByteCode = CompileShader(L"HLSL\\TreeSprite.hlsl", alphaTestDefines, "GS", "gs_6_6");
 
         mTreeInputLayout = {
             {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
             {"SIZE", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         };
-        mHorzBlurCSByteCode = CompileShader(L"HLSL\\Blur.hlsl", nullptr, "HorzBlurCS", "cs_5_1");
-        mVertBlurCSByteCode = CompileShader(L"HLSL\\Blur.hlsl", nullptr, "VertBlurCS", "cs_5_1");
+        mHorzBlurCSByteCode = CompileShader(L"HLSL\\Blur.hlsl", nullptr, "HorzBlurCS", "cs_6_6");
+        mVertBlurCSByteCode = CompileShader(L"HLSL\\Blur.hlsl", nullptr, "VertBlurCS", "cs_6_6");
 
-        mShadowCratePSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", alphaTestDefines, "PS_Shadow", "ps_5_1");
-        mShadowTreePSByteCode = CompileShader(L"HLSL\\TreeSprite.hlsl", alphaTestDefines, "PS_Shadow", "ps_5_1");
+        mShadowCratePSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", alphaTestDefines, "PS_Shadow", "ps_6_6");
+        mShadowTreePSByteCode = CompileShader(L"HLSL\\TreeSprite.hlsl", alphaTestDefines, "PS_Shadow", "ps_6_6");
 
-        mSkyVSByteCode = CompileShader(L"HLSL\\Sky.hlsl", lightDefines, "VS", "vs_5_1");
-        mSkyPSByteCode = CompileShader(L"HLSL\\Sky.hlsl", lightDefines, "PS", "ps_5_1");
+        mSkyVSByteCode = CompileShader(L"HLSL\\Sky.hlsl", lightDefines, "VS", "vs_6_6");
+        mSkyPSByteCode = CompileShader(L"HLSL\\Sky.hlsl", lightDefines, "PS", "ps_6_6");
 
-        mWaterPSByteCode = CompileShader(L"HLSL\\Color.hlsl", waterDefines, "PS", "ps_5_1");
+        mWaterPSByteCode = CompileShader(L"HLSL\\Color.hlsl", waterDefines, "PS", "ps_6_6");
         
-        mFloorPSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", floorDefines, "PS", "ps_5_1");
+        mFloorPSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", floorDefines, "PS", "ps_6_6");
     }
 
     void BuildPSO()
@@ -2097,6 +2154,11 @@ private:
     // 管线：描述符堆、根签名、着色器、输入布局、PSO（两套：木箱一套，陆地/水面共用一套）
     ComPtr<ID3D12DescriptorHeap> mHeap; // 着色器可见的 CBV/SRV/UAV 堆
     ComPtr<ID3D12RootSignature> mRootSignature;
+    // 热重载：当前用的是哪个版本的 HLSL、等待确认的新版本、上次查目录的时间
+    std::filesystem::file_time_type mShaderTime = NewestShaderTime();
+    std::filesystem::file_time_type mPendingShaderTime{};
+    float mLastShaderPoll = 0.0f;
+
     ComPtr<ID3D12PipelineState> mCratePSO;
     ComPtr<ID3D12PipelineState> mAlphaTestedPSO;
 

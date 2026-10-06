@@ -17,6 +17,9 @@
 
 using Microsoft::WRL::ComPtr;
 
+// 宏名、入口名都是 ASCII，逐字节扩成宽字符就行
+inline std::wstring ToWide(const char* s) { return std::wstring(s, s + strlen(s)); }
+
 class DxException
 {
 public:

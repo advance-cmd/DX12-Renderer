@@ -109,12 +109,14 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>d3d12.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d12.lib;dxgi.lib;dxcompiler.lib;d3dcompiler.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
       <Command>if not exist "$(OutDir)D3D12" md "$(OutDir)D3D12"
         copy /Y "D:\DX12\Env\AgilitySDK\1.619.6\build\native\bin\x64\D3D12Core.dll" "$(OutDir)D3D12\"
-        copy /Y "D:\DX12\Env\AgilitySDK\1.619.6\build\native\bin\x64\d3d12SDKLayers.dll" "$(OutDir)D3D12\"</Command>
+        copy /Y "D:\DX12\Env\AgilitySDK\1.619.6\build\native\bin\x64\d3d12SDKLayers.dll" "$(OutDir)D3D12\"
+        copy /Y "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxcompiler.dll" "$(OutDir)"
+        copy /Y "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxil.dll" "$(OutDir)"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -132,12 +134,14 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>d3d12.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d12.lib;dxgi.lib;dxcompiler.lib;d3dcompiler.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
       <Command>if not exist "$(OutDir)D3D12" md "$(OutDir)D3D12"
         copy /Y "D:\DX12\Env\AgilitySDK\1.619.6\build\native\bin\x64\D3D12Core.dll" "$(OutDir)D3D12\"
-        copy /Y "D:\DX12\Env\AgilitySDK\1.619.6\build\native\bin\x64\d3d12SDKLayers.dll" "$(OutDir)D3D12\"</Command>
+        copy /Y "D:\DX12\Env\AgilitySDK\1.619.6\build\native\bin\x64\d3d12SDKLayers.dll" "$(OutDir)D3D12\"
+        copy /Y "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxcompiler.dll" "$(OutDir)"
+        copy /Y "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxil.dll" "$(OutDir)"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
