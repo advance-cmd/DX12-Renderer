@@ -23,6 +23,13 @@
 #include <d3dcompiler.h>    // D3DCompileFromFile：运行时编译 HLSL
 #include <filesystem>       // 热重载：查 HLSL 文件的修改时间
 
+#include "imgui.h"
+#include "imgui_impl_win32.h"
+#include "imgui_impl_dx12.h"
+
+// imgui_impl_win32.h 里故意没声明这个函数（免得把 windows.h 拖进来），要自己声明
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
 // Agility SDK：告诉系统用 exe 旁边 D3D12\ 目录里的新版 D3D12 运行时
 extern "C" {
 __declspec(dllexport) extern const UINT D3D12SDKVersion = 619;
@@ -102,7 +109,58 @@ public:
         if (mCommandQueue != nullptr)
         {
             FlushCommandQueue();
+            if (ImGui::GetCurrentContext() != nullptr)
+            {
+                ImGui_ImplDX12_Shutdown();
+                ImGui_ImplWin32_Shutdown();
+                ImGui::DestroyContext();
+            }
         }
+    }
+
+    void InitImGui()
+    {
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        ImGui::StyleColorsDark();
+        io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", 16.0f);
+        ImGui_ImplWin32_Init(mhMainWnd);
+
+        for (int i = kImGuiFirstSlot + kImGuiSlotCount - 1; i >= kImGuiFirstSlot; i--)
+        {
+            mImGuiFreeSlots.push_back(i);
+        }
+        ImGui_ImplDX12_InitInfo init;
+        init.Device = mDevice.Get();
+        init.CommandQueue = mCommandQueue.Get(); // 上传字体纹理时用
+        init.NumFramesInFlight = gNumFrameResources; // ImGui 自己的顶点/索引缓冲也要轮换几份
+        init.RTVFormat = mBackBufferFormat;
+        init.DSVFormat = DXGI_FORMAT_UNKNOWN; //UI 不用深度
+        init.SrvDescriptorHeap = mHeap.Get();
+        init.UserData = this; // 回调是普通函数指针，拿不到 this，借 UserData 传进去
+        init.SrvDescriptorAllocFn = [](ImGui_ImplDX12_InitInfo* info, D3D12_CPU_DESCRIPTOR_HANDLE* cpu,
+                                       D3D12_GPU_DESCRIPTOR_HANDLE* gpu)
+        {
+            auto* app = static_cast<CrateApp*>(info->UserData);
+            const int slot = app->mImGuiFreeSlots.back();
+            app->mImGuiFreeSlots.pop_back();
+            *cpu = app->HeapCpuHandle(slot);
+            *gpu = app->HeapGpuHandle(slot);
+        };
+        init.SrvDescriptorFreeFn = [](ImGui_ImplDX12_InitInfo* info, D3D12_CPU_DESCRIPTOR_HANDLE cpu,
+                                      D3D12_GPU_DESCRIPTOR_HANDLE)
+        {
+            auto* app = static_cast<CrateApp*>(info->UserData);
+            const int slot = (int)((cpu.ptr - app->mHeap->GetCPUDescriptorHandleForHeapStart().ptr)
+                / app->mCSUDescriptorSize);
+            app->mImGuiFreeSlots.push_back(slot);
+        };
+        ImGui_ImplDX12_Init(&init);
+        
+        // 滑块初值从现在的 mSunDir 反算（指向太阳 = -mSunDir）
+        const XMFLOAT3 toSun = {-mSunDir.x, -mSunDir.y, -mSunDir.z};
+        mSunElevation = XMConvertToDegrees(asinf(toSun.y));          // 仰角：y = sin(仰角)
+        mSunAzimuth = XMConvertToDegrees(atan2f(toSun.x, toSun.z));  // 方位：从 +z 往 +x 转
     }
 
     bool Initialize() override
@@ -111,7 +169,7 @@ public:
         {
             return false;
         }
-        
+
         D3D12_FEATURE_DATA_SHADER_MODEL sm = {D3D_SHADER_MODEL_6_6};
         ThrowIfFailed(mDevice->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)));
         if (sm.HighestShaderModel < D3D_SHADER_MODEL_6_6)
@@ -158,12 +216,25 @@ public:
         {
             tex->UploadHeap.Reset();
         }
+
+        InitImGui();
+
         return true;
     }
 
 protected:
     // ======================== D3DApp 的虚函数 ========================
 
+    // 消息先给 ImGui：鼠标在 UI 上、或者正在往输入框里打字时，ImGui 要先拿到这条消息
+    LRESULT MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) override
+    {
+        if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+        {
+            return true;
+        }
+        return D3DApp::MsgProc(hWnd, msg, wParam, lParam); // 剩下的照旧交给框架：缩放、暂停、鼠标转视角……
+    }
+    
     void OnResize() override
     {
         D3DApp::OnResize(); // 先让基类重建交换链缓冲、RTV、深度缓冲、视口
@@ -396,15 +467,22 @@ protected:
         mCommandList->ResourceBarrier(3, b5);
     }
 
-    // 堆里第 slot 格的 GPU 句柄（SetComputeRootDescriptorTable 要用）
+    // 堆里第 slot 格的 GPU 句柄
     CD3DX12_GPU_DESCRIPTOR_HANDLE HeapGpuHandle(int slot) const
     {
         return CD3DX12_GPU_DESCRIPTOR_HANDLE(mHeap->GetGPUDescriptorHandleForHeapStart(), slot, mCSUDescriptorSize);
     }
 
+    // 堆里第 slot 格的 CPU 句柄
+    CD3DX12_CPU_DESCRIPTOR_HANDLE HeapCpuHandle(int slot) const
+    {
+        return CD3DX12_CPU_DESCRIPTOR_HANDLE(mHeap->GetCPUDescriptorHandleForHeapStart(), slot, mCSUDescriptorSize);
+    }
+
     // WASD 前后左右，Q 下降、E 上升（沿世界 y 轴，和朝向无关）
     void OnKeyboardInput(const GameTimer& gt)
     {
+        if (ImGui::GetIO().WantCaptureKeyboard) return;
         auto down = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
 
         // B 键开关后期模糊。按住不放时 GetAsyncKeyState 每帧都返回"按下"，
@@ -488,11 +566,34 @@ protected:
         }
     }
 
+    void BuildImGui()
+    {
+        ImGui_ImplDX12_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+
+        ImGui::SetNextWindowSize(ImVec2(320.0f, 0.0f), ImGuiCond_FirstUseEver); // 不设的话窗口太窄，标签被截断
+        ImGui::Begin("调试");
+        ImGui::Text("帧率 %.0f", ImGui::GetIO().Framerate);
+        ImGui::Checkbox("后期模糊", &mBlurEnabled);
+        bool sunChanged = ImGui::SliderFloat("太阳方位角", &mSunAzimuth, -180.0f, 180.0f, "%.1f°");
+        sunChanged |= ImGui::SliderFloat("太阳仰角", &mSunElevation, 5.0f, 85.0f, "%.1f°");
+        if (sunChanged)
+        {
+            const float az = XMConvertToRadians(mSunAzimuth), el = XMConvertToRadians(mSunElevation);
+            mSunDir = XMFLOAT3(-cosf(el) * sinf(az), -sinf(el), -cosf(el) * cosf(az));
+        }
+        ImGui::End();
+
+        ImGui::Render();
+    }
+
     void Update(const GameTimer& gt) override
     {
         // 先处理输入、移动摄像机，这一帧的 ViewProj 才是移动后的（放在最后会晚一帧）
         OnKeyboardInput(gt);
         CheckShaderReload(gt); // HLSL 文件改过就重新编译、重建 PSO
+        BuildImGui();
 
         // 轮换到下一份帧资源；GPU 如果还在用它，就先等
         mCurrFrameResourceIndex = (mCurrFrameResourceIndex + 1) % gNumFrameResources;
@@ -604,6 +705,13 @@ protected:
             DoBlur();
         }
         mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 5); // T5
+
+        // UI 最后画：盖在最上面，不被模糊，也不做深度测试。放在 T5 后面，不算进"模糊"的耗时
+        mCommandList->OMSetRenderTargets(1, &rtv, true, nullptr);
+        ID3D12DescriptorHeap* uiHeaps[] = {mHeap.Get()}; // 字体图集的 SRV 在 mHeap 第 12～15 格；显式再绑一次，不依赖前面绑过什么
+        mCommandList->SetDescriptorHeaps(_countof(uiHeaps), uiHeaps);
+        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), mCommandList.Get());
+
         mCommandList->ResolveQueryData(
             mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
             tsBase, kTimestampCount, // 从查询堆第 tsBase 格开始，复制这一帧的 6 格
@@ -631,6 +739,7 @@ protected:
     // 正负号故意和书上相反："抓着物体转"——物体跟着鼠标走，往上/往右拖是拉近
     void OnMouseDown(WPARAM btnState, int x, int y) override
     {
+        if (ImGui::GetIO().WantCaptureMouse) return;
         mLastMousePos.x = x;
         mLastMousePos.y = y;
         SetCapture(mhMainWnd); // 按着键拖出窗口以后，鼠标消息仍然发给这个窗口
@@ -638,11 +747,13 @@ protected:
 
     void OnMouseUp(WPARAM btnState, int x, int y) override
     {
+        if (ImGui::GetIO().WantCaptureMouse) return;
         ReleaseCapture();
     }
 
     void OnMouseMove(WPARAM btnState, int x, int y) override
     {
+        if (ImGui::GetIO().WantCaptureMouse) return;
         if ((btnState & MK_LBUTTON) != 0) // 左键：旋转，每像素 0.25°
         {
             float dx = XMConvertToRadians(0.25f * static_cast<float>(x - mLastMousePos.x));
@@ -659,6 +770,7 @@ protected:
     // 按倍数而不是按加减调：慢的时候每格变化小、调得细，快的时候每格变化大、调得快
     void OnMouseWheel(int delta) override
     {
+        if (ImGui::GetIO().WantCaptureMouse) return;
         float speed = mCamera.GetMoveSpeed() * powf(1.25f, delta / static_cast<float>(WHEEL_DELTA));
         speed = std::clamp(speed, 0.5f, 200.0f);
         mCamera.SetMoveSpeed(speed);
@@ -955,7 +1067,7 @@ private:
     {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {
             .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            .NumDescriptors = 12, // 0～4 纹理，5～8 模糊用的两张纹理（各一个 SRV、一个 UAV），9 阴影图的 SRV，10天空图   11是地板法线贴图
+            .NumDescriptors = 16, // 0～4 纹理，5～8 模糊用的两张纹理（各一个 SRV、一个 UAV），9 阴影图的 SRV，10天空图   11是地板法线贴图 12~15 ImGui
             .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, // 着色器要从这个堆里读（RTV/DSV 堆不用，所以是 NONE）
             .NodeMask = 0,
         };
@@ -1906,7 +2018,7 @@ private:
         mSkyPSByteCode = CompileShader(L"HLSL\\Sky.hlsl", lightDefines, "PS", "ps_6_6");
 
         mWaterPSByteCode = CompileShader(L"HLSL\\Color.hlsl", waterDefines, "PS", "ps_6_6");
-        
+
         mFloorPSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", floorDefines, "PS", "ps_6_6");
     }
 
@@ -1932,7 +2044,7 @@ private:
         psoDesc.VS = {mCrateVSByteCode->GetBufferPointer(), mCrateVSByteCode->GetBufferSize()};
         psoDesc.PS = {mCratePSByteCode->GetBufferPointer(), mCratePSByteCode->GetBufferSize()};
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&psoDesc,IID_PPV_ARGS(&mCratePSO)));
-        
+
         auto floorDesc = psoDesc;
         floorDesc.PS = {mFloorPSByteCode->GetBufferPointer(), mFloorPSByteCode->GetBufferSize()};
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&floorDesc,IID_PPV_ARGS(&mFloorPSO)));
@@ -2224,10 +2336,15 @@ private:
     ComPtr<ID3D12PipelineState> mSkyPSO;
     ComPtr<ID3DBlob> mSkyVSByteCode;
     ComPtr<ID3DBlob> mSkyPSByteCode;
-    
+
     //floor
     ComPtr<ID3DBlob> mFloorPSByteCode;
     ComPtr<ID3D12PipelineState> mFloorPSO;
+
+    //ImGui
+    static constexpr int kImGuiFirstSlot = 12, kImGuiSlotCount = 4;
+    std::vector<int> mImGuiFreeSlots;
+    float mSunAzimuth = 0.0f, mSunElevation = 0.0f; // 单位：度
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, int nShowCmd)

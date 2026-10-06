@@ -104,7 +104,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalIncludeDirectories>D:\DX12\Env\AgilitySDK\1.619.6\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)ThirdParty\imgui;$(ProjectDir)ThirdParty\imgui\backends;D:\DX12\Env\AgilitySDK\1.619.6\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -129,7 +129,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalIncludeDirectories>D:\DX12\Env\AgilitySDK\1.619.6\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)ThirdParty\imgui;$(ProjectDir)ThirdParty\imgui\backends;D:\DX12\Env\AgilitySDK\1.619.6\build\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -160,6 +160,13 @@
     <None Include="HLSL\Sky.hlsl" />
     <ClCompile Include="Waves.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="ThirdParty\imgui\imgui.cpp" />
+    <ClCompile Include="ThirdParty\imgui\imgui_draw.cpp" />
+    <ClCompile Include="ThirdParty\imgui\imgui_tables.cpp" />
+    <ClCompile Include="ThirdParty\imgui\imgui_widgets.cpp" />
+    <ClCompile Include="ThirdParty\imgui\imgui_demo.cpp" />
+    <ClCompile Include="ThirdParty\imgui\backends\imgui_impl_win32.cpp" />
+    <ClCompile Include="ThirdParty\imgui\backends\imgui_impl_dx12.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Common\D3DApp.h" />
@@ -171,6 +178,14 @@
     <ClInclude Include="Common\UploadBuffer.h" />
     <ClInclude Include="FrameResource.h" />
     <ClInclude Include="Waves.h" />
+    <ClInclude Include="ThirdParty\imgui\imgui.h" />
+    <ClInclude Include="ThirdParty\imgui\imgui_internal.h" />
+    <ClInclude Include="ThirdParty\imgui\imconfig.h" />
+    <ClInclude Include="ThirdParty\imgui\imstb_rectpack.h" />
+    <ClInclude Include="ThirdParty\imgui\imstb_textedit.h" />
+    <ClInclude Include="ThirdParty\imgui\imstb_truetype.h" />
+    <ClInclude Include="ThirdParty\imgui\backends\imgui_impl_win32.h" />
+    <ClInclude Include="ThirdParty\imgui\backends\imgui_impl_dx12.h" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="Textures\WoodCrate01.dds" />

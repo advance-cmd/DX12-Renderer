@@ -19,3 +19,6 @@ Release/
 *.vcxproj.user
 *.suo
 *.user
+
+# ImGui 运行时记录面板位置、大小
+imgui.ini
