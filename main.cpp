@@ -891,7 +891,9 @@ private:
         };*/
         pc.Lights[0].Strength = {1.35f, 1.12f, 0.85f}; // 夕阳：红多蓝少，偏暖，稍亮一点
         pc.Lights[0].FalloffStart = 5;
-        pc.Lights[0].Direction = mSunDir; // 太阳在场景后方、压得很低，朝镜头斜着照过来，水面的镜面反射点才会进入画面
+        // 太阳在场景后方、压得很低，朝镜头斜着照过来，水面的镜面反射点才会进入画面。
+        // 归一化再传：手写的 mSunDir 四舍五入后长度是 1.000127，BlinnPhong 里点积会超过 1 → pow(负数) = NaN → 背对太阳看时屏幕上一个黑圆
+        XMStoreFloat3(&pc.Lights[0].Direction, XMVector3Normalize(XMLoadFloat3(&mSunDir)));
         pc.Lights[0].FalloffEnd = 100;
         pc.Lights[0].Position = {0, 50, 0};
         pc.Lights[0].SpotPower = 0.2f;

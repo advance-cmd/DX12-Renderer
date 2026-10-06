@@ -55,7 +55,8 @@ float3 BlinnPhong(float3 lightStrength, float3 lightVec, float3 normal, float3 t
     float3 h = normalize(toEye + lightVec); // 半角向量
     float roughnessFactor = (m + 8) / 8 * pow(max(dot(h, normal), 0), m);
     // Schlick 近似的 Fresnel：夹角用 h 和 lightVec（Blinn-Phong 里微表面的法线就是 h）
-    float3 fresnel = mat.FresnelR0 + (1 - mat.FresnelR0) * pow(1 - max(dot(h, lightVec), 0), 5);
+    // 用 saturate 不用 max(…, 0)：浮点误差会让点积略大于 1，1 - 点积 成了负数，pow(负数) 是 NaN
+    float3 fresnel = mat.FresnelR0 + (1 - mat.FresnelR0) * pow(1 - saturate(dot(h, lightVec)), 5);
     float3 specAlbedo = fresnel * roughnessFactor;
     specAlbedo = specAlbedo / (specAlbedo + 1); // LDR：把可能超过 1 的高光压回 [0, 1)
     return (mat.DiffuseAlbedo.rgb + specAlbedo) * lightStrength * ndotl;
