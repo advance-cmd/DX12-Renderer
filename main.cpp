@@ -615,6 +615,10 @@ protected:
         ImGui::Begin("调试", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
         ImGui::Text("帧率 %.0f", ImGui::GetIO().Framerate);
         ImGui::Checkbox("后期模糊", &mBlurEnabled);
+        ImGui::SliderFloat("曝光", &mExposureEV, -4.0f, 4.0f, "%+.1f EV");
+        const char* curves[] = {"截断", "Reinhard", "ACES", "AgX"};
+        ImGui::Combo("色调曲线", &mToneCurve, curves, IM_ARRAYSIZE(curves));
+        ImGui::SliderFloat("太阳强度", &mSunIntensity, 0.5f, 4.0f, "×%.2f");
         bool sunChanged = ImGui::SliderFloat("太阳方位角", &mSunAzimuth, -180.0f, 180.0f, "%.1f°");
         sunChanged |= ImGui::SliderFloat("太阳仰角", &mSunElevation, 5.0f, 85.0f, "%.1f°");
         if (sunChanged)
@@ -768,6 +772,9 @@ protected:
         mCommandList->OMSetRenderTargets(1, &backRtv, true, nullptr);
         mCommandList->SetGraphicsRootSignature(mTonemapRootSignature.Get());
         mCommandList->SetGraphicsRootDescriptorTable(0, HeapGpuHandle(18)); // 堆第 18 格：HDR 纹理的 SRV
+        // 根参数 1：两个 32 位根常量（b0），和 Tonemap.hlsl 的 TonemapSettings 一一对应。EV 每 +1 亮一倍，所以是 2^EV
+        struct { float Exposure; UINT Curve; } tonemap = {exp2f(mExposureEV), (UINT)mToneCurve};
+        mCommandList->SetGraphicsRoot32BitConstants(1, 2, &tonemap, 0);
         mCommandList->SetPipelineState(mTonemapPSO.Get());
         mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         mCommandList->DrawInstanced(3, 1, 0, 0); // 3 个顶点 = 一个盖住全屏的大三角形，位置在 VS 里按 SV_VertexID 算
@@ -962,7 +969,8 @@ private:
         XMFLOAT3 Position;
         float SpotPower;
         };*/
-        pc.Lights[0].Strength = {1.935f, 1.283f, 0.700f}; // 夕阳：红多蓝少，偏暖，稍亮一点（原 1.35, 1.12, 0.85）
+        // 夕阳：红多蓝少，偏暖（线性值，原 1.35, 1.12, 0.85）；再乘面板上的"太阳强度"
+        pc.Lights[0].Strength = {1.935f * mSunIntensity, 1.283f * mSunIntensity, 0.700f * mSunIntensity};
         pc.Lights[0].FalloffStart = 5;
         // 太阳在场景后方、压得很低，朝镜头斜着照过来，水面的镜面反射点才会进入画面。
         // 归一化再传：手写的 mSunDir 四舍五入后长度是 1.000127，BlinnPhong 里点积会超过 1 → pow(负数) = NaN → 背对太阳看时屏幕上一个黑圆
@@ -2397,8 +2405,9 @@ private:
     {
         CD3DX12_DESCRIPTOR_RANGE hdrRange;
         hdrRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
-        CD3DX12_ROOT_PARAMETER param[1];
+        CD3DX12_ROOT_PARAMETER param[2];
         param[0].InitAsDescriptorTable(1, &hdrRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        param[1].InitAsConstants(2, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL);   //Exposure  Curve
         CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(_countof(param), param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
 
         ComPtr<ID3DBlob> serialized;
@@ -2534,6 +2543,9 @@ private:
     std::vector<int> mImGuiFreeSlots;
     float mSunAzimuth = 0.0f, mSunElevation = 0.0f; // 单位：度
     int mCameraPreset = -1; // 当前在第几个预设机位，-1 = 自由视角
+    float mExposureEV = 1.0f;     // 曝光，单位 EV：+1 = 亮一倍
+    int mToneCurve = 2;           // 0 截断 / 1 Reinhard / 2 ACES / 3 AgX
+    float mSunIntensity = 1.0f;   // 太阳强度倍数
 
     // HDR 成员：HDR 场景纹理 + 它的 RTV 小堆，色调映射的根签名、着色器、PSO
     ComPtr<ID3D12Resource> mHdrMap;
