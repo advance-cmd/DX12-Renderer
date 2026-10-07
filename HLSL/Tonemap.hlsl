@@ -1,11 +1,14 @@
 // 色调映射：HDR 场景纹理 × 曝光 → 色调曲线压到 [0, 1] → sRGB 编码 → 后台缓冲
 Texture2D<float4> gHdrMap : register(t0);
+Texture2D<float4> gBloomMap : register(t1);  // Bloom 的 mip 0（半分辨率），和 t0 挨着放在堆第 19 格
+SamplerState gLinearClamp : register(s0);    // 根签名里的静态采样器：双线性 + 夹边
 
-// 根常量（C++ 里 SetGraphicsRoot32BitConstants 写进来的两个 32 位数）
+// 根常量（C++ 里 SetGraphicsRoot32BitConstants 写进来的三个 32 位数，顺序要和 C++ 的 struct 一样）
 struct TonemapSettings
 {
-    float Exposure; // 2^EV
-    uint Curve;     // 0 截断 / 1 Reinhard / 2 ACES / 3 AgX
+    float Exposure;       // 2^EV
+    uint Curve;           // 0 截断 / 1 Reinhard / 2 ACES / 3 AgX
+    float BloomIntensity; // Bloom 加回去的比例；Bloom 关掉时 C++ 传 0
 };
 ConstantBuffer<TonemapSettings> gTonemap : register(b0);
 
@@ -53,6 +56,7 @@ float3 AgX(float3 c)
 struct VertexOut
 {
     float4 PosH : SV_Position;
+    float2 UV : TEXCOORD; // 0～1 的纹理坐标：Bloom 是半分辨率，不能像 HDR 那样按像素坐标 Load，要按 UV 采样
 };
 
 // 不用顶点缓冲：DrawInstanced(3) 时 id = 0、1、2
@@ -61,6 +65,7 @@ VertexOut VS(uint id : SV_VertexID)
     float2 uv = float2((id << 1) & 2, id & 2); // id 0、1、2 → uv (0,0)、(2,0)、(0,2)
     VertexOut vout;
     vout.PosH = float4(uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
+    vout.UV = uv;
     return vout;
 }
 
@@ -73,7 +78,9 @@ float3 LinearToSRGB(float3 c)
 float4 PS(VertexOut pin) : SV_Target
 {
     // 曝光乘在曲线之前：先决定场景里多亮算"中间调"，再由曲线把亮部平滑地压下去
-    float3 hdr = gHdrMap.Load(int3(pin.PosH.xy, 0)).rgb * gTonemap.Exposure;
+    float3 hdr = gHdrMap.Load(int3(pin.PosH.xy, 0)).rgb;
+    hdr += gBloomMap.SampleLevel(gLinearClamp,pin.UV,0).rgb * gTonemap.BloomIntensity;
+    hdr *= gTonemap.Exposure;
     float3 ldr;
     if (gTonemap.Curve == 1)      ldr = Reinhard(hdr);
     else if (gTonemap.Curve == 2) ldr = ACESFitted(hdr);

@@ -159,6 +159,7 @@
     <None Include="HLSL\Blur.hlsl" />
     <None Include="HLSL\Sky.hlsl" />
     <None Include="HLSL\Tonemap.hlsl" />
+    <None Include="HLSL\Bloom.hlsl" />
     <ClCompile Include="Waves.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="ThirdParty\imgui\imgui.cpp" />

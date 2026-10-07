@@ -92,7 +92,7 @@ enum class RenderLayer : int
     Count
 };
 
-static constexpr UINT kTimestampCount = 7;
+static constexpr UINT kTimestampCount = 8;
 static constexpr UINT kShadowMapSize = 4096;
 
 //场景先画进这张 HDR 纹理，每个通道 16 位浮点，亮度可以超过 1，最后再压到后台缓冲
@@ -222,6 +222,7 @@ public:
         BuildDescriptorHeaps();
         BuildBlurResources(); // 模糊用的两张纹理和它们的 4 个描述符（要用到堆）
         BuildHdrResources();
+        BuildBloomResources();
         BuildTimestampQueries(); //Pass时间记录
         BuildShadowMap(); //构建阴影贴图资源和View
         BuildShapeGeometry(); // 录制复制命令（木箱）
@@ -232,6 +233,7 @@ public:
         BuildRootSignature(); // PSO 要用根签名
         BuildBlurRootSignature(); //模糊专用的根签名
         BuildTonemapRootSignature();
+        BuildBloomRootSignature();
         BuildShadersAndInputLayout(); // PSO 要用着色器和输入布局
         BuildPSO(); // 上面两样都有了才能建 PSO；渲染项要记住用哪个 PSO，所以再排在它前面
         BuildMaterials(); //FrameResources要用到这个
@@ -285,6 +287,7 @@ protected:
         {
             BuildBlurResources();
             BuildHdrResources();
+            BuildBloomResources();
         }
     }
 
@@ -619,6 +622,9 @@ protected:
         const char* curves[] = {"截断", "Reinhard", "ACES", "AgX"};
         ImGui::Combo("色调曲线", &mToneCurve, curves, IM_ARRAYSIZE(curves));
         ImGui::SliderFloat("太阳强度", &mSunIntensity, 0.5f, 4.0f, "×%.2f");
+        ImGui::Checkbox("Bloom", &mBloomEnabled);
+        ImGui::SliderFloat("Bloom 强度", &mBloomIntensity, 0.0f, 0.5f, "%.3f");
+        ImGui::SliderFloat("Bloom 阈值", &mBloomThreshold, 0.0f, 4.0f, "%.2f");
         bool sunChanged = ImGui::SliderFloat("太阳方位角", &mSunAzimuth, -180.0f, 180.0f, "%.1f°");
         sunChanged |= ImGui::SliderFloat("太阳仰角", &mSunElevation, 5.0f, 85.0f, "%.1f°");
         if (sunChanged)
@@ -687,8 +693,8 @@ protected:
                 mPassSamples = 0;
                 // 基类每秒刷新一次标题（CalculateFrameStats），会把这段文字带上
                 mMainWndCaption = std::format(
-                    L"LearnDX12    移速 {:.1f}    GPU：阴影图 {:.3f} | 不透明 {:.3f} | 镜子 {:.3f} | 透明 {:.3f} | 色调映射 {:.3f} | 模糊 {:.3f} ms",
-                    mCamera.GetMoveSpeed(), avg[0], avg[1], avg[2], avg[3], avg[4], avg[5]);
+                    L"LearnDX12    移速 {:.1f}    GPU：阴影图 {:.3f} | 不透明 {:.3f} | 镜子 {:.3f} | 透明 {:.3f} | Bloom {:.3f} | 色调映射 {:.3f} | 模糊 {:.3f} ms",
+                    mCamera.GetMoveSpeed(), avg[0], avg[1], avg[2], avg[3], avg[4], avg[5], avg[6]);
             }
         }
 
@@ -764,27 +770,41 @@ protected:
         // 平面阴影（第 11 章的 Shadow 层）已经被阴影贴图取代，不再画；再画会和阴影贴图的影子叠成双重影子
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Transparent]);
         mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 4); // T4
+        
         // 色调映射：HDR 纹理 → 后台缓冲。HDR 纹理先从"被写"转成"被读"，帧末就停在这个状态（约定）
         auto hdrToSrv = CD3DX12_RESOURCE_BARRIER::Transition(
             mHdrMap.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         mCommandList->ResourceBarrier(1, &hdrToSrv);
+        if (mBloomEnabled)
+        {
+            DoBloom();
+        }
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 5); // T5
+        //Bloom Pass 把视口改成了Bloom图的大小，这里换回屏幕的
+        mCommandList->RSSetViewports(1, &mScreenViewport);
+        mCommandList->RSSetScissorRects(1, &mScissorRect);
         D3D12_CPU_DESCRIPTOR_HANDLE backRtv = CurrentBackBufferView();
         mCommandList->OMSetRenderTargets(1, &backRtv, true, nullptr);
         mCommandList->SetGraphicsRootSignature(mTonemapRootSignature.Get());
         mCommandList->SetGraphicsRootDescriptorTable(0, HeapGpuHandle(18)); // 堆第 18 格：HDR 纹理的 SRV
         // 根参数 1：两个 32 位根常量（b0），和 Tonemap.hlsl 的 TonemapSettings 一一对应。EV 每 +1 亮一倍，所以是 2^EV
-        struct { float Exposure; UINT Curve; } tonemap = {exp2f(mExposureEV), (UINT)mToneCurve};
-        mCommandList->SetGraphicsRoot32BitConstants(1, 2, &tonemap, 0);
+        struct
+        {
+            float Exposure;
+            UINT Curve;
+            float BloomIntensity;
+        } tonemap = {exp2f(mExposureEV), (UINT)mToneCurve,mBloomEnabled ? mBloomIntensity : 0.0f};
+        mCommandList->SetGraphicsRoot32BitConstants(1, 3, &tonemap, 0);
         mCommandList->SetPipelineState(mTonemapPSO.Get());
         mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         mCommandList->DrawInstanced(3, 1, 0, 0); // 3 个顶点 = 一个盖住全屏的大三角形，位置在 VS 里按 SV_VertexID 算
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 5); // T5
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 6); // T6
         if (mBlurEnabled)
         {
             DoBlur();
         }
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 6); // T6
-        // UI 最后画：盖在最上面，不被模糊，也不做深度测试。放在 T6 后面，不算进"模糊"的耗时
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 7); // T7
+        // UI 最后画：盖在最上面，不被模糊，也不做深度测试。放在 T7 后面，不算进"模糊"的耗时
         // 画在后台缓冲上：rtv 现在是 HDR 纹理，画进去就不会再上屏了
         mCommandList->OMSetRenderTargets(1, &backRtv, true, nullptr);
         ID3D12DescriptorHeap* uiHeaps[] = {mHeap.Get()}; // 字体图集的 SRV 在 mHeap 第 12～15 格；显式再绑一次，不依赖前面绑过什么
@@ -1127,7 +1147,7 @@ private:
 
     // ======================== 初始化（按 Initialize 里的调用顺序） ========================
 
-    void LoadTextureHelper(std::string Name, std::wstring FileName,bool sRGB = true)
+    void LoadTextureHelper(std::string Name, std::wstring FileName, bool sRGB = true)
     {
         auto Tex = std::make_unique<DX_Utils::Texture>();
         Tex->Name = Name;
@@ -1147,7 +1167,7 @@ private:
         LoadTextureHelper("treeArrayTex", L"Textures\\treeArray2.dds");
         //书上的 DDS 加载函数认得纹理数组，建出来的资源 DepthOrArraySize 会是 3。
         LoadTextureHelper("skyCubeTex", L"Textures\\grasscube1024.dds");
-        LoadTextureHelper("tileNormalTex", L"Textures\\tile_nmap.dds",false);
+        LoadTextureHelper("tileNormalTex", L"Textures\\tile_nmap.dds", false);
         LoadTextureHelper("grassTex", L"Textures\\grass.dds");
         LoadTextureHelper("stoneTex", L"Textures\\stone.dds");
     }
@@ -1157,8 +1177,16 @@ private:
     {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {
             .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            .NumDescriptors = 19,
-            // 0～4 纹理，5～8 模糊用的两张纹理（各一个 SRV、一个 UAV），9 阴影图的 SRV，10天空图   11是地板法线贴图 12~15 ImGui 16 ~ 17 grass stone   18 HDR场景纹理
+            .NumDescriptors = 25,
+            /* 0～4 纹理，
+             * 5～8 模糊用的两张纹理（各一个 SRV、一个 UAV），
+             * 9 阴影图的 SRV，10天空图   
+             * 11是地板法线贴图 
+             * 12~15 ImGui 
+             * 16 ~ 17 grass stone   
+             * 18 HDR场景纹理
+             * 19～24 是 Bloom 的 6 个 SRV
+             */
             .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, // 着色器要从这个堆里读（RTV/DSV 堆不用，所以是 NONE）
             .NodeMask = 0,
         };
@@ -2121,6 +2149,11 @@ private:
 
         mTonemapVSByteCode = CompileShader(L"HLSL\\Tonemap.hlsl", nullptr, "VS", "vs_6_6");
         mTonemapPSByteCode = CompileShader(L"HLSL\\Tonemap.hlsl", nullptr, "PS", "ps_6_6");
+
+        mBloomVSByteCode = CompileShader(L"HLSL\\Bloom.hlsl", nullptr, "VS", "vs_6_6");
+        mBloomPrefilterPSByteCode = CompileShader(L"HLSL\\Bloom.hlsl", nullptr, "PS_Prefilter", "ps_6_6");
+        mBloomDownPSByteCode = CompileShader(L"HLSL\\Bloom.hlsl", nullptr, "PS_Downsample", "ps_6_6");
+        mBloomUpPSByteCode = CompileShader(L"HLSL\\Bloom.hlsl", nullptr, "PS_Upsample", "ps_6_6");
     }
 
     void BuildPSO()
@@ -2327,6 +2360,29 @@ private:
         tonemapDesc.DSVFormat = DXGI_FORMAT_UNKNOWN; // 不绑深度缓冲
         tonemapDesc.SampleDesc.Count = 1;
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&tonemapDesc, IID_PPV_ARGS(&mTonemapPSO)));
+
+        // Bloom 三个 PSO：和色调映射一样是全屏三角形，换根签名、着色器、输出格式；放大那个开加法混合
+        auto bloomDesc = tonemapDesc;
+        bloomDesc.pRootSignature = mBloomRootSignature.Get();
+        bloomDesc.VS = {mBloomVSByteCode->GetBufferPointer(), mBloomVSByteCode->GetBufferSize()};
+        bloomDesc.RTVFormats[0] = kBloomFormat; // 空7
+        bloomDesc.PS = {mBloomPrefilterPSByteCode->GetBufferPointer(), mBloomPrefilterPSByteCode->GetBufferSize()};
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&bloomDesc, IID_PPV_ARGS(&mBloomPrefilterPSO)));
+        bloomDesc.PS = {mBloomDownPSByteCode->GetBufferPointer(), mBloomDownPSByteCode->GetBufferSize()};
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&bloomDesc, IID_PPV_ARGS(&mBloomDownPSO)));
+        bloomDesc.PS = {mBloomUpPSByteCode->GetBufferPointer(), mBloomUpPSByteCode->GetBufferSize()};
+        D3D12_RENDER_TARGET_BLEND_DESC add = {};
+        add.BlendEnable = TRUE;
+        add.SrcBlend = D3D12_BLEND_ONE; // 空8：结果 = 新算出来的 × ? + 原来的 × ?
+        add.DestBlend = D3D12_BLEND_ONE;
+        add.BlendOp = D3D12_BLEND_OP_ADD;
+        add.SrcBlendAlpha = D3D12_BLEND_ONE;
+        add.DestBlendAlpha = D3D12_BLEND_ZERO;
+        add.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        add.LogicOp = D3D12_LOGIC_OP_NOOP;
+        add.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        bloomDesc.BlendState.RenderTarget[0] = add;
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&bloomDesc, IID_PPV_ARGS(&mBloomUpPSO)));
     }
 
     // 高斯权重：G(x) = exp(-x² / 2σ²)，x 从 -半径 到 +半径，最后除以总和，让它们加起来等于 1。
@@ -2404,11 +2460,14 @@ private:
     void BuildTonemapRootSignature()
     {
         CD3DX12_DESCRIPTOR_RANGE hdrRange;
-        hdrRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+        hdrRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0);
         CD3DX12_ROOT_PARAMETER param[2];
         param[0].InitAsDescriptorTable(1, &hdrRange, D3D12_SHADER_VISIBILITY_PIXEL);
-        param[1].InitAsConstants(2, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL);   //Exposure  Curve
-        CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(_countof(param), param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        param[1].InitAsConstants(3, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL); // Exposure  Curve  BloomIntensity
+        // 读 Bloom 的 mip 0 要双线性放大到全屏，和 Bloom 根签名用同一种采样器（s0）
+        CD3DX12_STATIC_SAMPLER_DESC linearClamp(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                                                D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+        CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(_countof(param), param, 1, &linearClamp, D3D12_ROOT_SIGNATURE_FLAG_NONE);
 
         ComPtr<ID3DBlob> serialized;
         ComPtr<ID3DBlob> error;
@@ -2424,6 +2483,156 @@ private:
             serialized->GetBufferPointer(),
             serialized->GetBufferSize(),
             IID_PPV_ARGS(&mTonemapRootSignature)));
+    }
+
+    //Bloom
+    // Bloom 纹理：半分辨率、kBloomMips 级 mip。每级一个 RTV（自己的小堆）、一个 SRV（大堆 19～24 格）。
+    // 约定：帧与帧之间所有 mip 都停在 PIXEL_SHADER_RESOURCE
+    void BuildBloomResources()
+    {
+        D3D12_RESOURCE_DESC desc = {
+            .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            .Alignment = 0,
+            .Width = (std::max)(1u, mClientWidth/2),
+            .Height = (std::max)(1u, mClientHeight/2),
+            .DepthOrArraySize = 1,
+            .MipLevels = kBloomMips,
+            .Format = kBloomFormat,
+            .SampleDesc = {.Count = 1, .Quality = 0},
+            .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            .Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        };
+        CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+        mBloomMap.Reset();
+        ThrowIfFailed(
+            mDevice->CreateCommittedResource(&heapProps,D3D12_HEAP_FLAG_NONE,&desc,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&mBloomMap)));
+        if (!mBloomRtvHeap)
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {
+                .Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                .NumDescriptors = kBloomMips,
+                .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                .NodeMask = 0,
+            };
+            ThrowIfFailed(mDevice->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&mBloomRtvHeap)));
+        }
+        for (UINT i = 0; i < kBloomMips; i++)
+        {
+            D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {
+                .Format = kBloomFormat,
+                .ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D,
+                .Texture2D = {
+                    .MipSlice = i,
+                    .PlaneSlice = 0
+                }
+            };
+            mDevice->CreateRenderTargetView(mBloomMap.Get(), &rtvDesc, BloomRtv(i));
+            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+                .Format = kBloomFormat,
+                .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+                .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                .Texture2D = {.MostDetailedMip = i, .MipLevels = 1}, // 空6
+            };
+            mDevice->CreateShaderResourceView(mBloomMap.Get(), &srvDesc, HeapCpuHandle(19 + i));
+        }
+    }
+
+    // Bloom 小堆里第 mip 格的 RTV
+    CD3DX12_CPU_DESCRIPTOR_HANDLE BloomRtv(UINT mip) const
+    {
+        return CD3DX12_CPU_DESCRIPTOR_HANDLE(mBloomRtvHeap->GetCPUDescriptorHandleForHeapStart(), mip,
+                                             mRTVDescriptorSize);
+    }
+
+    // Bloom 的根签名：一张表（t0 = 这一趟读的那一级）+ 6 个根常量（b0）+ 线性夹边采样器（s0）
+    void BuildBloomRootSignature()
+    {
+        CD3DX12_DESCRIPTOR_RANGE srcRange;
+        srcRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+        CD3DX12_ROOT_PARAMETER param[2];
+        param[0].InitAsDescriptorTable(1, &srcRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        param[1].InitAsConstants(6, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL);
+        CD3DX12_STATIC_SAMPLER_DESC linearClamp(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                                                D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+        CD3DX12_ROOT_SIGNATURE_DESC
+            rootSigDesc(_countof(param), param, 1, &linearClamp, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+        ComPtr<ID3DBlob> serialized;
+        ComPtr<ID3DBlob> error;
+        HRESULT hr = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &error);
+        if (error != nullptr)
+        {
+            OutputDebugStringA((char*)error->GetBufferPointer());
+        }
+        ThrowIfFailed(hr);
+
+        ThrowIfFailed(mDevice->CreateRootSignature(
+            0,
+            serialized->GetBufferPointer(),
+            serialized->GetBufferSize(),
+            IID_PPV_ARGS(&mBloomRootSignature)));
+    }
+
+    // Bloom：进来、出去时 HDR 纹理和 Bloom 的所有 mip 都是 PIXEL_SHADER_RESOURCE
+    void DoBloom()
+    {
+        mCommandList->SetGraphicsRootSignature(mBloomRootSignature.Get());
+        mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        const UINT w0 = (std::max)(1u, mClientWidth / 2), h0 = (std::max)(1u, mClientHeight / 2);
+        auto mipW = [&](UINT i) { return (std::max)(1u, w0 >> i); };
+        auto mipH = [&](UINT i) { return (std::max)(1u, h0 >> i); };
+        // 只转第 i 级：Transition 的最后一个参数是子资源编号
+        auto toRT = [&](UINT i)
+        {
+            auto b = CD3DX12_RESOURCE_BARRIER::Transition(mBloomMap.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                          D3D12_RESOURCE_STATE_RENDER_TARGET, i); // 空9
+            mCommandList->ResourceBarrier(1, &b);
+        };
+        auto toSRV = [&](UINT i)
+        {
+            auto b = CD3DX12_RESOURCE_BARRIER::Transition(mBloomMap.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, i);
+            mCommandList->ResourceBarrier(1, &b);
+        };
+        // 画一趟：写第 dst 级，读堆里第 srcSlot 格；srcW × srcH 是读的那一级的大小
+        auto pass = [&](UINT dst, UINT srcSlot, float srcW, float srcH, ID3D12PipelineState* pso)
+        {
+            D3D12_VIEWPORT vp = {
+                0.0f, 0.0f, static_cast<float>(mipW(dst)), static_cast<float>(mipH(dst)), 0.0f, 1.0f
+            }; // 空10：视口要和写的那一级一样大
+            D3D12_RECT sc = {0, 0, (LONG)mipW(dst), (LONG)mipH(dst)};
+            mCommandList->RSSetViewports(1, &vp);
+            mCommandList->RSSetScissorRects(1, &sc);
+            auto rtv = BloomRtv(dst);
+            mCommandList->OMSetRenderTargets(1, &rtv, true, nullptr);
+            mCommandList->SetGraphicsRootDescriptorTable(0, HeapGpuHandle(srcSlot));
+            struct
+            {
+                float TexelX, TexelY, Threshold, Knee, Radius;
+                UINT Karis;
+            } c = {
+                1.0f / srcW, 1.0f / srcH, mBloomThreshold, 0.5f, 1.0f, 1u
+            };
+            mCommandList->SetGraphicsRoot32BitConstants(1, 6, &c, 0);
+            mCommandList->SetPipelineState(pso);
+            mCommandList->DrawInstanced(3, 1, 0, 0);
+        };
+        // ① 缩小：HDR → mip 0（带亮部提取），mip i-1 → mip i
+        for (UINT i = 0; i < kBloomMips; i++)
+        {
+            toRT(i);
+            if (i == 0) pass(0, 18, (float)mClientWidth, (float)mClientHeight, mBloomPrefilterPSO.Get()); // 空11
+            else pass(i, 19 + (i - 1), (float)mipW(i - 1), (float)mipH(i - 1), mBloomDownPSO.Get()); // 空12
+            toSRV(i);
+        }
+        // ② 放大叠加：从倒数第二级往上，每级读比它小一级的
+        for (int i = (int)kBloomMips - 2; i >= 0; i--)
+        {
+            toRT((UINT)i);
+            pass((UINT)i, 19 + (i + 1), (float)mipW(i + 1), (float)mipH(i + 1), mBloomUpPSO.Get()); // 空13
+            toSRV((UINT)i);
+        }
     }
 
     // ======================== 成员变量 ========================
@@ -2543,9 +2752,9 @@ private:
     std::vector<int> mImGuiFreeSlots;
     float mSunAzimuth = 0.0f, mSunElevation = 0.0f; // 单位：度
     int mCameraPreset = -1; // 当前在第几个预设机位，-1 = 自由视角
-    float mExposureEV = 1.0f;     // 曝光，单位 EV：+1 = 亮一倍
-    int mToneCurve = 2;           // 0 截断 / 1 Reinhard / 2 ACES / 3 AgX
-    float mSunIntensity = 1.0f;   // 太阳强度倍数
+    float mExposureEV = 1.0f; // 曝光，单位 EV：+1 = 亮一倍
+    int mToneCurve = 2; // 0 截断 / 1 Reinhard / 2 ACES / 3 AgX
+    float mSunIntensity = 1.0f; // 太阳强度倍数
 
     // HDR 成员：HDR 场景纹理 + 它的 RTV 小堆，色调映射的根签名、着色器、PSO
     ComPtr<ID3D12Resource> mHdrMap;
@@ -2554,6 +2763,18 @@ private:
     ComPtr<ID3DBlob> mTonemapVSByteCode;
     ComPtr<ID3DBlob> mTonemapPSByteCode;
     ComPtr<ID3D12PipelineState> mTonemapPSO;
+
+    // Bloom
+    static constexpr UINT kBloomMips = 6; // 2560×1440 下是 1280×720 … 40×22
+    static constexpr DXGI_FORMAT kBloomFormat = DXGI_FORMAT_R11G11B10_FLOAT; // 不要 alpha，每像素 4 字节
+    ComPtr<ID3D12Resource> mBloomMap;
+    ComPtr<ID3D12DescriptorHeap> mBloomRtvHeap;
+    ComPtr<ID3D12RootSignature> mBloomRootSignature;
+    ComPtr<ID3DBlob> mBloomVSByteCode, mBloomPrefilterPSByteCode, mBloomDownPSByteCode, mBloomUpPSByteCode;
+    ComPtr<ID3D12PipelineState> mBloomPrefilterPSO, mBloomDownPSO, mBloomUpPSO;
+    bool mBloomEnabled = true;
+    float mBloomIntensity = 0.1f;
+    float mBloomThreshold = 1.0f;
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, int nShowCmd)
