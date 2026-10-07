@@ -95,6 +95,23 @@ enum class RenderLayer : int
 static constexpr UINT kTimestampCount = 6;
 static constexpr UINT kShadowMapSize = 4096;
 
+// 录 demo 用的 6 个机位（Day18 的参考镜头），ImGui 面板里的下拉框选
+struct CameraPreset
+{
+    const char* Name;
+    XMFLOAT3 Eye;    // 眼睛
+    XMFLOAT3 Target; // 看向
+};
+
+static const CameraPreset kCameraPresets[] = {
+    {"1 开场全景", {34.0f, 5.0f, -44.0f}, {-4.0f, 2.0f, -20.0f}},
+    {"2 水面与倒影", {35.0f, 14.0f, -62.0f}, {0.0f, 2.0f, -22.0f}},
+    {"3 铁丝网、镜子和木箱", {-14.0f, 4.0f, -46.0f}, {12.0f, 3.0f, -18.0f}},
+    {"4 镜子特写", {-2.0f, 6.0f, -32.0f}, {11.0f, 4.5f, -20.0f}},
+    {"5 山坡、树影和雾", {-30.0f, 22.0f, -75.0f}, {8.0f, 2.0f, -20.0f}},
+    {"6 法线贴图地板", {6.0f, 2.5f, -42.0f}, {-2.0f, 0.0f, -18.0f}},
+};
+
 class CrateApp : public D3DApp
 {
 public:
@@ -118,11 +135,26 @@ public:
         }
     }
 
+    // 按 DPI 缩放 UI。ScaleAllSizes 是"乘上去"的，所以先恢复成默认样式再乘，
+    // 否则每换一次屏幕就叠乘一次（200% → 100% → 200% 来回一趟，边距从 16 变成 32）
+    void ScaleImGui()
+    {
+        ImGuiStyle& style = ImGui::GetStyle();
+        style = ImGuiStyle();               // 默认样式（构造函数里就是 Dark 配色）
+        style.ScaleAllSizes(mDpiScale);     // 边距、圆角、滚动条这些尺寸 × 缩放
+        style.FontScaleDpi = mDpiScale;     // 字号 × 缩放（1.92 的字体按需要的字号现烤，放大了也清楚）
+    }
+
+    void OnDpiChanged() override
+    {
+        ScaleImGui();
+    }
+
     void InitImGui()
     {
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO();
-        ImGui::StyleColorsDark();
+        ScaleImGui();
         io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", 16.0f);
         ImGui_ImplWin32_Init(mhMainWnd);
 
@@ -512,6 +544,7 @@ protected:
         }
 
         // 没按的方向不调用：Walk / Strafe / Ascend 都会把观察矩阵标成"脏"，不动就别让它每帧重建
+        if (forward != 0.0f || right != 0.0f || up != 0.0f) mCameraPreset = -1; // 离开了预设机位
         const float dt = gt.DeltaTime();
         if (forward != 0.0f) mCamera.Walk(forward * dt);
         if (right != 0.0f) mCamera.Strafe(right * dt);
@@ -572,8 +605,8 @@ protected:
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::SetNextWindowSize(ImVec2(320.0f, 0.0f), ImGuiCond_FirstUseEver); // 不设的话窗口太窄，标签被截断
-        ImGui::Begin("调试");
+        // 面板大小跟着内容走：imgui.ini 记的是像素大小，UI 按 DPI 放大以后旧尺寸装不下，内容会被截掉
+        ImGui::Begin("调试", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
         ImGui::Text("帧率 %.0f", ImGui::GetIO().Framerate);
         ImGui::Checkbox("后期模糊", &mBlurEnabled);
         bool sunChanged = ImGui::SliderFloat("太阳方位角", &mSunAzimuth, -180.0f, 180.0f, "%.1f°");
@@ -582,6 +615,21 @@ protected:
         {
             const float az = XMConvertToRadians(mSunAzimuth), el = XMConvertToRadians(mSunElevation);
             mSunDir = XMFLOAT3(-cosf(el) * sinf(az), -sinf(el), -cosf(el) * cosf(az));
+        }
+
+        // 机位：选一个就把摄像机放过去，之后照样能用鼠标键盘挪（一挪就显示"自由视角"）
+        const char* preview = mCameraPreset >= 0 ? kCameraPresets[mCameraPreset].Name : "自由视角";
+        if (ImGui::BeginCombo("机位", preview))
+        {
+            for (int i = 0; i < (int)_countof(kCameraPresets); i++)
+            {
+                if (ImGui::Selectable(kCameraPresets[i].Name, i == mCameraPreset))
+                {
+                    mCameraPreset = i;
+                    mCamera.LookAt(kCameraPresets[i].Eye, kCameraPresets[i].Target, XMFLOAT3(0.0f, 1.0f, 0.0f));
+                }
+            }
+            ImGui::EndCombo();
         }
         ImGui::End();
 
@@ -761,6 +809,7 @@ protected:
             float dy = XMConvertToRadians(0.25f * static_cast<float>(y - mLastMousePos.y));
             mCamera.Pitch(dy);
             mCamera.RotateY(dx);
+            mCameraPreset = -1; // 离开了预设机位
         }
         // 必须放在最后：下一次 MouseMove 要用这次的位置算差值
         mLastMousePos.x = x;
@@ -972,7 +1021,11 @@ private:
             std::uniform_int_distribution<int> row(4, mWaves->RowCount() - 5);
             std::uniform_int_distribution<int> col(4, mWaves->ColumnCount() - 5);
             std::uniform_real_distribution<float> magnitude(0.2f, 0.5f);
-            mWaves->Disturb(row(rng), col(rng), magnitude(rng));
+            // 高度随机取正负：总是往上戳的话，波动方程只把水推来推去、不会把多出来的水带走，
+            // 平均水位越涨越高，跑二十几秒就把贴着 y = 0 的地板淹了。正负各半，平均不加水也不减水
+            float m = magnitude(rng);
+            if (rng() & 1) m = -m;
+            mWaves->Disturb(row(rng), col(rng), m);
         }
 
         mWaves->Update(gt.DeltaTime());
@@ -2262,7 +2315,7 @@ private:
     std::unique_ptr<DX_Utils::MeshGeometry> mTreeGeo;
     // 后期模糊：A = mBlurMap[0]（场景复制进来，最终结果也在它里面），B = mBlurMap[1]（存横向模糊的结果）
     ComPtr<ID3D12Resource> mBlurMap[2];
-    bool mBlurEnabled = true; // B 键开关
+    bool mBlurEnabled = false; // B 键开关，默认关
     bool mBlurKeyWasDown = false;
     int mBlurCount = 4; // "横向 + 纵向"算一次，重复几次。越多越糊
     // 波浪：CPU 端的模拟。只算高度和法线，不碰任何 D3D 资源
@@ -2359,6 +2412,7 @@ private:
     static constexpr int kImGuiFirstSlot = 12, kImGuiSlotCount = 4;
     std::vector<int> mImGuiFreeSlots;
     float mSunAzimuth = 0.0f, mSunElevation = 0.0f; // 单位：度
+    int mCameraPreset = -1; // 当前在第几个预设机位，-1 = 自由视角
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, int nShowCmd)

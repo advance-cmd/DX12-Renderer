@@ -52,6 +52,8 @@ protected:
     virtual void OnMouseMove(WPARAM btnState,int x,int y){}
     // 滚轮：往前滚 delta 为正。普通滚轮一格 = WHEEL_DELTA（120），高精度滚轮一次可能只有几十
     virtual void OnMouseWheel(int delta){}
+    // 窗口挪到缩放不同的显示器上之后调用（mDpiScale 已经更新）
+    virtual void OnDpiChanged() {}
 
 protected:
     //封装初始化Windows应用程序所需的代码
@@ -87,6 +89,7 @@ protected:
     //用于指认所创建主窗口的句柄
     HWND mhMainWnd = nullptr;
     std::wstring mMainWndCaption = L"LearnDX12";   // 窗口标题的基础文字
+    float mDpiScale = 1.0f;   // 窗口所在显示器的缩放：100% → 1，200% → 2
 
     GameTimer mTimer;
     bool mAppPaused = false;    //暂停：失去焦点、最小化、拖动边框时

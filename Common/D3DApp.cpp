@@ -1,5 +1,6 @@
 #include "D3DApp.h"
 
+#include <algorithm>    // std::max
 #include <cassert>
 #include <format>
 #include <windowsx.h>
@@ -164,6 +165,18 @@ LRESULT D3DApp::MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         OnResize();
         return 0;
 
+    case WM_DPICHANGED:
+    {
+        // 窗口被拖到缩放不同的屏幕上了。wParam 的高 16 位是新的 DPI；lParam 指向 Windows 建议的新窗口矩形
+        //（物理大小不变：200% → 100% 时窗口的像素宽高减半）。改大小会触发 WM_SIZE，交换链照常在 OnResize 里重建
+        mDpiScale = HIWORD(wParam) / 96.0f;
+        const RECT* r = reinterpret_cast<const RECT*>(lParam);
+        SetWindowPos(hWnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        OnDpiChanged();
+        return 0;
+    }
+
     case WM_GETMINMAXINFO:
         //限制窗口最小尺寸
         ((MINMAXINFO*)lParam)->ptMinTrackSize.x = 200;
@@ -197,6 +210,11 @@ LRESULT D3DApp::MsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 bool D3DApp::InitMainWindow()
 {
+    // 声明"按每个显示器感知 DPI"：我们自己按真实像素画、自己处理缩放。
+    // 不声明的话，Windows 把程序当老程序：骗它屏幕是 1280×800（200% 缩放下），画完再整张放大 2 倍 → 糊。
+    // 必须在算窗口大小之前（最好是程序里第一件事）
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
     // 通过填写WNDCLASS结构体，根据其中描述的特征来创建一个窗口
     WNDCLASS wc;
 
@@ -238,6 +256,40 @@ bool D3DApp::InitMainWindow()
         MessageBox(0, L"CreateWindow FALLED", 0, 0);
         return false;
     }
+
+    // 窗口先按默认位置建出来（还没显示），再看它落在哪块屏幕上、那块屏幕的缩放是多少
+    const UINT dpi = GetDpiForWindow(mhMainWnd);   // 96 = 100%，192 = 200%
+    mDpiScale = dpi / 96.0f;
+    MONITORINFO mi = {.cbSize = sizeof(mi)};
+    GetMonitorInfo(MonitorFromWindow(mhMainWnd, MONITOR_DEFAULTTONEAREST), &mi);
+    const RECT work = mi.rcWork;                     // 工作区：屏幕去掉任务栏
+    const LONG workW = work.right - work.left, workH = work.bottom - work.top;
+
+    // 客户区优先 2560×1440，这块屏幕放不下就依次往下退（别人在 1080p 屏上打开也能用）
+    const SIZE sizes[] = {{2560, 1440}, {1920, 1080}, {1600, 900}, {1280, 720}};
+    SIZE client = {};
+    RECT wr = {};
+    for (SIZE c : sizes)
+    {
+        client = c;
+        wr = {0, 0, c.cx, c.cy};
+        // 客户区矩形 → 整个窗口的矩形（加上标题栏和边框）。边框多厚跟 DPI 有关，
+        // 用 ForDpi 版本按这块屏幕的 dpi 算；老的 AdjustWindowRect 总按主屏算，窗口在副屏上时会算错
+        AdjustWindowRectExForDpi(&wr, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi);
+        // 算完 wr.left/right/bottom 是左右下的边框（透明的拖拽区，伸出屏幕看不出来），
+        // wr.top 是负的标题栏高度，标题栏必须在屏幕里。200% 下 2560×1440：标题栏 58 + 1440 = 1498 ≤ 1504
+        if (c.cx <= workW && c.cy - wr.top <= workH)
+        {
+            break;
+        }
+    }
+    const int winW = wr.right - wr.left, winH = wr.bottom - wr.top;
+    const int visH = client.cy - wr.top;            // 看得见的高度：标题栏 + 客户区
+    SetWindowPos(mhMainWnd, nullptr,
+                 work.left + (workW - winW) / 2,                  // 水平居中
+                 work.top + (std::max)(0L, (workH - visH) / 2),   // 竖直居中，但标题栏不能出屏幕
+                 winW, winH, SWP_NOZORDER | SWP_NOACTIVATE);
+
     //调用展示和更新函数
     ShowWindow(mhMainWnd, SW_SHOW);
     UpdateWindow(mhMainWnd);
