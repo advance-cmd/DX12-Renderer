@@ -1869,7 +1869,7 @@ static HRESULT CreateTextureFromDDS12(
 			mipCount - skipMip,
 			arraySize,
 			format,
-			false, // forceSRGB
+			forceSRGB,
 			isCubeMap,
 			initData.get(),
 			texture, 
@@ -2146,7 +2146,8 @@ HRESULT DirectX::CreateDDSTextureFromFile12(_In_ ID3D12Device* device,
 	_Out_ ComPtr<ID3D12Resource>& texture,
 	_Out_ ComPtr<ID3D12Resource>& textureUploadHeap,
 	_In_ size_t maxsize,
-	_Out_opt_ DDS_ALPHA_MODE* alphaMode)
+	_Out_opt_ DDS_ALPHA_MODE* alphaMode,
+	_In_ bool forceSRGB)
 {
 	if (texture)
 	{
@@ -2178,7 +2179,7 @@ HRESULT DirectX::CreateDDSTextureFromFile12(_In_ ID3D12Device* device,
 	}
 
 	hr = CreateTextureFromDDS12(device, cmdList, header,
-		bitData, bitSize, maxsize, false, texture, textureUploadHeap);
+		bitData, bitSize, maxsize, forceSRGB, texture, textureUploadHeap);
 
 	if (SUCCEEDED(hr))
 	{

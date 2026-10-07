@@ -92,14 +92,17 @@ enum class RenderLayer : int
     Count
 };
 
-static constexpr UINT kTimestampCount = 6;
+static constexpr UINT kTimestampCount = 7;
 static constexpr UINT kShadowMapSize = 4096;
+
+//场景先画进这张 HDR 纹理，每个通道 16 位浮点，亮度可以超过 1，最后再压到后台缓冲
+static constexpr DXGI_FORMAT kHdrFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
 // 录 demo 用的 6 个机位（Day18 的参考镜头），ImGui 面板里的下拉框选
 struct CameraPreset
 {
     const char* Name;
-    XMFLOAT3 Eye;    // 眼睛
+    XMFLOAT3 Eye; // 眼睛
     XMFLOAT3 Target; // 看向
 };
 
@@ -140,9 +143,9 @@ public:
     void ScaleImGui()
     {
         ImGuiStyle& style = ImGui::GetStyle();
-        style = ImGuiStyle();               // 默认样式（构造函数里就是 Dark 配色）
-        style.ScaleAllSizes(mDpiScale);     // 边距、圆角、滚动条这些尺寸 × 缩放
-        style.FontScaleDpi = mDpiScale;     // 字号 × 缩放（1.92 的字体按需要的字号现烤，放大了也清楚）
+        style = ImGuiStyle(); // 默认样式（构造函数里就是 Dark 配色）
+        style.ScaleAllSizes(mDpiScale); // 边距、圆角、滚动条这些尺寸 × 缩放
+        style.FontScaleDpi = mDpiScale; // 字号 × 缩放（1.92 的字体按需要的字号现烤，放大了也清楚）
     }
 
     void OnDpiChanged() override
@@ -188,11 +191,11 @@ public:
             app->mImGuiFreeSlots.push_back(slot);
         };
         ImGui_ImplDX12_Init(&init);
-        
+
         // 滑块初值从现在的 mSunDir 反算（指向太阳 = -mSunDir）
         const XMFLOAT3 toSun = {-mSunDir.x, -mSunDir.y, -mSunDir.z};
-        mSunElevation = XMConvertToDegrees(asinf(toSun.y));          // 仰角：y = sin(仰角)
-        mSunAzimuth = XMConvertToDegrees(atan2f(toSun.x, toSun.z));  // 方位：从 +z 往 +x 转
+        mSunElevation = XMConvertToDegrees(asinf(toSun.y)); // 仰角：y = sin(仰角)
+        mSunAzimuth = XMConvertToDegrees(atan2f(toSun.x, toSun.z)); // 方位：从 +z 往 +x 转
     }
 
     bool Initialize() override
@@ -218,6 +221,7 @@ public:
         LoadTextures(); // 录制复制命令（纹理）
         BuildDescriptorHeaps();
         BuildBlurResources(); // 模糊用的两张纹理和它们的 4 个描述符（要用到堆）
+        BuildHdrResources();
         BuildTimestampQueries(); //Pass时间记录
         BuildShadowMap(); //构建阴影贴图资源和View
         BuildShapeGeometry(); // 录制复制命令（木箱）
@@ -227,6 +231,7 @@ public:
         BuildShaderResourceViews(); // 要用到纹理和堆
         BuildRootSignature(); // PSO 要用根签名
         BuildBlurRootSignature(); //模糊专用的根签名
+        BuildTonemapRootSignature();
         BuildShadersAndInputLayout(); // PSO 要用着色器和输入布局
         BuildPSO(); // 上面两样都有了才能建 PSO；渲染项要记住用哪个 PSO，所以再排在它前面
         BuildMaterials(); //FrameResources要用到这个
@@ -266,7 +271,7 @@ protected:
         }
         return D3DApp::MsgProc(hWnd, msg, wParam, lParam); // 剩下的照旧交给框架：缩放、暂停、鼠标转视角……
     }
-    
+
     void OnResize() override
     {
         D3DApp::OnResize(); // 先让基类重建交换链缓冲、RTV、深度缓冲、视口
@@ -279,6 +284,7 @@ protected:
         if (mHeap)
         {
             BuildBlurResources();
+            BuildHdrResources();
         }
     }
 
@@ -677,8 +683,8 @@ protected:
                 mPassSamples = 0;
                 // 基类每秒刷新一次标题（CalculateFrameStats），会把这段文字带上
                 mMainWndCaption = std::format(
-                    L"LearnDX12    移速 {:.1f}    GPU：阴影图 {:.3f} | 不透明 {:.3f} | 镜子 {:.3f} | 透明 {:.3f} | 模糊 {:.3f} ms",
-                    mCamera.GetMoveSpeed(), avg[0], avg[1], avg[2], avg[3], avg[4]);
+                    L"LearnDX12    移速 {:.1f}    GPU：阴影图 {:.3f} | 不透明 {:.3f} | 镜子 {:.3f} | 透明 {:.3f} | 色调映射 {:.3f} | 模糊 {:.3f} ms",
+                    mCamera.GetMoveSpeed(), avg[0], avg[1], avg[2], avg[3], avg[4], avg[5]);
             }
         }
 
@@ -697,10 +703,14 @@ protected:
         ThrowIfFailed(mCurrentFrame->CmdListAlloc->Reset());
         ThrowIfFailed(mCommandList->Reset(mCurrentFrame->CmdListAlloc.Get(), nullptr));
 
-        // 后台缓冲：PRESENT → RENDER_TARGET
-        auto toRenderTarget = CD3DX12_RESOURCE_BARRIER::Transition(
-            CurrentBackBuffer(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        mCommandList->ResourceBarrier(1, &toRenderTarget);
+        // 后台缓冲：PRESENT → RENDER_TARGET；HDR 纹理：PIXEL_SHADER_RESOURCE → RENDER_TARGET（场景要往里画）
+        D3D12_RESOURCE_BARRIER toRenderTarget[] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(
+                CurrentBackBuffer(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET),
+            CD3DX12_RESOURCE_BARRIER::Transition(mHdrMap.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                 D3D12_RESOURCE_STATE_RENDER_TARGET)
+        };
+        mCommandList->ResourceBarrier(2, toRenderTarget);
 
         // 每帧只需设一次的：堆 → 根签名。阴影 Pass 和主 Pass 共用，所以放在最前面
         // 参数 1 是描述符表，必须先 SetDescriptorHeaps；参数 0（物体常量）在 DrawRenderItems 里每个物体设一次
@@ -722,10 +732,11 @@ protected:
         mCommandList->RSSetViewports(1, &mScreenViewport);
         mCommandList->RSSetScissorRects(1, &mScissorRect);
 
-        // 清屏，绑定渲染目标
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv = CurrentBackBufferView();
+        // 清屏，绑定渲染目标：场景画进 HDR 纹理（后台缓冲不用清了，色调映射会把每个像素写一遍）
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = mHdrRtvHeap->GetCPUDescriptorHandleForHeapStart();
         D3D12_CPU_DESCRIPTOR_HANDLE dsv = DepthStencilView();
-        mCommandList->ClearRenderTargetView(rtv, Colors::LightSteelBlue, 0, nullptr);
+        const float hdrClear[4] = {0.0f, 0.0f, 0.0f, 1.0f}; // 必须和优化清除值一样
+        mCommandList->ClearRenderTargetView(rtv, hdrClear, 0, nullptr);
         mCommandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0,
                                             nullptr);
         mCommandList->OMSetRenderTargets(1, &rtv, true, &dsv);
@@ -749,14 +760,26 @@ protected:
         // 平面阴影（第 11 章的 Shadow 层）已经被阴影贴图取代，不再画；再画会和阴影贴图的影子叠成双重影子
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Transparent]);
         mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 4); // T4
+        // 色调映射：HDR 纹理 → 后台缓冲。HDR 纹理先从"被写"转成"被读"，帧末就停在这个状态（约定）
+        auto hdrToSrv = CD3DX12_RESOURCE_BARRIER::Transition(
+            mHdrMap.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        mCommandList->ResourceBarrier(1, &hdrToSrv);
+        D3D12_CPU_DESCRIPTOR_HANDLE backRtv = CurrentBackBufferView();
+        mCommandList->OMSetRenderTargets(1, &backRtv, true, nullptr);
+        mCommandList->SetGraphicsRootSignature(mTonemapRootSignature.Get());
+        mCommandList->SetGraphicsRootDescriptorTable(0, HeapGpuHandle(18)); // 堆第 18 格：HDR 纹理的 SRV
+        mCommandList->SetPipelineState(mTonemapPSO.Get());
+        mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        mCommandList->DrawInstanced(3, 1, 0, 0); // 3 个顶点 = 一个盖住全屏的大三角形，位置在 VS 里按 SV_VertexID 算
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 5); // T5
         if (mBlurEnabled)
         {
             DoBlur();
         }
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 5); // T5
-
-        // UI 最后画：盖在最上面，不被模糊，也不做深度测试。放在 T5 后面，不算进"模糊"的耗时
-        mCommandList->OMSetRenderTargets(1, &rtv, true, nullptr);
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 6); // T6
+        // UI 最后画：盖在最上面，不被模糊，也不做深度测试。放在 T6 后面，不算进"模糊"的耗时
+        // 画在后台缓冲上：rtv 现在是 HDR 纹理，画进去就不会再上屏了
+        mCommandList->OMSetRenderTargets(1, &backRtv, true, nullptr);
         ID3D12DescriptorHeap* uiHeaps[] = {mHeap.Get()}; // 字体图集的 SRV 在 mHeap 第 12～15 格；显式再绑一次，不依赖前面绑过什么
         mCommandList->SetDescriptorHeaps(_countof(uiHeaps), uiHeaps);
         ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), mCommandList.Get());
@@ -923,7 +946,8 @@ private:
         XMStoreFloat4x4(&pc.ViewProj, XMMatrixTranspose(mCamera.GetView() * mCamera.GetProj()));
         XMStoreFloat4x4(&pc.ShadowTransform, XMMatrixTranspose(XMLoadFloat4x4(&mShadowTransform)));
         pc.EyePosW = mCamera.GetPosition3f();
-        pc.AmbientLight = {0.3f, 0.32f, 0.4f, 1.0f}; // 偏蓝：天空散射过来的光，阴影里带点蓝
+        // 灯和环境光都是线性值：以前在 sRGB 编码过的数值上凭眼睛调的，换算时每个分量取 2.2 次方（原值写在注释里）
+        pc.AmbientLight = {0.071f, 0.082f, 0.133f, 1.0f}; // 偏蓝：天空散射过来的光，阴影里带点蓝（原 0.3, 0.32, 0.4）
         pc.FogColor = XMFLOAT4(Colors::LightSteelBlue.f);
         pc.FogStart = 70.f;
         pc.FogRange = 120.f;
@@ -938,7 +962,7 @@ private:
         XMFLOAT3 Position;
         float SpotPower;
         };*/
-        pc.Lights[0].Strength = {1.35f, 1.12f, 0.85f}; // 夕阳：红多蓝少，偏暖，稍亮一点
+        pc.Lights[0].Strength = {1.935f, 1.283f, 0.700f}; // 夕阳：红多蓝少，偏暖，稍亮一点（原 1.35, 1.12, 0.85）
         pc.Lights[0].FalloffStart = 5;
         // 太阳在场景后方、压得很低，朝镜头斜着照过来，水面的镜面反射点才会进入画面。
         // 归一化再传：手写的 mSunDir 四舍五入后长度是 1.000127，BlinnPhong 里点积会超过 1 → pow(负数) = NaN → 背对太阳看时屏幕上一个黑圆
@@ -948,13 +972,13 @@ private:
         pc.Lights[0].SpotPower = 0.2f;
 
         // Lights[1]：点光源，悬在水面上方，暖白色。FalloffStart 以内全亮，FalloffEnd 以外照不到
-        pc.Lights[1].Strength = {1.0f, 0.9f, 0.6f};
+        pc.Lights[1].Strength = {1.0f, 0.793f, 0.325f}; // 原 1.0, 0.9, 0.6
         pc.Lights[1].FalloffStart = 3.0f;
         pc.Lights[1].FalloffEnd = 14.0f;
         pc.Lights[1].Position = {6.0f, 2.0f, -34.0f};
 
         // Lights[2]：聚光灯，挂在左边山坡上方 8 个单位，竖直朝下照，冷白色
-        pc.Lights[2].Strength = {0.7f, 0.8f, 1.0f};
+        pc.Lights[2].Strength = {0.456f, 0.612f, 1.0f}; // 原 0.7, 0.8, 1.0
         pc.Lights[2].FalloffStart = 8.0f;
         pc.Lights[2].FalloffEnd = 16.0f;
         pc.Lights[2].Position = {-2.8f, 11.9f, -40.0f};
@@ -1095,13 +1119,13 @@ private:
 
     // ======================== 初始化（按 Initialize 里的调用顺序） ========================
 
-    void LoadTextureHelper(std::string Name, std::wstring FileName)
+    void LoadTextureHelper(std::string Name, std::wstring FileName,bool sRGB = true)
     {
         auto Tex = std::make_unique<DX_Utils::Texture>();
         Tex->Name = Name;
         Tex->Filename = FileName;
         ThrowIfFailed(CreateDDSTextureFromFile12(mDevice.Get(), mCommandList.Get(), Tex->Filename.c_str(),
-            Tex->Resource, Tex->UploadHeap));
+            Tex->Resource, Tex->UploadHeap,0,nullptr,sRGB));
         mTextures[Tex->Name] = std::move(Tex);
     }
 
@@ -1115,7 +1139,7 @@ private:
         LoadTextureHelper("treeArrayTex", L"Textures\\treeArray2.dds");
         //书上的 DDS 加载函数认得纹理数组，建出来的资源 DepthOrArraySize 会是 3。
         LoadTextureHelper("skyCubeTex", L"Textures\\grasscube1024.dds");
-        LoadTextureHelper("tileNormalTex", L"Textures\\tile_nmap.dds");
+        LoadTextureHelper("tileNormalTex", L"Textures\\tile_nmap.dds",false);
         LoadTextureHelper("grassTex", L"Textures\\grass.dds");
         LoadTextureHelper("stoneTex", L"Textures\\stone.dds");
     }
@@ -1125,7 +1149,8 @@ private:
     {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {
             .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            .NumDescriptors = 18, // 0～4 纹理，5～8 模糊用的两张纹理（各一个 SRV、一个 UAV），9 阴影图的 SRV，10天空图   11是地板法线贴图 12~15 ImGui 16 ~ 17 grass stone
+            .NumDescriptors = 19,
+            // 0～4 纹理，5～8 模糊用的两张纹理（各一个 SRV、一个 UAV），9 阴影图的 SRV，10天空图   11是地板法线贴图 12~15 ImGui 16 ~ 17 grass stone   18 HDR场景纹理
             .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, // 着色器要从这个堆里读（RTV/DSV 堆不用，所以是 NONE）
             .NodeMask = 0,
         };
@@ -1239,7 +1264,7 @@ private:
                                                        mCSUDescriptorSize);
         mDevice->CreateShaderResourceView(tileNormalTex.Get(), &tileNormalTexDesc,
                                           tileNormalHandle);
-        
+
         // 陆地的两层纹理挨着放：16 草地、17 岩石。根参数 7 的表从 16 开始、管 2 格
         const char* landLayers[] = {"grassTex", "stoneTex"};
         for (int k = 0; k < 2; k++)
@@ -1256,9 +1281,8 @@ private:
                     .ResourceMinLODClamp = 0.0f,
                 },
             };
-            mDevice->CreateShaderResourceView(landLayerTex.Get(), &landLayerTexDesc,HeapCpuHandle(16 + k));
+            mDevice->CreateShaderResourceView(landLayerTex.Get(), &landLayerTexDesc, HeapCpuHandle(16 + k));
         }
-        
     }
 
     void BuildShapeGeometry()
@@ -1580,7 +1604,7 @@ private:
 
         LMaterial_water->Name = "water";
         LMaterial_water->MatCBIndex = 2;
-        LMaterial_water->DiffuseAlbedo = {0.0f, 0.2f, 0.6f, .5f};
+        LMaterial_water->DiffuseAlbedo = {0.0f, 0.029f, 0.325f, .5f}; // 线性值，原 (0, 0.2, 0.6) 取 2.2 次方；透明度不是颜色，不换算
         LMaterial_water->FresnelR0 = {0.1f, 0.1f, 0.1f};
         LMaterial_water->Roughness = 0;
 
@@ -1600,7 +1624,7 @@ private:
 
         LMaterial_floor->Name = "floor";
         LMaterial_floor->MatCBIndex = 5;
-        LMaterial_floor->DiffuseAlbedo = {.9f, .9f, .9f, 1.f};
+        LMaterial_floor->DiffuseAlbedo = {.793f, .793f, .793f, 1.f}; // 线性值，原 0.9 取 2.2 次方
         LMaterial_floor->FresnelR0 = {0.02f, 0.02f, 0.02f};
         LMaterial_floor->Roughness = 0.7f;
         LMaterial_floor->DiffuseSrvHeapIndex = 3;
@@ -1918,7 +1942,7 @@ private:
 
         CD3DX12_DESCRIPTOR_RANGE tileNormalRange;
         tileNormalRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3); //1 个 SRV，从t3开始 tileNormal贴图
-        
+
         CD3DX12_DESCRIPTOR_RANGE landRange;
         landRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 4); // t4 草地、t5 岩石
 
@@ -2023,7 +2047,7 @@ private:
             {"NORMAL_MAP", "1"},
             {nullptr, nullptr}
         };
-        
+
         const D3D_SHADER_MACRO landDefines[] = {
             {"NUM_DIR_LIGHTS", "1"},
             {"NUM_POINT_LIGHTS", "1"},
@@ -2086,6 +2110,9 @@ private:
         mWaterPSByteCode = CompileShader(L"HLSL\\Color.hlsl", waterDefines, "PS", "ps_6_6");
 
         mFloorPSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", floorDefines, "PS", "ps_6_6");
+
+        mTonemapVSByteCode = CompileShader(L"HLSL\\Tonemap.hlsl", nullptr, "VS", "vs_6_6");
+        mTonemapPSByteCode = CompileShader(L"HLSL\\Tonemap.hlsl", nullptr, "PS", "ps_6_6");
     }
 
     void BuildPSO()
@@ -2100,7 +2127,7 @@ private:
         psoDesc.SampleMask = UINT_MAX;
         psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         psoDesc.NumRenderTargets = 1;
-        psoDesc.RTVFormats[0] = mBackBufferFormat;
+        psoDesc.RTVFormats[0] = kHdrFormat; //我画进去的那张纹理是什么格式
         psoDesc.DSVFormat = mDepthStencilFormat;
         psoDesc.SampleDesc.Count = 1;
         psoDesc.SampleDesc.Quality = 0;
@@ -2274,6 +2301,24 @@ private:
         //Vert
         GusBlurDesc.CS = {mVertBlurCSByteCode->GetBufferPointer(), mVertBlurCSByteCode->GetBufferSize()};
         ThrowIfFailed(mDevice->CreateComputePipelineState(&GusBlurDesc,IID_PPV_ARGS(&mVertBlurPSO)));
+
+        // 色调映射：全屏三角形。没有顶点缓冲（InputLayout 不填），不测深度，写后台缓冲
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC tonemapDesc = {};
+        tonemapDesc.pRootSignature = mTonemapRootSignature.Get();
+        tonemapDesc.VS = {mTonemapVSByteCode->GetBufferPointer(), mTonemapVSByteCode->GetBufferSize()};
+        tonemapDesc.PS = {mTonemapPSByteCode->GetBufferPointer(), mTonemapPSByteCode->GetBufferSize()};
+        tonemapDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+        tonemapDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; // 只有一个三角形，不用管绕序
+        tonemapDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+        tonemapDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+        tonemapDesc.DepthStencilState.DepthEnable = false; // 只是把一张图搬到屏幕上，没有前后遮挡
+        tonemapDesc.SampleMask = UINT_MAX;
+        tonemapDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        tonemapDesc.NumRenderTargets = 1;
+        tonemapDesc.RTVFormats[0] = mBackBufferFormat; // 这个 Pass 写的是后台缓冲，不是 HDR 纹理
+        tonemapDesc.DSVFormat = DXGI_FORMAT_UNKNOWN; // 不绑深度缓冲
+        tonemapDesc.SampleDesc.Count = 1;
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&tonemapDesc, IID_PPV_ARGS(&mTonemapPSO)));
     }
 
     // 高斯权重：G(x) = exp(-x² / 2σ²)，x 从 -半径 到 +半径，最后除以总和，让它们加起来等于 1。
@@ -2294,6 +2339,82 @@ private:
             w /= sum; // 不除的话总和是 2.48（σ = 1）这种数，画面会整体变亮
         }
         return weights;
+    }
+
+    /*
+     * HDR 场景纹理：场景画进它（RTV），色调映射 Pass 再读它（SRV，堆第 18 格）。
+     * 约定：帧与帧之间停在 PIXEL_SHADER_RESOURCE。窗口变大小要重建
+     */
+    void BuildHdrResources()
+    {
+        D3D12_RESOURCE_DESC desc = {
+            .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            .Alignment = 0,
+            .Width = mClientWidth, // 和后台缓冲一样大
+            .Height = mClientHeight,
+            .DepthOrArraySize = 1,
+            .MipLevels = 1,
+            .Format = kHdrFormat,
+            .SampleDesc = {.Count = 1, .Quality = 0},
+            .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            .Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, // 要当渲染目标，必须带这个标志
+        };
+        D3D12_CLEAR_VALUE optClear = {.Format = kHdrFormat, .Color = {0.0f, 0.0f, 0.0f, 1.0f}}; // 每帧清成黑色
+        CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+        mHdrMap.Reset(); //窗口变大小时先释放旧的（D3DApp::OnResize 开头 Flush 过）
+        ThrowIfFailed(mDevice->CreateCommittedResource(
+            &heapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            &optClear,
+            IID_PPV_ARGS(&mHdrMap)));
+        // RTV：自己的 1 格小堆。堆只建一次，视图每次重建（资源换了，旧视图指着的是已经释放的东西）
+        if (!mHdrRtvHeap)
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {
+                .Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                .NumDescriptors = 1,
+                .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                .NodeMask = 0,
+            };
+            ThrowIfFailed(mDevice->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&mHdrRtvHeap)));
+        }
+        // 两个视图放在 if 外面：每次换了新纹理都要重建，否则还指着上面刚释放的旧纹理
+        mDevice->CreateRenderTargetView(mHdrMap.Get(), nullptr, mHdrRtvHeap->GetCPUDescriptorHandleForHeapStart());
+
+        // SRV：大堆第 18 格
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+            .Format = kHdrFormat,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .Texture2D = {.MostDetailedMip = 0, .MipLevels = 1},
+        };
+        mDevice->CreateShaderResourceView(mHdrMap.Get(), &srvDesc, HeapCpuHandle(18));
+    }
+
+    void BuildTonemapRootSignature()
+    {
+        CD3DX12_DESCRIPTOR_RANGE hdrRange;
+        hdrRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+        CD3DX12_ROOT_PARAMETER param[1];
+        param[0].InitAsDescriptorTable(1, &hdrRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(_countof(param), param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+        ComPtr<ID3DBlob> serialized;
+        ComPtr<ID3DBlob> error;
+        HRESULT hr = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &error);
+        if (error != nullptr)
+        {
+            OutputDebugStringA((char*)error->GetBufferPointer());
+        }
+        ThrowIfFailed(hr);
+
+        ThrowIfFailed(mDevice->CreateRootSignature(
+            0,
+            serialized->GetBufferPointer(),
+            serialized->GetBufferSize(),
+            IID_PPV_ARGS(&mTonemapRootSignature)));
     }
 
     // ======================== 成员变量 ========================
@@ -2413,6 +2534,14 @@ private:
     std::vector<int> mImGuiFreeSlots;
     float mSunAzimuth = 0.0f, mSunElevation = 0.0f; // 单位：度
     int mCameraPreset = -1; // 当前在第几个预设机位，-1 = 自由视角
+
+    // HDR 成员：HDR 场景纹理 + 它的 RTV 小堆，色调映射的根签名、着色器、PSO
+    ComPtr<ID3D12Resource> mHdrMap;
+    ComPtr<ID3D12DescriptorHeap> mHdrRtvHeap;
+    ComPtr<ID3D12RootSignature> mTonemapRootSignature;
+    ComPtr<ID3DBlob> mTonemapVSByteCode;
+    ComPtr<ID3DBlob> mTonemapPSByteCode;
+    ComPtr<ID3D12PipelineState> mTonemapPSO;
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, int nShowCmd)
