@@ -2,6 +2,8 @@
 // 用法：在着色器里 #include "LightingUtil.hlsl"，再声明 ConstantBuffer<MaterialConstants> gMat : register(b2)
 
 #define MaxLights 100   // 必须和 C++ FrameResource.h 里的 MaxLights 一致
+static const float PI = 3.14159265f;
+static const float MinRoughness = 0.045f; // 感知粗糙度的下限
 
 // 必须和 C++ FrameResource.h 的 Light 一一对应（每两个字段正好一行 16 字节，共 48 字节）
 struct Light
@@ -19,9 +21,11 @@ struct Light
 // 必须和 C++ FrameResource.h 的 MaterialConstants 一一对应
 struct MaterialConstants
 {
-    float4 DiffuseAlbedo;
-    float3 FresnelR0;
+    float4 BaseColor;
+    float Metallic;
     float Roughness;
+    float Reflectance;
+    float Pad;
 };
 
 struct PassConstants
@@ -42,36 +46,69 @@ TextureCube gCubeMap : register(t2); // 天空图：用方向去查
 SamplerState gsamLinearWrap : register(s0);
 SamplerComparisonState gsamShadow : register(s1);
 
-// Blinn-Phong：漫反射 + 高光，三种灯共用。各种灯只负责算出
-//   lightStrength：这盏灯到达这个点时的强度（已经乘过衰减、聚光的锥形因子，还没乘夹角余弦）
-//   lightVec：从表面指向灯的单位向量
-// 约定：normal、lightVec、toEye 都是单位向量
-float3 BlinnPhong(float3 lightStrength, float3 lightVec, float3 normal, float3 toEye, MaterialConstants mat)
-{
-    // Lambert 余弦：光斜着照，同样的光摊到更大的面积上，每一小块接到的就少；背面接不到光
-    float ndotl = max(dot(lightVec, normal), 0.0f);
+//金属没有漫反射
+float3 DiffuseColor(MaterialConstants mat){
+    return (1 - mat.Metallic)*mat.BaseColor.rgb;
+}
 
-    float m = max((1 - mat.Roughness) * 256, 1.0f); // 光泽度至少为 1：pow(0, 0) 在 GPU 上是 NaN
-    float3 h = normalize(toEye + lightVec); // 半角向量
-    float roughnessFactor = (m + 8) / 8 * pow(max(dot(h, normal), 0), m);
-    // Schlick 近似的 Fresnel：夹角用 h 和 lightVec（Blinn-Phong 里微表面的法线就是 h）
-    // 用 saturate 不用 max(…, 0)：浮点误差会让点积略大于 1，1 - 点积 成了负数，pow(负数) 是 NaN
-    float3 fresnel = mat.FresnelR0 + (1 - mat.FresnelR0) * pow(1 - saturate(dot(h, lightVec)), 5);
-    float3 specAlbedo = fresnel * roughnessFactor;
-    return (mat.DiffuseAlbedo.rgb + specAlbedo) * lightStrength * ndotl;
+// 正对着看的反射率：电介质是 0.16·r²（白色），金属是基础色；按 Metallic 在两者之间过渡
+float3 F0(MaterialConstants mat)
+{
+    return lerp(0.16*pow(mat.Reflectance,2),mat.BaseColor.rgb,mat.Metallic);
+}
+
+// D：法线正好朝着 h 的小镜面占多少（GGX）。参数 a 就是 α，已经平方过了
+float D_GGX(float NoH, float a)
+{
+    float a2 = a * a;
+    float f = NoH * NoH * (a2 - 1) + 1;   // 空3：公式分母括号里那一项，(n·h)²(α² − 1) + 1
+    return a2 / (PI * f * f);
+}
+
+// V = G / (4·NoV·NoL)：照抄 Filament 的代码清单
+float V_SmithGGXCorrelated(float NoV, float NoL, float a)
+{
+    float a2 = a * a;
+    float GGXL = NoV * sqrt((-NoL * a2 + NoL) * NoL + a2);
+    float GGXV = NoL * sqrt((-NoV * a2 + NoV) * NoV + a2);
+    return 0.5f / (GGXV + GGXL);
+}
+
+// F：Schlick。u = l·h
+float3 F_Schlick(float u, float3 f0)
+{
+    return f0 + (1-f0)*pow((1-u),5);
+}
+
+// 一盏灯照到这个点：(漫反射 + 镜面) × 光强 × NoL，三种灯共用
+//   灯的强度沿用以前的意思：正对着照一块纯白漫反射面时显示的亮度
+float3 ShadePBR(float3 lightStrength, float3 lightVec, float3 normal, float3 toEye, MaterialConstants mat)
+{
+    float3 h = normalize(toEye + lightVec);
+    float NoV = abs(dot(normal,toEye))+1e-5;   // 空5：照 Filament 的写法。为什么这么写，看图里第 6 种
+    float NoL = saturate(dot(normal, lightVec));
+    float NoH = saturate(dot(normal, h));
+    float LoH = saturate(dot(lightVec, h));
+    float r = max(MinRoughness,mat.Roughness);     // 空6：粗糙度夹到下限以上
+    float a = r*r;     // 空7：感知粗糙度 → α
+    float3 Fr = D_GGX(NoH, a) * V_SmithGGXCorrelated(NoV, NoL, a) * F_Schlick(LoH, F0(mat));
+    float3 Fd = DiffuseColor(mat) / PI;   // 空8：Lambert
+    return (Fr + Fd)*PI * lightStrength * NoL;        // 空9：别忘了乘 π
 }
 
 // 平行光：光向量处处一样，没有衰减
 float3 ComputeDirectionalLight(Light L, MaterialConstants mat, float3 normal, float3 toEye)
 {
     float3 lightVec = -L.Direction;
-    return BlinnPhong(L.Strength, lightVec, normal, toEye, mat);
+    return ShadePBR(L.Strength, lightVec, normal, toEye, mat);
 }
 
-// 衰减：距离 <= falloffStart 时是 1，>= falloffEnd 时是 0，中间线性过渡
-float CalcAttenuation(float d, float falloffStart, float falloffEnd)
+// 平方反比 × 窗口：光强在 radius 处平滑地降到 0；灯贴着表面时也不会除以 0
+float DistanceAttenuation(float d, float radius)
 {
-    return saturate((falloffEnd - d) / (falloffEnd - falloffStart));
+    float f = pow(d/radius,2);                          // 空11：公式里要的是 (d/r)⁴，这里先算 (d/r)²
+    float window = saturate(1.0f - f * f);
+    return window * window / max(d * d, 1e-4f); // 空12
 }
 
 // 点光源：灯挂在 L.Position，光向量每个点都不同，所以需要这个点的世界坐标 pos
@@ -83,8 +120,8 @@ float3 ComputePointLight(Light L, MaterialConstants mat, float3 pos, float3 norm
     if (d <= L.FalloffEnd)
     {
         lightVec /= d; // 归一化（前面已经算过长度，直接除）
-        float3 lightStrength = L.Strength * CalcAttenuation(d, L.FalloffStart, L.FalloffEnd);
-        result = BlinnPhong(lightStrength, lightVec, normal, toEye, mat);
+        float3 lightStrength = L.Strength * DistanceAttenuation(d, L.FalloffEnd);
+        result = ShadePBR(lightStrength, lightVec, normal, toEye, mat);
     }
     return result;
 }
@@ -98,14 +135,14 @@ float3 ComputeSpotLight(Light L, MaterialConstants mat, float3 pos, float3 norma
     if (d <= L.FalloffEnd)
     {
         lightVec /= d;
-        float3 lightStrength = L.Strength * CalcAttenuation(d, L.FalloffStart, L.FalloffEnd);
+        float3 lightStrength = L.Strength * DistanceAttenuation(d, L.FalloffEnd);
 
         // -lightVec 是"灯 → 这个点"的方向，和锥的中轴越接近，点积越接近 1。
         // 再 pow 一下：SpotPower 越大，偏离中轴时掉得越快，光圈越小
         float spotFactor = pow(max(dot(-lightVec, L.Direction), 0.0f), L.SpotPower);
         lightStrength *= spotFactor;
 
-        result = BlinnPhong(lightStrength, lightVec, normal, toEye, mat);
+        result = ShadePBR(lightStrength, lightVec, normal, toEye, mat);
     }
     return result;
 }
@@ -165,19 +202,12 @@ float4 FogColorAt(float3 toEye)
     return float4(gCubeMap.SampleLevel(gsamLinearWrap, dir, 5).rgb, 1.0f);
 }
 
-// Schlick 近似的菲涅耳：看得越斜（n 和 l 夹角越大），反射越强
-float3 SchlickFresnel(float3 R0, float3 normal, float3 lightVec)
-{
-    float f0 = 1.0f - saturate(dot(normal, lightVec)); // 1 - cosθ，θ 是 normal 和 lightVec 的夹角
-    return R0 + (1.0f - R0) * pow(f0, 5);
-}
-
 // 环境反射：把视线在表面上弹一下，用弹出去的方向查天空图
 float3 EnvReflection(MaterialConstants mat, float3 normal, float3 toEye)
 {
     float3 r = reflect(-toEye, normal);
     float3 reflectionColor = gCubeMap.Sample(gsamLinearWrap, SkyDir(r)).rgb;
-    return (1.0f - mat.Roughness) * SchlickFresnel(mat.FresnelR0, normal, r) * reflectionColor;
+    return (1.0f - mat.Roughness) * F_Schlick(saturate(dot(normal,toEye)), F0(mat)) * reflectionColor;
 }
 
 // 法线图的一个样本（切线空间）→ 世界空间

@@ -52,18 +52,21 @@ struct Material
     int MatCBIndex;
     int NumFramesDirty = gNumFrameResources;
 
-    XMFLOAT4 DiffuseAlbedo;
-    XMFLOAT3 FresnelR0;
-    float Roughness;
+    XMFLOAT4 BaseColor = {1.0f, 1.0f, 1.0f, 1.0f}; // rgb 基础色（线性），a 透明度
+    float Metallic = 0.0f;                         // 0 电介质，1 金属
+    float Roughness = 0.5f;                        // 感知粗糙度，公式里用它的平方
+    float Reflectance = 0.5f;                      // 电介质的 f0 = 0.16·r²，0.5 → 4%
     int DiffuseSrvHeapIndex = 0;
     int NormalSrvHeapIndex = -1;
 };
 
 struct MaterialConstants
 {
-    XMFLOAT4 DiffuseAlbedo;
-    XMFLOAT3 FresnelR0;
-    float Roughness;
+    XMFLOAT4 BaseColor = {1.0f, 1.0f, 1.0f, 1.0f}; // rgb 基础色（线性），a 透明度
+    float Metallic = 0.0f;                         // 0 电介质，1 金属
+    float Roughness = 0.5f;                        // 感知粗糙度，公式里用它的平方
+    float Reflectance = 0.5f;                      // 电介质的 f0 = 0.16·r²，0.5 → 4%
+    float Pad = 0.0f;
 };
 
 struct ColorVertex

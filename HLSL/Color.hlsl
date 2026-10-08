@@ -1,4 +1,4 @@
-// 受光的无贴图物体（陆地和水面）：颜色只来自材质（DiffuseAlbedo）和光照，不用顶点色
+// 受光的无贴图物体（陆地和水面）：颜色只来自材质（BaseColor）和光照，不用顶点色
 // 根签名和 Triangle.hlsl 共用：b0 = 物体常量，b1 = Pass 常量，b2 = 材质
 // 这个 shader 不用纹理，所以根参数 1 的 SRV 表设不设都行
 // 输入布局里还有 COLOR，但这里不读它：输入布局可以比 VertexIn 多，按语义名对应
@@ -68,12 +68,12 @@ float4 PS(VertexOut pin) : SV_Target
 
     // ④ lerp(a, b, t) = a × (1 - t) + b × t：steep = 0 是草，1 是石头
     //    材质颜色已经改成了 (1, 1, 1)，乘完就是纹理本身的颜色
-    mat.DiffuseAlbedo.rgb *= lerp(grass, stone, steep);
+    mat.BaseColor.rgb *= lerp(grass, stone, steep);
 #endif
     
     // 没有贴图，材质原样拿来用
     float4 res=float4(0,0,0,0);
-    float3 ambient = gPass.AmbientLight.rgb * mat.DiffuseAlbedo.rgb;
+    float3 ambient = gPass.AmbientLight.rgb * (DiffuseColor(mat) + F0(mat));
     float3 toEye = gPass.EyePosW - pin.PosW;
     float distToEye = length(toEye);
     toEye /= distToEye;
@@ -82,7 +82,7 @@ float4 PS(VertexOut pin) : SV_Target
     shadowFactor[0] = CalcShadowFactor(pin.shadowPosH); // Lights[0] 是太阳，阴影图是站在太阳那里画的
     float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye,shadowFactor);
     
-    res = float4(ambient + direct, mat.DiffuseAlbedo.a);
+    res = float4(ambient + direct, mat.BaseColor.a);
 #ifdef ENV_REFLECT
     res.rgb += EnvReflection(mat, normal, toEye);   // 水面多出一份"从天空反射来的光"
 #endif

@@ -89,6 +89,7 @@ enum class RenderLayer : int
     Shadow,
     Transparent,
     Sky,
+    TestSpheres, // PBR 测试球：面板上勾选才画
     Count
 };
 
@@ -113,6 +114,7 @@ static const CameraPreset kCameraPresets[] = {
     {"4 镜子特写", {-2.0f, 6.0f, -32.0f}, {11.0f, 4.5f, -20.0f}},
     {"5 山坡、树影和雾", {-30.0f, 22.0f, -75.0f}, {8.0f, 2.0f, -20.0f}},
     {"6 法线贴图地板", {6.0f, 2.5f, -42.0f}, {-2.0f, 0.0f, -18.0f}},
+    {"7 PBR 测试球", {19.0f, 4.0f, -19.0f}, {19.0f, 1.0f, -34.0f}},
 };
 
 class CrateApp : public D3DApp
@@ -625,6 +627,7 @@ protected:
         ImGui::Checkbox("Bloom", &mBloomEnabled);
         ImGui::SliderFloat("Bloom 强度", &mBloomIntensity, 0.0f, 0.5f, "%.3f");
         ImGui::SliderFloat("Bloom 阈值", &mBloomThreshold, 0.0f, 4.0f, "%.2f");
+        ImGui::Checkbox("PBR 测试球", &mShowTestSpheres);
         bool sunChanged = ImGui::SliderFloat("太阳方位角", &mSunAzimuth, -180.0f, 180.0f, "%.1f°");
         sunChanged |= ImGui::SliderFloat("太阳仰角", &mSunElevation, 5.0f, 85.0f, "%.1f°");
         if (sunChanged)
@@ -756,6 +759,10 @@ protected:
         mCommandList->SetGraphicsRootDescriptorTable(7, HeapGpuHandle(16));
 
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Opaque]);
+        if (mShowTestSpheres)
+        {
+            DrawRenderItems(mRitemLayer[(int)RenderLayer::TestSpheres]);
+        }
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Sky]); // 天空：不透明之后（被挡住的像素省掉），透明之前（水要和天空混合）
         mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 2); // T2
         mCommandList->OMSetStencilRef(1); // 章上刻"1"
@@ -899,6 +906,10 @@ private:
         mCommandList->ClearDepthStencilView(shadowDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr); // 只清深度；最后两个 = 整张都清
         mCommandList->SetGraphicsRootConstantBufferView(2, shadowPassCB); // 第 2 份 Pass 常量：ViewProj 是灯的
         DrawRenderItems(mRitemLayer[(int)RenderLayer::Opaque], true);
+        if (mShowTestSpheres)
+        {
+            DrawRenderItems(mRitemLayer[(int)RenderLayer::TestSpheres], true);
+        }
         // 转回 PIXEL_SHADER_RESOURCE：主 Pass 要把它当纹理读
         D3D12_RESOURCE_BARRIER b2[] = {
             CD3DX12_RESOURCE_BARRIER::Transition(mShadowMap.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
@@ -935,10 +946,12 @@ private:
             if (mat->NumFramesDirty > 0)
             {
                 MaterialConstants mc;
-                // 1) 把 mat 的 3 个字段抄进 mc
-                mc.DiffuseAlbedo = mat->DiffuseAlbedo;
-                mc.FresnelR0 = mat->FresnelR0;
+                // 1) 把 mat 的 4 个字段抄进 mc（Pad 只是凑满 16 字节，填 0）
+                mc.BaseColor = mat->BaseColor;
+                mc.Metallic = mat->Metallic;
                 mc.Roughness = mat->Roughness;
+                mc.Reflectance = mat->Reflectance;
+                mc.Pad = 0.0f;
                 // 2) CopyData：第几格用 mat->MatCBIndex
                 mCurrentFrame->MaterialCB->CopyData(mat->MatCBIndex, mc);
                 // 3) NumFramesDirty--
@@ -999,16 +1012,18 @@ private:
         pc.Lights[0].Position = {0, 50, 0};
         pc.Lights[0].SpotPower = 0.2f;
 
-        // Lights[1]：点光源，悬在水面上方，暖白色。FalloffStart 以内全亮，FalloffEnd 以外照不到
-        pc.Lights[1].Strength = {1.0f, 0.793f, 0.325f}; // 原 1.0, 0.9, 0.6
-        pc.Lights[1].FalloffStart = 3.0f;
-        pc.Lights[1].FalloffEnd = 14.0f;
+        // Lights[1]：点光源，悬在水面上方，暖白色。Strength 是发光强度，按 1/d² 衰减，FalloffEnd 处平滑地降到 0
+        // ×16：4 个单位处 16 / 4² = 1，和以前线性衰减时差不多亮
+        pc.Lights[1].Strength = {1.0f * 16, 0.793f * 16, 0.325f * 16}; // 颜色：原 1.0, 0.9, 0.6
+        pc.Lights[1].FalloffStart = 3.0f; // PBR 的衰减不用它了
+        pc.Lights[1].FalloffEnd = 14.0f; // 影响半径
         pc.Lights[1].Position = {6.0f, 2.0f, -34.0f};
 
         // Lights[2]：聚光灯，挂在左边山坡上方 8 个单位，竖直朝下照，冷白色
-        pc.Lights[2].Strength = {0.456f, 0.612f, 1.0f}; // 原 0.7, 0.8, 1.0
-        pc.Lights[2].FalloffStart = 8.0f;
-        pc.Lights[2].FalloffEnd = 16.0f;
+        // ×100：照到山坡大约 10 个单位，100 / 10² = 1
+        pc.Lights[2].Strength = {0.456f * 100, 0.612f * 100, 1.0f * 100}; // 颜色：原 0.7, 0.8, 1.0
+        pc.Lights[2].FalloffStart = 8.0f; // PBR 的衰减不用它了
+        pc.Lights[2].FalloffEnd = 16.0f; // 影响半径
         pc.Lights[2].Position = {-2.8f, 11.9f, -40.0f};
         pc.Lights[2].Direction = {0.0f, -1.0f, 0.0f};
         pc.Lights[2].SpotPower = 32.0f;
@@ -1628,63 +1643,72 @@ private:
 
         LMaterial_crate->Name = "crate";
         LMaterial_crate->MatCBIndex = 0;
-        LMaterial_crate->DiffuseAlbedo = {1, 1, 1, 1};
-        LMaterial_crate->FresnelR0 = {0.05f, 0.05f, 0.05f};
-        LMaterial_crate->Roughness = 0.2f;
+        LMaterial_crate->BaseColor = {1, 1, 1, 1};
+        LMaterial_crate->Metallic = 0.0f;
+        LMaterial_crate->Roughness = 0.6f; // 木头半粗糙。原来的 0.2 在 BlinnPhong 里是光泽度 204，几乎是镜面，侧着看一大块过曝
+        LMaterial_crate->Reflectance = 0.5f;
 
         LMaterial_grass->Name = "grass";
         LMaterial_grass->MatCBIndex = 1;
-        LMaterial_grass->DiffuseAlbedo = {1, 1, 1, 1};
-        LMaterial_grass->FresnelR0 = {0.01f, 0.01f, 0.01f};
-        LMaterial_grass->Roughness = 0.85f;
+        LMaterial_grass->BaseColor = {1, 1, 1, 1};
+        LMaterial_grass->Metallic = 0.0f;
+        LMaterial_grass->Roughness = 0.9f; // 草地、石头都很粗糙
+        LMaterial_grass->Reflectance = 0.5f;
 
         LMaterial_water->Name = "water";
         LMaterial_water->MatCBIndex = 2;
-        LMaterial_water->DiffuseAlbedo = {0.0f, 0.029f, 0.325f, .5f}; // 线性值，原 (0, 0.2, 0.6) 取 2.2 次方；透明度不是颜色，不换算
-        LMaterial_water->FresnelR0 = {0.1f, 0.1f, 0.1f};
-        LMaterial_water->Roughness = 0;
+        LMaterial_water->BaseColor = {0.0f, 0.029f, 0.325f, .5f}; // 线性值，原 (0, 0.2, 0.6) 取 2.2 次方；透明度不是颜色，不换算
+        LMaterial_water->Metallic = 0.0f;
+        LMaterial_water->Roughness = 0.1f; // 不能是 0：α = 0 时 GGX 算出 0/0 = NaN
+        LMaterial_water->Reflectance = 0.35f; // 水的 f0 ≈ 0.02：0.16·r² = 0.02 → r ≈ 0.35
 
         LMaterial_fence->Name = "fence";
         LMaterial_fence->MatCBIndex = 3;
-        LMaterial_fence->DiffuseAlbedo = {1.0f, 1.0f, 1.0f, 1.0f};
-        LMaterial_fence->FresnelR0 = {0.1f, 0.1f, 0.1f};
-        LMaterial_fence->Roughness = 0.25f;
+        LMaterial_fence->BaseColor = {1.0f, 1.0f, 1.0f, 1.0f};
+        LMaterial_fence->Metallic = 1.0f; // 铁丝网当金属：没有漫反射，贴图颜色就是反光的颜色
+        LMaterial_fence->Roughness = 0.4f;
+        LMaterial_fence->Reflectance = 0.5f; // 金属用不到（f0 直接取基础色）
         LMaterial_fence->DiffuseSrvHeapIndex = 1; //材质里的一个编号，意思是"我这个材质的贴图，放在 SRV 堆的第几格"。
 
         LMaterial_mirror->Name = "mirror";
         LMaterial_mirror->MatCBIndex = 4;
-        LMaterial_mirror->DiffuseAlbedo = {1.0f, 1.0f, 1.0f, .3f};
-        LMaterial_mirror->FresnelR0 = {0.1f, 0.1f, 0.1f};
-        LMaterial_mirror->Roughness = 0.5f;
+        LMaterial_mirror->BaseColor = {1.0f, 1.0f, 1.0f, .3f};
+        LMaterial_mirror->Metallic = 0.0f;
+        LMaterial_mirror->Roughness = 0.1f; // 冰面很光滑
+        LMaterial_mirror->Reflectance = 0.35f; // 冰的 f0 和水差不多
         LMaterial_mirror->DiffuseSrvHeapIndex = 2;
 
         LMaterial_floor->Name = "floor";
         LMaterial_floor->MatCBIndex = 5;
-        LMaterial_floor->DiffuseAlbedo = {.793f, .793f, .793f, 1.f}; // 线性值，原 0.9 取 2.2 次方
-        LMaterial_floor->FresnelR0 = {0.02f, 0.02f, 0.02f};
-        LMaterial_floor->Roughness = 0.7f;
+        LMaterial_floor->BaseColor = {.793f, .793f, .793f, 1.f}; // 线性值，原 0.9 取 2.2 次方
+        LMaterial_floor->Metallic = 0.0f;
+        LMaterial_floor->Roughness = 0.5f; // 瓷砖；法线图的 alpha 还会把砖缝的粗糙度推到 1
+        LMaterial_floor->Reflectance = 0.5f;
         LMaterial_floor->DiffuseSrvHeapIndex = 3;
         LMaterial_floor->NormalSrvHeapIndex = 11;
 
         LMaterial_shadow->Name = "shadow";
         LMaterial_shadow->MatCBIndex = 6;
-        LMaterial_shadow->DiffuseAlbedo = {.0f, .0f, .0f, .5f};
-        LMaterial_shadow->FresnelR0 = {0.001f, 0.001f, 0.001f};
-        LMaterial_shadow->Roughness = 0.f;
+        LMaterial_shadow->BaseColor = {.0f, .0f, .0f, .5f};
+        LMaterial_shadow->Metallic = 0.0f; // 平面阴影已经不画了，下面两项随便填
+        LMaterial_shadow->Roughness = 1.0f;
+        LMaterial_shadow->Reflectance = 0.5f;
         LMaterial_shadow->DiffuseSrvHeapIndex = 0;
 
         LMaterial_fenceShadow->Name = "fenceShadow";
         LMaterial_fenceShadow->MatCBIndex = 7;
-        LMaterial_fenceShadow->DiffuseAlbedo = {.0f, .0f, .0f, .5f};
-        LMaterial_fenceShadow->FresnelR0 = {0.001f, 0.001f, 0.001f};
-        LMaterial_fenceShadow->Roughness = 0.f;
+        LMaterial_fenceShadow->BaseColor = {.0f, .0f, .0f, .5f};
+        LMaterial_fenceShadow->Metallic = 0.0f;
+        LMaterial_fenceShadow->Roughness = 1.0f;
+        LMaterial_fenceShadow->Reflectance = 0.5f;
         LMaterial_fenceShadow->DiffuseSrvHeapIndex = 1;
 
         LMaterial_tree->Name = "tree";
         LMaterial_tree->MatCBIndex = 8;
-        LMaterial_tree->DiffuseAlbedo = {1.0f, 1.0f, 1.0f, 1.0f};
-        LMaterial_tree->FresnelR0 = {0.01f, 0.01f, 0.01f};
-        LMaterial_tree->Roughness = 0.125f;
+        LMaterial_tree->BaseColor = {1.0f, 1.0f, 1.0f, 1.0f};
+        LMaterial_tree->Metallic = 0.0f;
+        LMaterial_tree->Roughness = 0.9f; // 树叶很粗糙
+        LMaterial_tree->Reflectance = 0.5f;
         LMaterial_tree->DiffuseSrvHeapIndex = 4;
 
         LMaterial_sky->Name = "sky";
@@ -1701,6 +1725,22 @@ private:
         mMaterials[LMaterial_fenceShadow->Name] = std::move(LMaterial_fenceShadow);
         mMaterials[LMaterial_tree->Name] = std::move(LMaterial_tree);
         mMaterials[LMaterial_sky->Name] = std::move(LMaterial_sky);
+
+        // PBR 测试球：前排红色塑料（电介质），后排金（金属，线性值）；从左到右粗糙度 0、0.25、0.5、0.75、1
+        for (int row = 0; row < 2; row++)
+        {
+            for (int i = 0; i < 5; i++)
+            {
+                auto m = std::make_unique<Material>();
+                m->Name = std::format("sphere{}{}", row, i);
+                m->MatCBIndex = 10 + row * 5 + i;
+                m->BaseColor = row == 0 ? XMFLOAT4{0.70f, 0.05f, 0.05f, 1.0f} : XMFLOAT4{1.0f, 0.766f, 0.336f, 1.0f};
+                m->Metallic = row == 0 ? 0.0f : 1.0f;
+                m->Roughness = 0.25f * i;
+                m->Reflectance = 0.5f;
+                mMaterials[m->Name] = std::move(m);
+            }
+        }
     }
 
     //构建mAllItems
@@ -1943,6 +1983,29 @@ private:
         sky->Mat = mMaterials.at("sky").get();
         mRitemLayer[(int)RenderLayer::Sky].push_back(sky.get());
         mAllItems.push_back(std::move(sky));
+
+        // PBR 测试球：半径 0.8（天空球那个半径 0.5 的球放大 1.6 倍），浮在右边的水面上（左边是山）。
+        // 两排隔 8：太阳很低，前排的影子拖得长，隔近了会落到后排上。机位 7 朝 -z 看，屏幕右边是 -x，所以 x 从大往小排
+        const auto& sphereArgs = mShapeGeo->DrawArgs.at("sphere");
+        for (int row = 0; row < 2; row++)
+        {
+            for (int i = 0; i < 5; i++)
+            {
+                auto ball = std::make_unique<RenderItem>();
+                XMStoreFloat4x4(&ball->World, XMMatrixScaling(1.6f, 1.6f, 1.6f) *
+                                XMMatrixTranslation(24.0f - 2.5f * i, 1.2f, row == 0 ? -30.0f : -38.0f));
+                ball->PSO = mSpherePSO.GetAddressOf();
+                ball->ShadowPSO = mShadowCratePSO.GetAddressOf();
+                ball->ObjCBIndex = objCBIndex++;
+                ball->Geo = mShapeGeo.get();
+                ball->IndexCount = sphereArgs.IndexCount;
+                ball->StartIndexLocation = sphereArgs.StartIndexLocation;
+                ball->BaseVertexLocation = sphereArgs.BaseVertexLocation;
+                ball->Mat = mMaterials.at(std::format("sphere{}{}", row, i)).get();
+                mRitemLayer[(int)RenderLayer::TestSpheres].push_back(ball.get());
+                mAllItems.push_back(std::move(ball));
+            }
+        }
     }
 
     // 3 份帧资源，每份：3 个 Pass 常量（0 主 Pass、1 镜像、2 阴影 Pass）+ 每个渲染项 1 个物体常量
@@ -2093,6 +2156,16 @@ private:
             {nullptr, nullptr}
         };
 
+        // 测试球：不采样贴图，颜色全来自材质
+        const D3D_SHADER_MACRO sphereDefines[] = {
+            {"NUM_DIR_LIGHTS", "1"},
+            {"NUM_POINT_LIGHTS", "1"},
+            {"NUM_SPOT_LIGHTS", "1"},
+            {"FOG", "1"},
+            {"NO_DIFFUSE_MAP", "1"},
+            {nullptr, nullptr}
+        };
+
         const D3D_SHADER_MACRO alphaTestDefines[] = {
             {"NUM_DIR_LIGHTS", "1"},
             {"NUM_POINT_LIGHTS", "1"},
@@ -2105,6 +2178,7 @@ private:
         // DXC 编译，Shader Model 6.6（Initialize 里检查过显卡支持）
         mCrateVSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "VS", "vs_6_6");
         mCratePSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "PS", "ps_6_6");
+        mSpherePSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", sphereDefines, "PS", "ps_6_6");
         mAlphaTestedPSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", alphaTestDefines, "PS", "ps_6_6");
         mMirrorVSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "VS_MirrorClear", "vs_6_6");
         mMirrorPSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "PS_MirrorClear", "ps_6_6");
@@ -2178,6 +2252,11 @@ private:
         psoDesc.VS = {mCrateVSByteCode->GetBufferPointer(), mCrateVSByteCode->GetBufferSize()};
         psoDesc.PS = {mCratePSByteCode->GetBufferPointer(), mCratePSByteCode->GetBufferSize()};
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&psoDesc,IID_PPV_ARGS(&mCratePSO)));
+
+        // 测试球：和木箱一样，只是 PS 不采样贴图
+        auto sphereDesc = psoDesc;
+        sphereDesc.PS = {mSpherePSByteCode->GetBufferPointer(), mSpherePSByteCode->GetBufferSize()};
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&sphereDesc, IID_PPV_ARGS(&mSpherePSO)));
 
         auto floorDesc = psoDesc;
         floorDesc.PS = {mFloorPSByteCode->GetBufferPointer(), mFloorPSByteCode->GetBufferSize()};
@@ -2678,6 +2757,8 @@ private:
     float mLastShaderPoll = 0.0f;
 
     ComPtr<ID3D12PipelineState> mCratePSO;
+    ComPtr<ID3D12PipelineState> mSpherePSO; // PBR 测试球
+    ComPtr<ID3DBlob> mSpherePSByteCode;
     ComPtr<ID3D12PipelineState> mAlphaTestedPSO;
 
     ComPtr<ID3DBlob> mCrateVSByteCode;
@@ -2755,6 +2836,7 @@ private:
     float mExposureEV = 1.0f; // 曝光，单位 EV：+1 = 亮一倍
     int mToneCurve = 2; // 0 截断 / 1 Reinhard / 2 ACES / 3 AgX
     float mSunIntensity = 1.0f; // 太阳强度倍数
+    bool mShowTestSpheres = false; // 面板勾选才画 PBR 测试球
 
     // HDR 成员：HDR 场景纹理 + 它的 RTV 小堆，色调映射的根签名、着色器、PSO
     ComPtr<ID3D12Resource> mHdrMap;

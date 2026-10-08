@@ -45,12 +45,12 @@ float4 PS(GeoOut pin) : SV_Target
 
     // 光照用的材质：反照率要带上贴图颜色，其余原样照抄 gMat
     MaterialConstants mat = gMat;
-    mat.DiffuseAlbedo = TexColor * gMat.DiffuseAlbedo;
+    mat.BaseColor = TexColor * gMat.BaseColor;
 #ifdef ALPHA_TEST
-    clip(mat.DiffuseAlbedo.a - 0.1f);
+    clip(mat.BaseColor.a - 0.1f);
 #endif
 
-    float3 ambient = gPass.AmbientLight.rgb * mat.DiffuseAlbedo.rgb;
+    float3 ambient = gPass.AmbientLight.rgb * (DiffuseColor(mat) + F0(mat));
     float3 toEye = gPass.EyePosW - pin.PosW;
     float distToEye = length(toEye);
     toEye /= distToEye;
@@ -58,7 +58,7 @@ float4 PS(GeoOut pin) : SV_Target
     float3 shadowFactor = float3(1.0f, 1.0f, 1.0f);
     shadowFactor[0] = CalcShadowFactor(pin.shadowPosH); // Lights[0] 是太阳，阴影图是站在太阳那里画的
     float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye,shadowFactor);
-    res = float4(ambient + direct, mat.DiffuseAlbedo.a);
+    res = float4(ambient + direct, mat.BaseColor.a);
 #ifdef FOG
     res.rgb = ApplyFog(res.rgb, distToEye, FogColorAt(toEye), gPass.FogStart, gPass.FogRange);
 #endif
@@ -116,5 +116,5 @@ void PS_Shadow(GeoOut pin)
 {
     float3 uvw = float3(pin.TexC, pin.PrimID % 3); // 第 3 个坐标 = 第几张图（我们只有 3 张）
     float4 TexColor = gTreeMapArray.Sample(gsamLinearWrap, uvw);
-    clip(TexColor.a * gMat.DiffuseAlbedo.a - 0.1f);
+    clip(TexColor.a * gMat.BaseColor.a - 0.1f);
 }

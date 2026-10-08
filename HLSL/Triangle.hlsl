@@ -54,16 +54,20 @@ VertexOut VS(VertexIn vin)
 float4 PS(VertexOut pin) : SV_Target
 {
     float4 res=float4(0,0,0,0);
+#ifdef NO_DIFFUSE_MAP
+    float4 TexColor = 1.0f; // PBR 测试球：颜色全来自材质
+#else
     float4 TexColor = gDiffuseMap.Sample(gsamLinearWrap, pin.TexC); // Sample 只能在像素着色器里用
+#endif
 
     // 光照用的材质：反照率要带上贴图颜色，其余原样照抄 gMat
     MaterialConstants mat = gMat;
-    mat.DiffuseAlbedo = TexColor * gMat.DiffuseAlbedo;
+    mat.BaseColor = TexColor * gMat.BaseColor;
 #ifdef ALPHA_TEST
-    clip(mat.DiffuseAlbedo.a -0.1f);
+    clip(mat.BaseColor.a -0.1f);
 #endif
 
-    float3 ambient = gPass.AmbientLight.rgb * mat.DiffuseAlbedo.rgb;
+    float3 ambient = gPass.AmbientLight.rgb * (DiffuseColor(mat) + F0(mat));
     float3 toEye = gPass.EyePosW - pin.PosW;
     float distToEye = length(toEye);
     toEye /= distToEye;
@@ -76,7 +80,7 @@ float4 PS(VertexOut pin) : SV_Target
     float3 shadowFactor = float3(1.0f, 1.0f, 1.0f);
     shadowFactor[0] = CalcShadowFactor(pin.shadowPosH); // Lights[0] 是太阳，阴影图是站在太阳那里画的
     float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye,shadowFactor);
-    res = float4(ambient + direct, mat.DiffuseAlbedo.a);
+    res = float4(ambient + direct, mat.BaseColor.a);
 #ifdef FOG
     res.rgb = ApplyFog(res.rgb, distToEye, FogColorAt(toEye), gPass.FogStart, gPass.FogRange);
 #endif
@@ -102,5 +106,5 @@ float4 PS_MirrorClear(VertexOut pin) : SV_Target
 void PS_Shadow(VertexOut pin)
 {
     float4 TexColor = gDiffuseMap.Sample(gsamLinearWrap, pin.TexC); // Sample 只能在像素着色器里用
-    clip(TexColor.a * gMat.DiffuseAlbedo.a - 0.1f);
+    clip(TexColor.a * gMat.BaseColor.a - 0.1f);
 }
