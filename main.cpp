@@ -76,6 +76,8 @@ struct RenderItem
     ID3D12PipelineState* const* PSO = nullptr;
     // 画阴影图时用的 PSO（只写深度）。空 = 这个物体不投影子
     ID3D12PipelineState* const* ShadowPSO = nullptr;
+    // 延迟渲染 G-Buffer Pass 用的 PSO（只写材质和法线）。空 = 不走延迟（透明物体、天空、镜子……）
+    ID3D12PipelineState* const* GbufferPSO = nullptr;
 
     Material* Mat = nullptr;
 };
@@ -93,11 +95,22 @@ enum class RenderLayer : int
     Count
 };
 
-static constexpr UINT kTimestampCount = 8;
+// DrawRenderItems 这一趟画的是哪个 Pass：决定用渲染项的哪个 PSO
+enum class DrawPass
+{
+    Main, // 前向：边画边算光
+    Shadow, // 阴影图：只写深度
+    GBuffer // 延迟：只写材质和法线
+};
+
+static constexpr UINT kTimestampCount = 9;
 static constexpr UINT kShadowMapSize = 4096;
 
 //场景先画进这张 HDR 纹理，每个通道 16 位浮点，亮度可以超过 1，最后再压到后台缓冲
 static constexpr DXGI_FORMAT kHdrFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+// 0：基础色 + 金属度；1：世界法线 + 粗糙度
+static constexpr DXGI_FORMAT kGBuffer0Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; //RGB：基础色，A：金属度
+static constexpr DXGI_FORMAT kGBuffer1Format = DXGI_FORMAT_R16G16B16A16_FLOAT; //XYZ：世界法线，W：粗糙度
 
 // 录 demo 用的 6 个机位（Day18 的参考镜头），ImGui 面板里的下拉框选
 struct CameraPreset
@@ -225,6 +238,7 @@ public:
         BuildBlurResources(); // 模糊用的两张纹理和它们的 4 个描述符（要用到堆）
         BuildHdrResources();
         BuildBloomResources();
+        BuildGBufferResources();
         BuildTimestampQueries(); //Pass时间记录
         BuildShadowMap(); //构建阴影贴图资源和View
         BuildShapeGeometry(); // 录制复制命令（木箱）
@@ -290,6 +304,7 @@ protected:
             BuildBlurResources();
             BuildHdrResources();
             BuildBloomResources();
+            BuildGBufferResources();
         }
     }
 
@@ -628,6 +643,12 @@ protected:
         ImGui::SliderFloat("Bloom 强度", &mBloomIntensity, 0.0f, 0.5f, "%.3f");
         ImGui::SliderFloat("Bloom 阈值", &mBloomThreshold, 0.0f, 4.0f, "%.2f");
         ImGui::Checkbox("PBR 测试球", &mShowTestSpheres);
+        ImGui::Checkbox("延迟渲染", &mDeferred);
+        if (mDeferred) // 调试视图只有延迟模式才有（要读 G-Buffer）
+        {
+            const char* gbufferViews[] = {"关", "基础色", "法线", "粗糙度", "金属度", "深度", "世界坐标"};
+            ImGui::Combo("G-Buffer 视图", &mGBufferView, gbufferViews, IM_ARRAYSIZE(gbufferViews));
+        }
         bool sunChanged = ImGui::SliderFloat("太阳方位角", &mSunAzimuth, -180.0f, 180.0f, "%.1f°");
         sunChanged |= ImGui::SliderFloat("太阳仰角", &mSunElevation, 5.0f, 85.0f, "%.1f°");
         if (sunChanged)
@@ -696,8 +717,8 @@ protected:
                 mPassSamples = 0;
                 // 基类每秒刷新一次标题（CalculateFrameStats），会把这段文字带上
                 mMainWndCaption = std::format(
-                    L"LearnDX12    移速 {:.1f}    GPU：阴影图 {:.3f} | 不透明 {:.3f} | 镜子 {:.3f} | 透明 {:.3f} | Bloom {:.3f} | 色调映射 {:.3f} | 模糊 {:.3f} ms",
-                    mCamera.GetMoveSpeed(), avg[0], avg[1], avg[2], avg[3], avg[4], avg[5], avg[6]);
+                    L"LearnDX12    移速 {:.1f}    GPU：阴影图 {:.3f} | 不透明/G-Buffer {:.3f} | 光照 {:.3f} | 天空+镜子 {:.3f} | 透明 {:.3f} | Bloom {:.3f} | 色调映射 {:.3f} | 模糊 {:.3f} ms",
+                    mCamera.GetMoveSpeed(), avg[0], avg[1], avg[2], avg[3], avg[4], avg[5], avg[6], avg[7]);
             }
         }
 
@@ -709,6 +730,33 @@ protected:
         UpdateMainPassCB();
     }
 
+    /*
+     * 一帧的 Pass 地图。PSO 本身不知道自己属于哪一段：它在哪个 Draw 前被 SetPipelineState，就属于哪一段；
+     * 创建 PSO 时的 RTVFormats / DSVFormat / 根签名，必须和那一段绑着的渲染目标、深度缓冲、根签名对上。
+     * 下面的 rtv 就是 HDR 纹理的 RTV（传进 DrawDeferred 后叫 hdrRtv），dsv 是主深度缓冲。
+     *
+     *   ① 阴影图        DrawShadowMap
+     *        渲染目标：无 | 深度：阴影图 | PSO：各物体的 ShadowPSO | 根签名：主
+     *   ② 不透明物体
+     *        前向：渲染目标：HDR | 深度：主深度 | PSO：各物体的 PSO | 根签名：主
+     *        延迟：DrawDeferred，分成两段 ↓
+     *     ②a G-Buffer   渲染目标：GBuffer0 + GBuffer1 | 深度：主深度 | PSO：各物体的 GbufferPSO | 根签名：主
+     *     ②b 光照       全屏三角形
+     *        渲染目标：HDR | 深度：无（深度这时当 SRV 读）| PSO：mDeferredLightPSO，选了 G-Buffer 视图时换 mGBufferViewPSO[v]
+     *        根签名：主（根参数 8 = G-Buffer + 深度）
+     *   ③ 天空、镜子、倒影、透明
+     *        渲染目标：HDR | 深度：主深度 | PSO：各物体的 PSO | 根签名：主
+     *   ④ Bloom         DoBloom，全屏三角形
+     *        渲染目标：Bloom 纹理链（kBloomFormat）| 深度：无 | PSO：mBloomPrefilter/Down/UpPSO | 根签名：Bloom
+     *   ⑤ 色调映射      全屏三角形，HDR 纹理 → 屏幕
+     *        渲染目标：后台缓冲（mBackBufferFormat）| 深度：无 | PSO：mTonemapPSO | 根签名：Tonemap
+     *   ⑥ 模糊          DoBlur，计算着色器（Dispatch，不绑渲染目标）
+     *        读写：后台缓冲 ↔ 模糊纹理 | PSO：mHorzBlurPSO / mVertBlurPSO | 根签名：Blur（计算）
+     *   ⑦ UI            ImGui
+     *        渲染目标：后台缓冲 | 深度：无 | PSO、根签名：ImGui 自己的
+     *
+     * 两个 PSO 长得像（比如光照 PSO 和 tonemapDesc 都是全屏三角形），但在表里不同行，输出格式就不同
+     */
     void Draw(const GameTimer& gt) override
     {
         const UINT tsBase = mCurrFrameResourceIndex * kTimestampCount; // 这份帧资源的 6 格从这里开始
@@ -745,48 +793,67 @@ protected:
         mCommandList->RSSetViewports(1, &mScreenViewport);
         mCommandList->RSSetScissorRects(1, &mScissorRect);
 
-        // 清屏，绑定渲染目标：场景画进 HDR 纹理（后台缓冲不用清了，色调映射会把每个像素写一遍）
+        // 清屏：场景画进 HDR 纹理（后台缓冲不用清了，色调映射会把每个像素写一遍）
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = mHdrRtvHeap->GetCPUDescriptorHandleForHeapStart();
         D3D12_CPU_DESCRIPTOR_HANDLE dsv = DepthStencilView();
         const float hdrClear[4] = {0.0f, 0.0f, 0.0f, 1.0f}; // 必须和优化清除值一样
         mCommandList->ClearRenderTargetView(rtv, hdrClear, 0, nullptr);
         mCommandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0,
                                             nullptr);
-        mCommandList->OMSetRenderTargets(1, &rtv, true, &dsv);
 
         mCommandList->SetGraphicsRootConstantBufferView(2, passCB); // 阴影 Pass 用的是第 2 份，换回主 Pass 的
         mCommandList->SetGraphicsRootDescriptorTable(4, HeapGpuHandle(9));
         mCommandList->SetGraphicsRootDescriptorTable(7, HeapGpuHandle(16));
 
-        DrawRenderItems(mRitemLayer[(int)RenderLayer::Opaque]);
-        if (mShowTestSpheres)
+        // 不透明物体。延迟 = G-Buffer Pass + 光照 Pass（选了 G-Buffer 视图时换成调试视图）；前向 = 边画边算光。
+        // 两条路出来时一样：HDR 纹理 + 深度缓冲绑着，深度里是不透明物体的深度
+        if (mDeferred)
         {
-            DrawRenderItems(mRitemLayer[(int)RenderLayer::TestSpheres]);
+            DrawDeferred(rtv, dsv, tsBase); // T2、T3 在里面
         }
-        DrawRenderItems(mRitemLayer[(int)RenderLayer::Sky]); // 天空：不透明之后（被挡住的像素省掉），透明之前（水要和天空混合）
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 2); // T2
-        mCommandList->OMSetStencilRef(1); // 章上刻"1"
-        DrawRenderItems(mRitemLayer[(int)RenderLayer::Mirrors]); // ③ 看得见的镜子像素盖章
-        DrawRenderItems(mRitemLayer[(int)RenderLayer::MirrorClear]); // ③b 盖了章的地方：深度推远、刷成天空色
-        // ④ 镜像：Ref 还是 1，只画在模板 = 1 的像素；Pass 常量换成第 1 份（反射后的灯）
-        mCommandList->SetGraphicsRootConstantBufferView(2, passCB + passCBByteSize);
-        DrawRenderItems(mRitemLayer[(int)RenderLayer::Reflected]);
-        mCommandList->SetGraphicsRootConstantBufferView(2, passCB); // 换回主 Pass 常量，后面的镜子和水要用
-        mCommandList->OMSetStencilRef(0); // 用完恢复
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 3); // T3
-        // 平面阴影（第 11 章的 Shadow 层）已经被阴影贴图取代，不再画；再画会和阴影贴图的影子叠成双重影子
-        DrawRenderItems(mRitemLayer[(int)RenderLayer::Transparent]);
+        else
+        {
+            mCommandList->OMSetRenderTargets(1, &rtv, true, &dsv);
+            DrawRenderItems(mRitemLayer[(int)RenderLayer::Opaque]);
+            if (mShowTestSpheres)
+            {
+                DrawRenderItems(mRitemLayer[(int)RenderLayer::TestSpheres]);
+            }
+            mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 2); // T2
+            mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 3); // T3：前向没有单独的光照 Pass
+        }
+
+        // G-Buffer 视图只看 G-Buffer 里存的东西：天空、镜子、透明物体都不画。前向模式下没有 G-Buffer，下拉框不算数
+        const bool gbufferView = mDeferred && mGBufferView > 0;
+        if (!gbufferView)
+        {
+            DrawRenderItems(mRitemLayer[(int)RenderLayer::Sky]); // 天空：不透明之后（被挡住的像素省掉），透明之前（水要和天空混合）
+            mCommandList->OMSetStencilRef(1); // 章上刻"1"
+            DrawRenderItems(mRitemLayer[(int)RenderLayer::Mirrors]); // ③ 看得见的镜子像素盖章
+            DrawRenderItems(mRitemLayer[(int)RenderLayer::MirrorClear]); // ③b 盖了章的地方：深度推远、刷成天空色
+            // ④ 镜像：Ref 还是 1，只画在模板 = 1 的像素；Pass 常量换成第 1 份（反射后的灯）
+            mCommandList->SetGraphicsRootConstantBufferView(2, passCB + passCBByteSize);
+            DrawRenderItems(mRitemLayer[(int)RenderLayer::Reflected]);
+            mCommandList->SetGraphicsRootConstantBufferView(2, passCB); // 换回主 Pass 常量，后面的镜子和水要用
+            mCommandList->OMSetStencilRef(0); // 用完恢复
+        }
         mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 4); // T4
-        
+        // 平面阴影（第 11 章的 Shadow 层）已经被阴影贴图取代，不再画；再画会和阴影贴图的影子叠成双重影子
+        if (!gbufferView)
+        {
+            DrawRenderItems(mRitemLayer[(int)RenderLayer::Transparent]);
+        }
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 5); // T5
+
         // 色调映射：HDR 纹理 → 后台缓冲。HDR 纹理先从"被写"转成"被读"，帧末就停在这个状态（约定）
         auto hdrToSrv = CD3DX12_RESOURCE_BARRIER::Transition(
             mHdrMap.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         mCommandList->ResourceBarrier(1, &hdrToSrv);
-        if (mBloomEnabled)
+        if (mBloomEnabled && !gbufferView)
         {
             DoBloom();
         }
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 5); // T5
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 6); // T6
         //Bloom Pass 把视口改成了Bloom图的大小，这里换回屏幕的
         mCommandList->RSSetViewports(1, &mScreenViewport);
         mCommandList->RSSetScissorRects(1, &mScissorRect);
@@ -800,18 +867,22 @@ protected:
             float Exposure;
             UINT Curve;
             float BloomIntensity;
-        } tonemap = {exp2f(mExposureEV), (UINT)mToneCurve,mBloomEnabled ? mBloomIntensity : 0.0f};
+        } tonemap = {exp2f(mExposureEV), (UINT)mToneCurve, mBloomEnabled ? mBloomIntensity : 0.0f};
+        if (gbufferView)
+        {
+            tonemap = {1.0f, 0u, 0.0f}; // G-Buffer 视图：不加曝光、不压曲线、不加 Bloom，屏幕上就是存的原值
+        }
         mCommandList->SetGraphicsRoot32BitConstants(1, 3, &tonemap, 0);
         mCommandList->SetPipelineState(mTonemapPSO.Get());
         mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         mCommandList->DrawInstanced(3, 1, 0, 0); // 3 个顶点 = 一个盖住全屏的大三角形，位置在 VS 里按 SV_VertexID 算
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 6); // T6
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 7); // T7
         if (mBlurEnabled)
         {
             DoBlur();
         }
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 7); // T7
-        // UI 最后画：盖在最上面，不被模糊，也不做深度测试。放在 T7 后面，不算进"模糊"的耗时
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 8); // T8
+        // UI 最后画：盖在最上面，不被模糊，也不做深度测试。放在 T8 后面，不算进"模糊"的耗时
         // 画在后台缓冲上：rtv 现在是 HDR 纹理，画进去就不会再上屏了
         mCommandList->OMSetRenderTargets(1, &backRtv, true, nullptr);
         ID3D12DescriptorHeap* uiHeaps[] = {mHeap.Get()}; // 字体图集的 SRV 在 mHeap 第 12～15 格；显式再绑一次，不依赖前面绑过什么
@@ -905,10 +976,10 @@ private:
         mCommandList->OMSetRenderTargets(0, nullptr, false, &shadowDsv);
         mCommandList->ClearDepthStencilView(shadowDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr); // 只清深度；最后两个 = 整张都清
         mCommandList->SetGraphicsRootConstantBufferView(2, shadowPassCB); // 第 2 份 Pass 常量：ViewProj 是灯的
-        DrawRenderItems(mRitemLayer[(int)RenderLayer::Opaque], true);
+        DrawRenderItems(mRitemLayer[(int)RenderLayer::Opaque], DrawPass::Shadow);
         if (mShowTestSpheres)
         {
-            DrawRenderItems(mRitemLayer[(int)RenderLayer::TestSpheres], true);
+            DrawRenderItems(mRitemLayer[(int)RenderLayer::TestSpheres], DrawPass::Shadow);
         }
         // 转回 PIXEL_SHADER_RESOURCE：主 Pass 要把它当纹理读
         D3D12_RESOURCE_BARRIER b2[] = {
@@ -983,7 +1054,19 @@ private:
         mCamera.UpdateViewMatrix();
 
         PassConstants pc = {};
-        XMStoreFloat4x4(&pc.ViewProj, XMMatrixTranspose(mCamera.GetView() * mCamera.GetProj()));
+        const XMMATRIX viewProj =
+            mCamera.GetView() * mCamera.GetProj();
+
+        XMStoreFloat4x4(
+            &pc.ViewProj,
+            XMMatrixTranspose(viewProj));
+
+        const XMMATRIX invViewProj =
+            XMMatrixInverse(nullptr, viewProj);
+
+        XMStoreFloat4x4(
+            &pc.InvViewProj,
+            XMMatrixTranspose(invViewProj));
         XMStoreFloat4x4(&pc.ShadowTransform, XMMatrixTranspose(XMLoadFloat4x4(&mShadowTransform)));
         pc.EyePosW = mCamera.GetPosition3f();
         // 灯和环境光都是线性值：以前在 sRGB 编码过的数值上凭眼睛调的，换算时每个分量取 2.2 次方（原值写在注释里）
@@ -1111,7 +1194,7 @@ private:
     }
 
     // 逐个画渲染项：设 IA → 把根参数 0 指到这个物体的常量 → Draw
-    void DrawRenderItems(const std::vector<RenderItem*>& items, bool shadowPass = false)
+    void DrawRenderItems(const std::vector<RenderItem*>& items, DrawPass pass = DrawPass::Main)
     {
         const UINT objCBByteSize = CalcConstantBufferByteSize(sizeof(ObjectConstants)); // 256 字节对齐
         const D3D12_GPU_VIRTUAL_ADDRESS objCBStart = mCurrentFrame->ObjectCB->Resource()->GetGPUVirtualAddress();
@@ -1121,12 +1204,16 @@ private:
 
         for (auto& ri : items)
         {
-            // PSO 是一整包状态，只能整个换。木箱用木箱的，陆地和波浪用另一套；阴影 Pass 用 ShadowPSO
-            ID3D12PipelineState* const* slot = shadowPass ? ri->ShadowPSO : ri->PSO;
+            // PSO 是一整包状态，只能整个换。木箱用木箱的，陆地和波浪用另一套；阴影 Pass 用 ShadowPSO，G-Buffer Pass 用 GbufferPSO
+            ID3D12PipelineState* const* slot = pass == DrawPass::Shadow
+                                                   ? ri->ShadowPSO
+                                                   : pass == DrawPass::GBuffer
+                                                   ? ri->GbufferPSO
+                                                   : ri->PSO;
             ID3D12PipelineState* pso = slot != nullptr ? *slot : nullptr; // 取槽里现在放的那个 PSO
             if (pso == nullptr)
             {
-                continue; // 没挂 ShadowPSO 的物体不投影子，阴影 Pass 里跳过
+                continue; // 这个 Pass 没给它挂 PSO：没挂 ShadowPSO 的不投影子，没挂 GbufferPSO 的不走延迟
             }
             mCommandList->SetPipelineState(pso);
             // 视图是函数返回的临时对象，先存成变量才能取地址（直接 &ri->Geo->VertexBufferView() 会报 C2102）
@@ -1192,7 +1279,7 @@ private:
     {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {
             .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            .NumDescriptors = 25,
+            .NumDescriptors = 28,
             /* 0～4 纹理，
              * 5～8 模糊用的两张纹理（各一个 SRV、一个 UAV），
              * 9 阴影图的 SRV，10天空图   
@@ -1201,6 +1288,8 @@ private:
              * 16 ~ 17 grass stone   
              * 18 HDR场景纹理
              * 19～24 是 Bloom 的 6 个 SRV
+             * 25~26 Gbuffer0~1
+             * 27 原来的深度缓冲
              */
             .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, // 着色器要从这个堆里读（RTV/DSV 堆不用，所以是 NONE）
             .NodeMask = 0,
@@ -1754,6 +1843,7 @@ private:
         XMStoreFloat4x4(&land->World, XMMatrixIdentity());
         land->PSO = mColorPSO.GetAddressOf();
         land->ShadowPSO = mShadowLandPSO.GetAddressOf();
+        land->GbufferPSO = mGBufferLandPSO.GetAddressOf();
         land->ObjCBIndex = objCBIndex++;
         land->Geo = mLandGeo.get();
         land->IndexCount = mLandGeo->DrawArgs["grid"].IndexCount;
@@ -1770,6 +1860,7 @@ private:
         auto Lfence1 = std::make_unique<RenderItem>();
         Lfence1->PSO = mAlphaTestedPSO.GetAddressOf();
         Lfence1->ShadowPSO = mShadowCratePSO.GetAddressOf();
+        Lfence1->GbufferPSO = mGBufferFencePSO.GetAddressOf();
         Lfence1->ObjCBIndex = objCBIndex++;
         Lfence1->Geo = mShapeGeo.get();
         Lfence1->IndexCount = box.IndexCount;
@@ -1791,6 +1882,7 @@ private:
             auto crate = std::make_unique<RenderItem>();
             crate->PSO = mCratePSO.GetAddressOf();
             crate->ShadowPSO = mShadowCratePSO.GetAddressOf();
+            crate->GbufferPSO = mGBufferCratePSO.GetAddressOf();
             XMStoreFloat4x4(&crate->World, world);
             crate->ObjCBIndex = objCBIndex++;
             crate->Geo = mShapeGeo.get();
@@ -1904,6 +1996,7 @@ private:
         XMStoreFloat4x4(&floor->World, XMMatrixTranslation(1.0f, 0.05f, -27.0f));
         floor->PSO = mFloorPSO.GetAddressOf();
         floor->ShadowPSO = mShadowCratePSO.GetAddressOf();
+        floor->GbufferPSO = mGBufferFloorPSO.GetAddressOf();
         floor->ObjCBIndex = objCBIndex++;
         floor->Geo = mShapeGeo.get();
         floor->IndexCount = propertyFloor.IndexCount;
@@ -1960,6 +2053,7 @@ private:
         auto LGeo = mTreeGeo.get();
         tree->PSO = mTreePSO.GetAddressOf();
         tree->ShadowPSO = mShadowTreePSO.GetAddressOf();
+        tree->GbufferPSO = mGBufferTreePSO.GetAddressOf();
         tree->ObjCBIndex = objCBIndex++;
         tree->Geo = LGeo;
         tree->PrimitiveType = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
@@ -1996,6 +2090,7 @@ private:
                                 XMMatrixTranslation(24.0f - 2.5f * i, 1.2f, row == 0 ? -30.0f : -38.0f));
                 ball->PSO = mSpherePSO.GetAddressOf();
                 ball->ShadowPSO = mShadowCratePSO.GetAddressOf();
+                ball->GbufferPSO = mGBufferSpherePSO.GetAddressOf();
                 ball->ObjCBIndex = objCBIndex++;
                 ball->Geo = mShapeGeo.get();
                 ball->IndexCount = sphereArgs.IndexCount;
@@ -2023,11 +2118,26 @@ private:
         }
     }
 
-    // 根签名 = 着色器的"参数列表"：
-    //   参数 0：根 CBV → b0，物体常量（每个物体设一次）
-    //   参数 1：描述符表 → t0，木箱纹理（只有像素着色器用）
-    //   参数 2：根 CBV → b1，Pass 常量（每帧设一次）
-    //   静态采样器 s0：三线性过滤 + WRAP（CD3DX12_STATIC_SAMPLER_DESC 默认的寻址模式）
+    /*
+     * 根签名 = 着色器的"参数列表"。三种编号别混：
+     *   根参数 N  —— 这张列表里的第 N 项（从 0 数），C++ 里 SetGraphicsRootXxx(N, …) 用它
+     *   b0、t6 …  —— 着色器里的寄存器，HLSL 里 register(b0)、register(t6) 用它
+     *   堆第 N 格 —— 描述符实际放在大堆 mHeap 的哪一格，描述符表用 HeapGpuHandle(N) 指过去
+     *
+     *   参数 0：根 CBV → b0，物体常量（DrawRenderItems 里每个物体设一次）
+     *   参数 1：描述符表 → t0，漫反射纹理（材质的 DiffuseSrvHeapIndex 那一格，每个物体设一次）
+     *   参数 2：根 CBV → b1，Pass 常量（主 Pass、镜像、阴影 Pass 各一份，换 Pass 时换）
+     *   参数 3：根 CBV → b2，材质常量（每个物体设一次）
+     *   参数 4：描述符表 → t1，阴影图（堆第 9 格）
+     *   参数 5：描述符表 → t2，天空图（堆第 10 格）
+     *   参数 6：描述符表 → t3，地板的法线贴图（材质的 NormalSrvHeapIndex，堆第 11 格）
+     *   参数 7：描述符表 → t4、t5，陆地的草地、岩石（堆第 16、17 格）
+     *   参数 8：描述符表 → t6、t7、t8，两张 G-Buffer + 深度缓冲（堆第 25、26、27 格，延迟渲染的光照 Pass 读）
+     *   描述符表（参数 1、4～8）只给像素着色器看；根 CBV（参数 0、2、3）所有阶段都能看
+     *
+     *   静态采样器 s0：三线性过滤 + WRAP（CD3DX12_STATIC_SAMPLER_DESC 默认的寻址模式）
+     *   静态采样器 s1：比较采样器，阴影图 PCF 用（BORDER 边框白色 = 深度 1，阴影图外面算亮）
+     */
     void BuildRootSignature()
     {
         CD3DX12_DESCRIPTOR_RANGE srvRange;
@@ -2045,7 +2155,10 @@ private:
         CD3DX12_DESCRIPTOR_RANGE landRange;
         landRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 4); // t4 草地、t5 岩石
 
-        CD3DX12_ROOT_PARAMETER slotRootParameter[8];
+        CD3DX12_DESCRIPTOR_RANGE gbufferRange;
+        gbufferRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 6); //t6~7 Gbuffer0~1，t8 深度
+
+        CD3DX12_ROOT_PARAMETER slotRootParameter[9];
         slotRootParameter[0].InitAsConstantBufferView(0);
         slotRootParameter[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
         slotRootParameter[2].InitAsConstantBufferView(1);
@@ -2054,6 +2167,7 @@ private:
         slotRootParameter[5].InitAsDescriptorTable(1, &skyRange, D3D12_SHADER_VISIBILITY_PIXEL);
         slotRootParameter[6].InitAsDescriptorTable(1, &tileNormalRange, D3D12_SHADER_VISIBILITY_PIXEL);
         slotRootParameter[7].InitAsDescriptorTable(1, &landRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        slotRootParameter[8].InitAsDescriptorTable(1, &gbufferRange, D3D12_SHADER_VISIBILITY_PIXEL);
 
         CD3DX12_STATIC_SAMPLER_DESC samplers[2] = {
             CD3DX12_STATIC_SAMPLER_DESC(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR),
@@ -2228,6 +2342,36 @@ private:
         mBloomPrefilterPSByteCode = CompileShader(L"HLSL\\Bloom.hlsl", nullptr, "PS_Prefilter", "ps_6_6");
         mBloomDownPSByteCode = CompileShader(L"HLSL\\Bloom.hlsl", nullptr, "PS_Downsample", "ps_6_6");
         mBloomUpPSByteCode = CompileShader(L"HLSL\\Bloom.hlsl", nullptr, "PS_Upsample", "ps_6_6");
+
+        // 延迟渲染：G-Buffer Pass 的 PS（只写材质和法线，不算光）。
+        // 宏和对应的前向 PS 一样：地板要 NORMAL_MAP，陆地要 LAND_TEX，测试球要 NO_DIFFUSE_MAP，
+        // 铁丝网和树要 ALPHA_TEST（不 clip 的话，洞也会写进 G-Buffer 和深度，挡住后面的东西）
+        mGBufferCratePSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", lightDefines, "PS_GBuffer", "ps_6_6");
+        mGBufferSpherePSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", sphereDefines, "PS_GBuffer", "ps_6_6");
+        mGBufferFloorPSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", floorDefines, "PS_GBuffer", "ps_6_6");
+        mGBufferFencePSByteCode = CompileShader(L"HLSL\\Triangle.hlsl", alphaTestDefines, "PS_GBuffer", "ps_6_6");
+        mGBufferLandPSByteCode = CompileShader(L"HLSL\\Color.hlsl", landDefines, "PS_GBuffer", "ps_6_6");
+        mGBufferTreePSByteCode = CompileShader(L"HLSL\\TreeSprite.hlsl", alphaTestDefines, "PS_GBuffer", "ps_6_6");
+
+        // 全屏三角形的 VS：光照 Pass 和 G-Buffer 调试视图共用。调试视图每种一个 PS（宏 GBUFFER_VIEW = 1～6）
+        mDeferredVSByteCode = CompileShader(L"HLSL\\Deferred.hlsl", lightDefines, "VS", "vs_6_6");
+        for (int v = 0; v < kGBufferViews; v++)
+        {
+            const std::string view = std::to_string(v + 1);
+            const D3D_SHADER_MACRO viewDefines[] = {
+                {"NUM_DIR_LIGHTS", "1"},
+                {"NUM_POINT_LIGHTS", "1"},
+                {"NUM_SPOT_LIGHTS", "1"},
+                {"GBUFFER_VIEW", view.c_str()},
+                {nullptr, nullptr}
+            };
+            mGBufferViewPSByteCode[v] = CompileShader(L"HLSL\\Deferred.hlsl", viewDefines, "PS_GBufferView", "ps_6_6");
+        }
+        mDeferredPSByteCode = CompileShader(
+            L"HLSL\\Deferred.hlsl",
+            lightDefines,
+            "PS",
+            "ps_6_6");
     }
 
     void BuildPSO()
@@ -2401,6 +2545,55 @@ private:
         LSkyPSODesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL; // 天空深度恒为 1，和清屏值相等，LESS 不让它过
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&LSkyPSODesc, IID_PPV_ARGS(&mSkyPSO)));
 
+        auto gbufferDesc = psoDesc;
+
+        // 两张颜色目标，照常进行深度测试和深度写入
+        gbufferDesc.NumRenderTargets = 2;
+        gbufferDesc.RTVFormats[0] = kGBuffer0Format;
+        gbufferDesc.RTVFormats[1] = kGBuffer1Format;
+        /*
+        * SV_Target0 ↔ RTVFormats[0] ↔ GBuffer0
+        * SV_Target1 ↔ RTVFormats[1] ↔ GBuffer1
+        */
+
+        // 下面 6 个和各自的前向 PSO 一一对应：前向那个改了哪些字段，这里就改哪些，只是 PS 换成 PS_GBuffer
+        // 木箱、测试球、地砖：只换 PS
+        auto gbCrateDesc = gbufferDesc;
+        gbCrateDesc.PS = {mGBufferCratePSByteCode->GetBufferPointer(), mGBufferCratePSByteCode->GetBufferSize()};
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&gbCrateDesc, IID_PPV_ARGS(&mGBufferCratePSO)));
+
+        auto gbSphereDesc = gbufferDesc;
+        gbSphereDesc.PS = {mGBufferSpherePSByteCode->GetBufferPointer(), mGBufferSpherePSByteCode->GetBufferSize()};
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&gbSphereDesc, IID_PPV_ARGS(&mGBufferSpherePSO)));
+
+        auto gbFloorDesc = gbufferDesc;
+        gbFloorDesc.PS = {mGBufferFloorPSByteCode->GetBufferPointer(), mGBufferFloorPSByteCode->GetBufferSize()};
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&gbFloorDesc, IID_PPV_ARGS(&mGBufferFloorPSO)));
+
+        // 铁丝网：和前向的 fenceDesc 一样两面都画
+        auto gbFenceDesc = gbufferDesc;
+        gbFenceDesc.PS = {mGBufferFencePSByteCode->GetBufferPointer(), mGBufferFencePSByteCode->GetBufferSize()};
+        gbFenceDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&gbFenceDesc, IID_PPV_ARGS(&mGBufferFencePSO)));
+
+        // 陆地：顶点格式不一样，输入布局和 VS 换成陆地的
+        auto gbLandDesc = gbufferDesc;
+        gbLandDesc.InputLayout = {mColorInputLayout.data(), (UINT)mColorInputLayout.size()};
+        gbLandDesc.VS = {mColorVSByteCode->GetBufferPointer(), mColorVSByteCode->GetBufferSize()};
+        gbLandDesc.PS = {mGBufferLandPSByteCode->GetBufferPointer(), mGBufferLandPSByteCode->GetBufferSize()};
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&gbLandDesc, IID_PPV_ARGS(&mGBufferLandPSO)));
+
+        // 树：和前向的 LTreePSODesc 一样，输入布局、VS、GS 换成树的，图元是点，两面都画
+        auto gbTreeDesc = gbufferDesc;
+        gbTreeDesc.InputLayout = {mTreeInputLayout.data(), (UINT)mTreeInputLayout.size()};
+        gbTreeDesc.VS = {mTreeVSByteCode->GetBufferPointer(), mTreeVSByteCode->GetBufferSize()};
+        gbTreeDesc.GS = {mTreeGSByteCode->GetBufferPointer(), mTreeGSByteCode->GetBufferSize()};
+        gbTreeDesc.PS = {mGBufferTreePSByteCode->GetBufferPointer(), mGBufferTreePSByteCode->GetBufferSize()};
+        gbTreeDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+        gbTreeDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&gbTreeDesc, IID_PPV_ARGS(&mGBufferTreePSO)));
+
+
         // 陆地和水面：位置 + 顶点色，PS 直接返回颜色
         psoDesc.InputLayout = {mColorInputLayout.data(), (UINT)mColorInputLayout.size()};
         psoDesc.VS = {mColorVSByteCode->GetBufferPointer(), mColorVSByteCode->GetBufferSize()};
@@ -2462,6 +2655,38 @@ private:
         add.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
         bloomDesc.BlendState.RenderTarget[0] = add;
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&bloomDesc, IID_PPV_ARGS(&mBloomUpPSO)));
+
+        // G-Buffer 调试视图：和色调映射一样是全屏三角形（没有顶点缓冲、不测深度），
+        // 换成主根签名（要用根参数 8 读 G-Buffer 和深度），写 HDR 纹理
+        for (int v = 0; v < kGBufferViews; v++)
+        {
+            auto viewDesc = tonemapDesc;
+            viewDesc.pRootSignature = mRootSignature.Get();
+            viewDesc.VS = {mDeferredVSByteCode->GetBufferPointer(), mDeferredVSByteCode->GetBufferSize()};
+            viewDesc.PS = {mGBufferViewPSByteCode[v]->GetBufferPointer(), mGBufferViewPSByteCode[v]->GetBufferSize()};
+            viewDesc.RTVFormats[0] = kHdrFormat;
+            ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&viewDesc, IID_PPV_ARGS(&mGBufferViewPSO[v])));
+        }
+        // 同样是全屏三角形：没有顶点输入，不做深度测试
+        auto lightDesc = tonemapDesc;
+
+        lightDesc.pRootSignature = mRootSignature.Get();
+
+        lightDesc.VS = {
+            mDeferredVSByteCode->GetBufferPointer(),
+            mDeferredVSByteCode->GetBufferSize()
+        };
+
+        lightDesc.PS = {
+            mDeferredPSByteCode->GetBufferPointer(),
+            mDeferredPSByteCode->GetBufferSize()
+        };
+
+        lightDesc.RTVFormats[0] = kHdrFormat;
+
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(
+            &lightDesc,
+            IID_PPV_ARGS(&mDeferredLightPSO)));
     }
 
     // 高斯权重：G(x) = exp(-x² / 2σ²)，x 从 -半径 到 +半径，最后除以总和，让它们加起来等于 1。
@@ -2546,7 +2771,8 @@ private:
         // 读 Bloom 的 mip 0 要双线性放大到全屏，和 Bloom 根签名用同一种采样器（s0）
         CD3DX12_STATIC_SAMPLER_DESC linearClamp(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
                                                 D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
-        CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(_countof(param), param, 1, &linearClamp, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        CD3DX12_ROOT_SIGNATURE_DESC
+            rootSigDesc(_countof(param), param, 1, &linearClamp, D3D12_ROOT_SIGNATURE_FLAG_NONE);
 
         ComPtr<ID3DBlob> serialized;
         ComPtr<ID3DBlob> error;
@@ -2572,8 +2798,8 @@ private:
         D3D12_RESOURCE_DESC desc = {
             .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             .Alignment = 0,
-            .Width = (std::max)(1u, mClientWidth/2),
-            .Height = (std::max)(1u, mClientHeight/2),
+            .Width = (std::max)(1u, mClientWidth / 2),
+            .Height = (std::max)(1u, mClientHeight / 2),
             .DepthOrArraySize = 1,
             .MipLevels = kBloomMips,
             .Format = kBloomFormat,
@@ -2712,6 +2938,170 @@ private:
             pass((UINT)i, 19 + (i + 1), (float)mipW(i + 1), (float)mipH(i + 1), mBloomUpPSO.Get()); // 空13
             toSRV((UINT)i);
         }
+    }
+
+    //延迟渲染
+    void BuildGBufferResources()
+    {
+        // 堆建一次；窗口尺寸变化时，资源和视图都要重建
+        if (!mGBufferRtvHeap)
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {
+                .Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                .NumDescriptors = 2,
+                .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                .NodeMask = 0,
+            };
+
+            ThrowIfFailed(mDevice->CreateDescriptorHeap(
+                &heapDesc, IID_PPV_ARGS(&mGBufferRtvHeap)));
+        }
+
+        const DXGI_FORMAT formats[2] = {
+            kGBuffer0Format, kGBuffer1Format
+        };
+        CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+        for (int i = 0; i < 2; i++)
+        {
+            D3D12_RESOURCE_DESC desc = {
+                .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                .Alignment = 0,
+                .Width = mClientWidth,
+                .Height = mClientHeight,
+                .DepthOrArraySize = 1,
+                .MipLevels = 1,
+                .Format = formats[i],
+                .SampleDesc = {
+                    .Count = 1,
+                    .Quality = 0
+                },
+                .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                .Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+            };
+            D3D12_CLEAR_VALUE optClear = {
+                .Format = formats[i],
+                .Color = {0, 0, 0, 0}
+            };
+            mGBuffer[i].Reset();
+
+            ThrowIfFailed(mDevice->CreateCommittedResource(
+                &heapProps,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                &optClear,
+                IID_PPV_ARGS(&mGBuffer[i])));
+
+            mDevice->CreateRenderTargetView(mGBuffer[i].Get(), nullptr, GBufferRtv(i));
+
+            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+                .Format = formats[i],
+                .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+                .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                .Texture2D = {
+                    .MostDetailedMip = 0,
+                    .MipLevels = 1,
+                }
+            };
+            mDevice->CreateShaderResourceView(mGBuffer[i].Get(), &srvDesc, HeapCpuHandle(25 + i));
+        }
+
+        // 深度缓冲的 SRV（堆第 27 格）：只读前 24 位深度，后 8 位模板不要（和阴影图一样）。
+        // 深度缓冲是 D3DApp::OnResize 重建的，旧 SRV 指着已经释放的资源，所以每次都要跟着重建
+        D3D12_SHADER_RESOURCE_VIEW_DESC depthSrvDesc = {
+            .Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .Texture2D = {
+                .MostDetailedMip = 0,
+                .MipLevels = 1,
+            }
+        };
+        mDevice->CreateShaderResourceView(mDepthStencilBuffer.Get(), &depthSrvDesc, HeapCpuHandle(27));
+    }
+
+    CD3DX12_CPU_DESCRIPTOR_HANDLE GBufferRtv(int i) const
+    {
+        return CD3DX12_CPU_DESCRIPTOR_HANDLE(mGBufferRtvHeap->GetCPUDescriptorHandleForHeapStart(), i,
+                                             mRTVDescriptorSize);
+    }
+
+    void DrawDeferred(
+        D3D12_CPU_DESCRIPTOR_HANDLE hdrRtv,
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv,
+        UINT tsBase)
+    {
+        D3D12_RESOURCE_BARRIER toRender[] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(mGBuffer[0].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                 D3D12_RESOURCE_STATE_RENDER_TARGET),
+            CD3DX12_RESOURCE_BARRIER::Transition(mGBuffer[1].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                 D3D12_RESOURCE_STATE_RENDER_TARGET),
+        };
+        mCommandList->ResourceBarrier(_countof(toRender), toRender);
+        // 清除两张颜色目标，清除值与创建资源时的 optClear 一致
+        const float clear[4] = {0, 0, 0, 0};
+        for (int i = 0; i < 2; i++)
+        {
+            mCommandList->ClearRenderTargetView(
+                GBufferRtv(i), clear, 0, nullptr);
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE gbufferRtv = GBufferRtv(0);
+        mCommandList->OMSetRenderTargets(2, &gbufferRtv, true, &dsv);
+        DrawRenderItems(
+            mRitemLayer[(int)RenderLayer::Opaque],
+            DrawPass::GBuffer);
+        if (mShowTestSpheres)
+        {
+            DrawRenderItems(
+                mRitemLayer[(int)RenderLayer::TestSpheres],
+                DrawPass::GBuffer);
+        }
+
+        mCommandList->EndQuery(
+            mTimestampHeap.Get(),
+            D3D12_QUERY_TYPE_TIMESTAMP,
+            tsBase + 2); // T2：G-Buffer 写完
+
+        // ② 写完后切换成读取：两张颜色目标 + 一张深度
+        D3D12_RESOURCE_BARRIER toRead[] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(mGBuffer[0].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            CD3DX12_RESOURCE_BARRIER::Transition(mGBuffer[1].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            CD3DX12_RESOURCE_BARRIER::Transition(mDepthStencilBuffer.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
+        };
+        mCommandList->ResourceBarrier(_countof(toRead), toRead);
+        // ③ 光照 Pass（选了 G-Buffer 视图时换成调试视图）：全屏三角形读 G-Buffer 和深度，输出到 HDR 纹理
+        mCommandList->OMSetRenderTargets(
+            1, &hdrRtv, true, nullptr);
+        mCommandList->SetGraphicsRootDescriptorTable(8, HeapGpuHandle(25));
+
+        ID3D12PipelineState* pso =
+            mGBufferView > 0
+                ? mGBufferViewPSO[mGBufferView - 1].Get()
+                : mDeferredLightPSO.Get();
+
+        mCommandList->SetPipelineState(pso);
+
+        mCommandList->IASetPrimitiveTopology(
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        mCommandList->DrawInstanced(3, 1, 0, 0);
+
+        // ④ 后续前向绘制还要测深度、写模板：把深度状态恢复
+        /* 深度：PIXEL_SHADER_RESOURCE → DEPTH_WRITE */
+        auto depthBack = CD3DX12_RESOURCE_BARRIER::Transition(
+            mDepthStencilBuffer.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        mCommandList->ResourceBarrier(1, &depthBack);
+
+        mCommandList->OMSetRenderTargets(
+            1, &hdrRtv, true, &dsv);
+
+        mCommandList->EndQuery(
+            mTimestampHeap.Get(),
+            D3D12_QUERY_TYPE_TIMESTAMP,
+            tsBase + 3); // T3：光照 / 调试视图完成
     }
 
     // ======================== 成员变量 ========================
@@ -2857,6 +3247,25 @@ private:
     bool mBloomEnabled = true;
     float mBloomIntensity = 0.1f;
     float mBloomThreshold = 1.0f;
+
+    //延迟渲染
+    ComPtr<ID3D12Resource> mGBuffer[2];
+    ComPtr<ID3D12DescriptorHeap> mGBufferRtvHeap;
+    // G-Buffer Pass 的 6 个 PS：木箱、测试球、地砖、铁丝网、陆地、树（和各自的前向 PS 同一组宏）
+    ComPtr<ID3DBlob> mGBufferCratePSByteCode, mGBufferSpherePSByteCode, mGBufferFloorPSByteCode;
+    ComPtr<ID3DBlob> mGBufferFencePSByteCode, mGBufferLandPSByteCode, mGBufferTreePSByteCode;
+    ComPtr<ID3D12PipelineState> mGBufferCratePSO, mGBufferSpherePSO, mGBufferFloorPSO;
+    ComPtr<ID3D12PipelineState> mGBufferFencePSO, mGBufferLandPSO, mGBufferTreePSO;
+    bool mDeferred = false; // 面板"延迟渲染"：勾上 = G-Buffer Pass + 光照 Pass，不勾 = 原来的前向
+    // 光照 Pass：全屏三角形，读 G-Buffer 和深度、反推世界坐标再算光，写 HDR 纹理（VS 和调试视图共用 mDeferredVSByteCode）
+    ComPtr<ID3DBlob> mDeferredPSByteCode;
+    ComPtr<ID3D12PipelineState> mDeferredLightPSO;
+    // G-Buffer 调试视图：基础色、法线、粗糙度、金属度、深度、世界坐标（面板上的下拉框选，0 = 关 = 正常算光）
+    static constexpr int kGBufferViews = 6;
+    int mGBufferView = 0;
+    ComPtr<ID3DBlob> mDeferredVSByteCode;
+    ComPtr<ID3DBlob> mGBufferViewPSByteCode[kGBufferViews];
+    ComPtr<ID3D12PipelineState> mGBufferViewPSO[kGBufferViews];
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, int nShowCmd)

@@ -608,7 +608,7 @@ void D3DApp::CreateDepthAndStencil()
         .Height = mClientHeight,
         .DepthOrArraySize = 1,
         .MipLevels = 1,
-        .Format = mDepthStencilFormat,
+        .Format = DXGI_FORMAT_R24G8_TYPELESS,
         .SampleDesc = {
             .Count = 1,
             .Quality = 0
@@ -632,10 +632,17 @@ void D3DApp::CreateDepthAndStencil()
         &optClear,
         IID_PPV_ARGS(mDepthStencilBuffer.GetAddressOf())));
 
-    //利用此资源的格式，为整个资源的第0mip层创建描述符
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {
+        .Format = DXGI_FORMAT_D24_UNORM_S8_UINT,
+        .ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D,
+        .Flags = D3D12_DSV_FLAG_NONE,
+        .Texture2D = {.MipSlice = 0}
+    };
+    
+    // 资源是无类型的，DSV 必须写明"按什么格式写"
     mDevice->CreateDepthStencilView(
         mDepthStencilBuffer.Get(),
-        nullptr,
+        &dsvDesc,
         DepthStencilView());
 }
 

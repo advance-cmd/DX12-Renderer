@@ -32,6 +32,7 @@ struct PassConstants
 {
     float4x4 ViewProj;
     float4x4 ShadowTransform;
+    float4x4 InvViewProj;
     float3 EyePosW;
     float padding;
     float4 AmbientLight;
@@ -174,6 +175,18 @@ float3 ComputeLighting(Light lights[MaxLights], MaterialConstants mat, float3 po
 #endif
 
     return result;
+}
+
+struct GBufferOut{
+    float4 BaseMetal : SV_Target0;
+    float4 NormalRough : SV_Target1;
+};
+
+GBufferOut PackGBuffer(MaterialConstants mat,float3 normal){
+    GBufferOut o;
+    o.BaseMetal = float4(mat.BaseColor.rgb,mat.Metallic);
+    o.NormalRough = float4(normal,mat.Roughness);
+    return o;
 }
 
 // 线性雾：距离 <= fogStart 不受影响，>= fogStart + fogRange 完全变成雾色，中间线性过渡。

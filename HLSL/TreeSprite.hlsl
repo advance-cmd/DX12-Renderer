@@ -37,32 +37,49 @@ VertexOut VS(VertexIn vin)
     return vout;
 }
 
-float4 PS(GeoOut pin) : SV_Target
+// 这个像素的表面是什么：材质 + 法线。前向 PS 和 PS_GBuffer 共用
+void GetSurface(GeoOut pin, out MaterialConstants mat, out float3 normal)
 {
-    float4 res = float4(0, 0, 0, 0);
     float3 uvw = float3(pin.TexC, pin.PrimID % 3); // 第 3 个坐标 = 第几张图（我们只有 3 张）
     float4 TexColor = gTreeMapArray.Sample(gsamLinearWrap, uvw);
 
     // 光照用的材质：反照率要带上贴图颜色，其余原样照抄 gMat
-    MaterialConstants mat = gMat;
+    mat = gMat;
     mat.BaseColor = TexColor * gMat.BaseColor;
 #ifdef ALPHA_TEST
     clip(mat.BaseColor.a - 0.1f);
 #endif
+    normal = normalize(pin.NormalW); // 插值之后长度不一定是 1
+}
+
+// 前向：表面 + 算光
+float4 PS(GeoOut pin) : SV_Target
+{
+    MaterialConstants mat;
+    float3 normal;
+    GetSurface(pin, mat, normal);
 
     float3 ambient = gPass.AmbientLight.rgb * (DiffuseColor(mat) + F0(mat));
     float3 toEye = gPass.EyePosW - pin.PosW;
     float distToEye = length(toEye);
     toEye /= distToEye;
-    float3 normal = normalize(pin.NormalW); // 插值之后长度不一定是 1
     float3 shadowFactor = float3(1.0f, 1.0f, 1.0f);
     shadowFactor[0] = CalcShadowFactor(pin.shadowPosH); // Lights[0] 是太阳，阴影图是站在太阳那里画的
     float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye,shadowFactor);
-    res = float4(ambient + direct, mat.BaseColor.a);
+    float4 res = float4(ambient + direct, mat.BaseColor.a);
 #ifdef FOG
     res.rgb = ApplyFog(res.rgb, distToEye, FogColorAt(toEye), gPass.FogStart, gPass.FogRange);
 #endif
     return res;
+}
+
+// 延迟：只把表面写进 G-Buffer
+GBufferOut PS_GBuffer(GeoOut pin)
+{
+    MaterialConstants mat;
+    float3 normal;
+    GetSurface(pin, mat, normal);
+    return PackGBuffer(mat, normal);
 }
 
 [maxvertexcount(4)]

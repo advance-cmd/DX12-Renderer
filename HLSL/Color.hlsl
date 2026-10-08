@@ -48,10 +48,11 @@ Texture2D gGrassMap : register(t4);
 Texture2D gStoneMap : register(t5);
 #endif
 
-float4 PS(VertexOut pin) : SV_Target
+// 这个像素的表面是什么：材质 + 法线。前向 PS 和 PS_GBuffer 共用
+void GetSurface(VertexOut pin, out MaterialConstants mat, out float3 normal)
 {
-    MaterialConstants mat = gMat; // 常量缓冲是只读的，要改就复制一份
-    
+    mat = gMat; // 常量缓冲是只读的，要改就复制一份
+
 #ifdef LAND_TEX
     // ① 陆地的顶点没有 uv，就拿世界坐标的水平方向 (x, z) 当 uv，相当于从正上方把纹理"投"到地面上。
     //    除以 6：每 6 个单位铺一块。比如 (x, z) = (12, -30) → uv = (2, -5)；采样器是 Wrap 模式，只看小数部分，所以每 6 个单位重复一次
@@ -70,24 +71,41 @@ float4 PS(VertexOut pin) : SV_Target
     //    材质颜色已经改成了 (1, 1, 1)，乘完就是纹理本身的颜色
     mat.BaseColor.rgb *= lerp(grass, stone, steep);
 #endif
-    
-    // 没有贴图，材质原样拿来用
-    float4 res=float4(0,0,0,0);
+    // 没有 LAND_TEX（水面）：材质原样拿来用
+
+    normal = normalize(pin.NormalW);   // 插值之后长度不一定是 1
+}
+
+// 前向：表面 + 算光
+float4 PS(VertexOut pin) : SV_Target
+{
+    MaterialConstants mat;
+    float3 normal;
+    GetSurface(pin, mat, normal);
+
     float3 ambient = gPass.AmbientLight.rgb * (DiffuseColor(mat) + F0(mat));
     float3 toEye = gPass.EyePosW - pin.PosW;
     float distToEye = length(toEye);
     toEye /= distToEye;
-    float3 normal = normalize(pin.NormalW);   // 插值之后长度不一定是 1
     float3 shadowFactor = float3(1.0f, 1.0f, 1.0f);
     shadowFactor[0] = CalcShadowFactor(pin.shadowPosH); // Lights[0] 是太阳，阴影图是站在太阳那里画的
     float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye,shadowFactor);
-    
-    res = float4(ambient + direct, mat.BaseColor.a);
+
+    float4 res = float4(ambient + direct, mat.BaseColor.a);
 #ifdef ENV_REFLECT
-    res.rgb += EnvReflection(mat, normal, toEye);   // 水面多出一份"从天空反射来的光"
+    res.rgb += EnvReflection(mat, normal, toEye);   // 水面多出一份"从天空反射来的光"：要用 toEye，属于算光，留在 PS
 #endif
 #ifdef FOG
     res.rgb = ApplyFog(res.rgb, distToEye, FogColorAt(toEye), gPass.FogStart, gPass.FogRange);
 #endif
     return res;
+}
+
+// 延迟：只把表面写进 G-Buffer（陆地走这里；水是透明的，照旧走前向的 PS）
+GBufferOut PS_GBuffer(VertexOut pin)
+{
+    MaterialConstants mat;
+    float3 normal;
+    GetSurface(pin, mat, normal);
+    return PackGBuffer(mat, normal);
 }

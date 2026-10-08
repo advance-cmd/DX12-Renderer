@@ -34,6 +34,7 @@ struct PassConstants
 {
     XMFLOAT4X4 ViewProj;
     XMFLOAT4X4 ShadowTransform;
+    XMFLOAT4X4 InvViewProj; //从深度反推世界坐标
 
     XMFLOAT3 EyePosW;
     float padding;

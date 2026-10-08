@@ -51,40 +51,55 @@ VertexOut VS(VertexIn vin)
     return vout;
 }
 
+// 这个像素的表面是什么：材质（基础色已乘贴图）+ 法线（已过法线贴图）。前向 PS 和 PS_GBuffer 共用
+void GetSurface(VertexOut pin, out MaterialConstants mat, out float3 normal)
+{
+    #ifdef NO_DIFFUSE_MAP
+        float4 TexColor = 1.0f; // PBR 测试球：颜色全来自材质
+    #else
+        float4 TexColor = gDiffuseMap.Sample(gsamLinearWrap, pin.TexC); // Sample 只能在像素着色器里用
+    #endif
+    mat = gMat;
+    mat.BaseColor = TexColor * gMat.BaseColor;
+    #ifdef ALPHA_TEST
+        clip(mat.BaseColor.a -0.1f);
+    #endif
+        normal = normalize(pin.NormalW);   // 插值之后长度不一定是 1
+    #ifdef NORMAL_MAP
+        float4 normalMapSample = gNormalMap.Sample(gsamLinearWrap, pin.TexC);
+        normal = NormalSampleToWorldSpace(normalMapSample.rgb, normal, pin.TangentW);
+        mat.Roughness = 1.0f - (1.0f - mat.Roughness) * normalMapSample.a; // alpha 是光泽度：1 = 照常反光，0 = 瓷砖缝里不反光
+    #endif
+}
+
+// 前向：表面 + 算光
 float4 PS(VertexOut pin) : SV_Target
 {
-    float4 res=float4(0,0,0,0);
-#ifdef NO_DIFFUSE_MAP
-    float4 TexColor = 1.0f; // PBR 测试球：颜色全来自材质
-#else
-    float4 TexColor = gDiffuseMap.Sample(gsamLinearWrap, pin.TexC); // Sample 只能在像素着色器里用
-#endif
-
-    // 光照用的材质：反照率要带上贴图颜色，其余原样照抄 gMat
-    MaterialConstants mat = gMat;
-    mat.BaseColor = TexColor * gMat.BaseColor;
-#ifdef ALPHA_TEST
-    clip(mat.BaseColor.a -0.1f);
-#endif
+    MaterialConstants mat;
+    float3 normal;
+    GetSurface(pin, mat, normal);
 
     float3 ambient = gPass.AmbientLight.rgb * (DiffuseColor(mat) + F0(mat));
     float3 toEye = gPass.EyePosW - pin.PosW;
     float distToEye = length(toEye);
     toEye /= distToEye;
-    float3 normal = normalize(pin.NormalW);   // 插值之后长度不一定是 1
-#ifdef NORMAL_MAP
-    float4 normalMapSample = gNormalMap.Sample(gsamLinearWrap, pin.TexC);
-    normal = NormalSampleToWorldSpace(normalMapSample.rgb, normal, pin.TangentW);
-    mat.Roughness = 1.0f - (1.0f - mat.Roughness) * normalMapSample.a; // alpha 是光泽度：1 = 照常反光，0 = 瓷砖缝里不反光
-#endif
     float3 shadowFactor = float3(1.0f, 1.0f, 1.0f);
     shadowFactor[0] = CalcShadowFactor(pin.shadowPosH); // Lights[0] 是太阳，阴影图是站在太阳那里画的
     float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye,shadowFactor);
-    res = float4(ambient + direct, mat.BaseColor.a);
+    float4 res = float4(ambient + direct, mat.BaseColor.a);
 #ifdef FOG
     res.rgb = ApplyFog(res.rgb, distToEye, FogColorAt(toEye), gPass.FogStart, gPass.FogRange);
 #endif
     return res;
+}
+
+// 延迟：只把表面写进 G-Buffer，不算光（光照 Pass 再算）
+GBufferOut PS_GBuffer(VertexOut pin)
+{
+    MaterialConstants mat;
+    float3 normal;
+    GetSurface(pin, mat, normal);
+    return PackGBuffer(mat, normal);
 }
 
 VertexOut VS_MirrorClear(VertexIn vin)
