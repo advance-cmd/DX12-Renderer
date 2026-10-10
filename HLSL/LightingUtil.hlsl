@@ -2,6 +2,9 @@
 // 用法：在着色器里 #include "LightingUtil.hlsl"，再声明 ConstantBuffer<MaterialConstants> gMat : register(b2)
 
 #define MaxLights 100   // 必须和 C++ FrameResource.h 里的 MaxLights 一致
+#ifndef NUM_EXTRA_LIGHTS
+#define NUM_EXTRA_LIGHTS 0 // 延迟第③步的小灯（C++ 用宏传 0 或 64），排在平行光、点光源、聚光灯后面
+#endif
 static const float PI = 3.14159265f;
 static const float MinRoughness = 0.045f; // 感知粗糙度的下限
 
@@ -172,6 +175,13 @@ float3 ComputeLighting(Light lights[MaxLights], MaterialConstants mat, float3 po
     [unroll]
     for (i = NUM_DIR_LIGHTS + NUM_POINT_LIGHTS; i < NUM_DIR_LIGHTS + NUM_POINT_LIGHTS + NUM_SPOT_LIGHTS; ++i)
         result += ComputeSpotLight(lights[i], mat, pos, normal, toEye);
+#endif
+
+#if (NUM_EXTRA_LIGHTS > 0)
+    // 小灯多：[loop] 不展开（展开 64 份编译慢、着色器也大）
+    [loop]
+    for (i = NUM_DIR_LIGHTS + NUM_POINT_LIGHTS + NUM_SPOT_LIGHTS; i < NUM_DIR_LIGHTS + NUM_POINT_LIGHTS + NUM_SPOT_LIGHTS + NUM_EXTRA_LIGHTS; ++i)
+        result += ComputePointLight(lights[i], mat, pos, normal, toEye);
 #endif
 
     return result;

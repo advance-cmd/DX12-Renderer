@@ -326,7 +326,7 @@ void D3DApp::OnResize()
 
     //让交换链按新尺寸重新分配缓冲
     ThrowIfFailed(mSwapChain->ResizeBuffers(
-        SwapChainBufferCount,mClientWidth,mClientHeight,mBackBufferFormat,0));
+        SwapChainBufferCount,mClientWidth,mClientHeight,mBackBufferFormat,SwapChainFlags())); // 标志必须和建的时候一样
 
     //重建
     CreateSwapChainRTV();
@@ -352,6 +352,18 @@ void D3DApp::InitDxgiFactory()
     flags |= DXGI_CREATE_FACTORY_DEBUG;
 #endif
     ThrowIfFailed(CreateDXGIFactory2(flags, IID_PPV_ARGS(&mDxgiFactory)));
+
+    // 能不能"允许撕裂"：要 IDXGIFactory5（Win10 1607 以上）问一下，拿不到就当不支持
+    ComPtr<IDXGIFactory5> factory5;
+    if (SUCCEEDED(mDxgiFactory.As(&factory5)))
+    {
+        BOOL allowTearing = FALSE;
+        if (SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearing,
+                                                    sizeof(allowTearing))))
+        {
+            mTearingSupported = allowTearing == TRUE;
+        }
+    }
 }
 
 //创建设备：优先用高性能显卡（独显），都不行再用默认显卡，最后回退到 WARP
@@ -477,7 +489,7 @@ void D3DApp::CreateSwapChain()
         .Scaling = DXGI_SCALING_STRETCH,
         .SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD,
         .AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED,
-        .Flags = 0
+        .Flags = SwapChainFlags() // 支持的话带上 ALLOW_TEARING，关垂直同步时才能用
     };
     ComPtr<IDXGISwapChain1> swapChain1;
     ThrowIfFailed(mDxgiFactory->CreateSwapChainForHwnd(

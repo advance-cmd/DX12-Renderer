@@ -83,6 +83,53 @@ float4 PS(VertexOut pin) : SV_Target
     return float4(color, 1.0f);
 }
 
+// ======================== 光体积 ========================
+static const uint kFirstExtraLight = NUM_DIR_LIGHTS + NUM_POINT_LIGHTS + NUM_SPOT_LIGHTS;
+
+struct VolumeIn
+{
+    float3 PosL : POSITION; //球网格只用位置
+};
+
+struct VolumeOut
+{
+    float4 PosH : SV_Position;
+    nointerpolation uint Light : LIGHT; //第几盏灯
+};
+
+VolumeOut VS_LightVolume(VolumeIn vin,uint id : SV_InstanceID){
+    Light L = gPass.Lights[kFirstExtraLight + id];
+    // 球网格就是天空那个：CreateSphere(.5f, 20, 20)。要把它变成半径 = 影响半径的球，再放大 5%
+    float3 posW = vin.PosL * 2.0f * L.FalloffEnd * 1.05f + L.Position;
+    VolumeOut vout;
+    vout.PosH = mul(float4(posW,1.0f),gPass.ViewProj);
+    vout.Light = kFirstExtraLight + id;
+    return vout;
+}
+
+float4 PS_LightVolume(VolumeOut pin) : SV_Target{
+    int2 pixel = int2(pin.PosH.xy);
+    float depth = gDepthMap.Load(int3(pixel,0));
+    if(depth >=1.0f)
+        discard;
+    
+    uint width, height;
+    gDepthMap.GetDimensions(width, height);
+    float2 uv = pin.PosH.xy / float2(width, height);
+    
+    MaterialConstants mat;
+    float3 normal;
+    ReadGBuffer(pixel,mat,normal);
+    float3 posW = WorldPosFromDepth(uv,depth);
+    float3 toEye = gPass.EyePosW - posW;
+    float distToEye = length(toEye);
+    toEye/=distToEye;
+    float3 c = ComputePointLight(gPass.Lights[pin.Light], mat, posW, normal, toEye);
+#ifdef FOG
+    c *= 1.0f - saturate((distToEye - gPass.FogStart) / gPass.FogRange);
+#endif
+    return float4(c, 0.0f); // alpha 用不上
+}
 // ======================== 调试视图（面板上的"G-Buffer 视图"） ========================
 // 色调映射这时临时换成"曝光 0 EV + 截断"，这里输出的线性值经 sRGB 编码直接上屏：
 // 基础色本来就是线性颜色，原样输出；法线、粗糙度这些"数"先做 2.2 次方，上屏后的灰度才等于原值

@@ -111,6 +111,8 @@ static constexpr DXGI_FORMAT kHdrFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 // 0：基础色 + 金属度；1：世界法线 + 粗糙度
 static constexpr DXGI_FORMAT kGBuffer0Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; //RGB：基础色，A：金属度
 static constexpr DXGI_FORMAT kGBuffer1Format = DXGI_FORMAT_R16G16B16A16_FLOAT; //XYZ：世界法线，W：粗糙度
+// 延迟第③步：面板勾"64 盏小灯"时多出来的点光源，排在原来 3 盏后面（Lights[3..66]，MaxLights = 100 够用）
+static constexpr UINT kExtraLights = 64;
 
 // 录 demo 用的 6 个机位（Day18 的参考镜头），ImGui 面板里的下拉框选
 struct CameraPreset
@@ -634,6 +636,7 @@ protected:
         // 面板大小跟着内容走：imgui.ini 记的是像素大小，UI 按 DPI 放大以后旧尺寸装不下，内容会被截掉
         ImGui::Begin("调试", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
         ImGui::Text("帧率 %.0f", ImGui::GetIO().Framerate);
+        ImGui::Checkbox("垂直同步", &mVsync); // 默认关：帧率不锁在屏幕刷新率上，看得出真实的快慢
         ImGui::Checkbox("后期模糊", &mBlurEnabled);
         ImGui::SliderFloat("曝光", &mExposureEV, -4.0f, 4.0f, "%+.1f EV");
         const char* curves[] = {"截断", "Reinhard", "ACES", "AgX"};
@@ -648,6 +651,14 @@ protected:
         {
             const char* gbufferViews[] = {"关", "基础色", "法线", "粗糙度", "金属度", "深度", "世界坐标"};
             ImGui::Combo("G-Buffer 视图", &mGBufferView, gbufferViews, IM_ARRAYSIZE(gbufferViews));
+        }
+        if (ImGui::Checkbox("64 盏小灯", &mManyLights))
+        {
+            ReloadShaders(); // 小灯的数量是编译着色器时传的宏（NUM_EXTRA_LIGHTS），换了要重编
+        }
+        if (mDeferred && mManyLights) // 只有延迟 + 小灯时才有两种画法可选
+        {
+            ImGui::Checkbox("光体积", &mLightVolumes); // 勾上：每盏小灯画一个球；不勾：全屏 Pass 里循环 64 盏
         }
         bool sunChanged = ImGui::SliderFloat("太阳方位角", &mSunAzimuth, -180.0f, 180.0f, "%.1f°");
         sunChanged |= ImGui::SliderFloat("太阳仰角", &mSunElevation, 5.0f, 85.0f, "%.1f°");
@@ -744,6 +755,9 @@ protected:
      *     ②b 光照       全屏三角形
      *        渲染目标：HDR | 深度：无（深度这时当 SRV 读）| PSO：mDeferredLightPSO，选了 G-Buffer 视图时换 mGBufferViewPSO[v]
      *        根签名：主（根参数 8 = G-Buffer + 深度）
+     *        勾了"64 盏小灯"+"光体积"时：全屏这次换 mDeferredLightBasePSO（只算原来 3 盏），接着 ↓
+     *     ②c 光体积     64 个球，一次实例化画完
+     *        渲染目标：HDR（加法混合，叠在 ②b 上）| 深度：无 | PSO：mLightVolumePSO | 根签名：主
      *   ③ 天空、镜子、倒影、透明
      *        渲染目标：HDR | 深度：主深度 | PSO：各物体的 PSO | 根签名：主
      *   ④ Bloom         DoBloom，全屏三角形
@@ -904,7 +918,11 @@ protected:
         ThrowIfFailed(mCommandList->Close());
         ID3D12CommandList* cmdLists[] = {mCommandList.Get()};
         mCommandQueue->ExecuteCommandLists(_countof(cmdLists), cmdLists);
-        ThrowIfFailed(mSwapChain->Present(0, 0));
+        // 垂直同步：开 = 等下一次屏幕刷新再换（1）；关 = 不等（0），而且要带上 ALLOW_TEARING——
+        // 只写 0 的话，窗口模式下 DWM 合成照样按刷新率取帧，双缓冲时帧率还是被卡在刷新率（实测 144 Hz 屏卡在 142～144）
+        const UINT syncInterval = mVsync ? 1 : 0;
+        const UINT presentFlags = (!mVsync && mTearingSupported) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+        ThrowIfFailed(mSwapChain->Present(syncInterval, presentFlags));
 
         // 不再每帧 Flush：给这份帧资源记下 Fence 值。GPU 执行到这条 Signal 时，Fence 才会变成这个值，
         // 3 帧后轮回到这份帧资源时，WaitForCurrentFrameResource 就靠它判断 GPU 用完没有
@@ -1110,11 +1128,16 @@ private:
         pc.Lights[2].Position = {-2.8f, 11.9f, -40.0f};
         pc.Lights[2].Direction = {0.0f, -1.0f, 0.0f};
         pc.Lights[2].SpotPower = 32.0f;
+        if (mManyLights)
+        {
+            FillExtraLights(pc);
+        }
         mCurrentFrame->PassCB->CopyData(0, pc);
 
         PassConstants reflectedPass = pc; // 其余都一样，只把灯反射一下
         const XMMATRIX R = XMMatrixReflect(XMLoadFloat4(&mMirrorPlane));
-        for (int i = 0; i < 3; ++i)
+        const int lightCount = 3 + (mManyLights ? (int)kExtraLights : 0); // 小灯也要反射，镜子里才照得到
+        for (int i = 0; i < lightCount; ++i)
         {
             // 方向：只转不平移（w = 0）；位置：要平移（w = 1）
             XMStoreFloat3(&reflectedPass.Lights[i].Direction,
@@ -1130,6 +1153,24 @@ private:
         PassConstants shadowPass = pc;
         XMStoreFloat4x4(&shadowPass.ViewProj, XMMatrixTranspose(XMLoadFloat4x4(&mLightViewProj)));
         mCurrentFrame->PassCB->CopyData(2, shadowPass);
+    }
+
+    // 第③步的 64 盏小灯：8×8 排在地砖、木箱、测试球一带，离地 0.7，影响半径 4，色相按编号转一圈
+    void FillExtraLights(PassConstants& pc) const
+    {
+        for (UINT i = 0; i < kExtraLights; i++)
+        {
+            const float x = -8.0f + 24.0f * (float)(i % 8) / 7.0f;
+            const float z = -42.0f + 26.0f * (float)(i / 8) / 7.0f;
+            Light& L = pc.Lights[3 + i];
+            L.Position = {x, (std::max)(GetHillsHeight(x, z), 0.05f) + 0.7f, z}; // 水面以下的地方按水面高度算
+            L.FalloffStart = 0.0f;
+            L.FalloffEnd = 4.0f; // 影响半径：光体积的球就按它放大
+            L.Direction = {0.0f, -1.0f, 0.0f};
+            L.SpotPower = 0.0f;
+            const XMVECTOR rgb = XMColorHSVToRGB(XMVectorSet((float)i / kExtraLights, 0.7f, 1.0f, 1.0f));
+            XMStoreFloat3(&L.Strength, rgb * 3.0f); // 发光强度：1 个单位外亮度 3
+        }
     }
 
     // 灯是固定的，其实算一次就够；放在每帧算，以后让太阳动起来也不用改
@@ -2234,11 +2275,14 @@ private:
     //编译着色器
     void BuildShadersAndInputLayout()
     {
+        // 第③步的小灯：数量也用宏传（排在原来 3 盏后面），勾选"64 盏小灯"时 ReloadShaders 重编
+        const std::string extraLights = std::to_string(mManyLights ? kExtraLights : 0);
         // 灯的数量用宏传给着色器，顺序必须和 UpdateMainPassCB 里填灯的顺序一致：先平行光，再点光源，最后聚光灯
         const D3D_SHADER_MACRO lightDefines[] = {
             {"NUM_DIR_LIGHTS", "1"},
             {"NUM_POINT_LIGHTS", "1"},
             {"NUM_SPOT_LIGHTS", "1"},
+            {"NUM_EXTRA_LIGHTS", extraLights.c_str()},
             {"FOG", "1"},
             {nullptr, nullptr}
         };
@@ -2247,6 +2291,7 @@ private:
             {"NUM_DIR_LIGHTS", "1"},
             {"NUM_POINT_LIGHTS", "1"},
             {"NUM_SPOT_LIGHTS", "1"},
+            {"NUM_EXTRA_LIGHTS", extraLights.c_str()},
             {"FOG", "1"},
             {"ENV_REFLECT", "1"},
             {nullptr, nullptr}
@@ -2256,6 +2301,7 @@ private:
             {"NUM_DIR_LIGHTS", "1"},
             {"NUM_POINT_LIGHTS", "1"},
             {"NUM_SPOT_LIGHTS", "1"},
+            {"NUM_EXTRA_LIGHTS", extraLights.c_str()},
             {"FOG", "1"},
             {"NORMAL_MAP", "1"},
             {nullptr, nullptr}
@@ -2265,6 +2311,7 @@ private:
             {"NUM_DIR_LIGHTS", "1"},
             {"NUM_POINT_LIGHTS", "1"},
             {"NUM_SPOT_LIGHTS", "1"},
+            {"NUM_EXTRA_LIGHTS", extraLights.c_str()},
             {"FOG", "1"},
             {"LAND_TEX", "1"},
             {nullptr, nullptr}
@@ -2275,6 +2322,7 @@ private:
             {"NUM_DIR_LIGHTS", "1"},
             {"NUM_POINT_LIGHTS", "1"},
             {"NUM_SPOT_LIGHTS", "1"},
+            {"NUM_EXTRA_LIGHTS", extraLights.c_str()},
             {"FOG", "1"},
             {"NO_DIFFUSE_MAP", "1"},
             {nullptr, nullptr}
@@ -2284,6 +2332,7 @@ private:
             {"NUM_DIR_LIGHTS", "1"},
             {"NUM_POINT_LIGHTS", "1"},
             {"NUM_SPOT_LIGHTS", "1"},
+            {"NUM_EXTRA_LIGHTS", extraLights.c_str()},
             {"FOG", "1"},
             {"ALPHA_TEST", "1"},
             {nullptr, nullptr}
@@ -2372,6 +2421,20 @@ private:
             lightDefines,
             "PS",
             "ps_6_6");
+
+        // 第③步光体积模式：全屏 Pass 只算原来的 3 盏（没有 NUM_EXTRA_LIGHTS = 0），64 盏小灯交给光体积。
+        // 光体积的 VS / PS 也用这组宏：它们只要知道"小灯从第几盏开始"（1 + 1 + 1 = 3）
+        const D3D_SHADER_MACRO baseLightDefines[] = {
+            {"NUM_DIR_LIGHTS", "1"},
+            {"NUM_POINT_LIGHTS", "1"},
+            {"NUM_SPOT_LIGHTS", "1"},
+            {"FOG", "1"},
+            {nullptr, nullptr}
+        };
+
+        mDeferredBasePSByteCode = CompileShader(L"HLSL\\Deferred.hlsl", baseLightDefines, "PS", "ps_6_6");
+        mLightVolumeVSByteCode = CompileShader(L"HLSL\\Deferred.hlsl", lightDefines, "VS_LightVolume", "vs_6_6");
+        mLightVolumePSByteCode = CompileShader(L"HLSL\\Deferred.hlsl", lightDefines, "PS_LightVolume", "ps_6_6");
     }
 
     void BuildPSO()
@@ -2687,6 +2750,21 @@ private:
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(
             &lightDesc,
             IID_PPV_ARGS(&mDeferredLightPSO)));
+
+        // 光体积模式的全屏 Pass：和 mDeferredLightPSO 只差一个 PS
+        lightDesc.PS = {mDeferredBasePSByteCode->GetBufferPointer(), mDeferredBasePSByteCode->GetBufferSize()};
+        // CreateGraphicsPipelineState → mDeferredLightBasePSO
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&lightDesc, IID_PPV_ARGS(&mDeferredLightBasePSO)));
+        // 光体积：从 lightDesc 复制，"不测深度、DSV = UNKNOWN、写 HDR、主根签名"都继承下来
+        auto volumeDesc = lightDesc;
+        volumeDesc.InputLayout = {mCrateInputLayout.data(), (UINT)mCrateInputLayout.size()}; // 这次画的是真网格（天空球用的是哪个布局？）
+        // VS = mLightVolumeVSByteCode，PS = mLightVolumePSByteCode
+        volumeDesc.VS = {mLightVolumeVSByteCode->GetBufferPointer(), mLightVolumeVSByteCode->GetBufferSize()};
+        volumeDesc.PS = {mLightVolumePSByteCode->GetBufferPointer(), mLightVolumePSByteCode->GetBufferSize()};
+        volumeDesc.RasterizerState.CullMode = D3D12_CULL_MODE_FRONT;
+        volumeDesc.BlendState.RenderTarget[0] = add;
+        // CreateGraphicsPipelineState → mLightVolumePSO
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&volumeDesc, IID_PPV_ARGS(&mLightVolumePSO)));
     }
 
     // 高斯权重：G(x) = exp(-x² / 2σ²)，x 从 -半径 到 +半径，最后除以总和，让它们加起来等于 1。
@@ -3077,10 +3155,16 @@ private:
             1, &hdrRtv, true, nullptr);
         mCommandList->SetGraphicsRootDescriptorTable(8, HeapGpuHandle(25));
 
-        ID3D12PipelineState* pso =
-            mGBufferView > 0
-                ? mGBufferViewPSO[mGBufferView - 1].Get()
-                : mDeferredLightPSO.Get();
+        // 光体积模式：开了小灯、选了光体积、没在看调试视图
+        const bool volumes = mManyLights && mLightVolumes && mGBufferView == 0;
+
+        ID3D12PipelineState* pso = nullptr;
+        if (mGBufferView > 0)
+            pso = mGBufferViewPSO[mGBufferView - 1].Get(); // 调试视图
+        else if (volumes)
+            pso = mDeferredLightBasePSO.Get(); // 光体积模式：全屏只算原来 3 盏
+        else
+            pso = mDeferredLightPSO.Get(); // 平时：全屏把所有灯都算了
 
         mCommandList->SetPipelineState(pso);
 
@@ -3088,6 +3172,18 @@ private:
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
         mCommandList->DrawInstanced(3, 1, 0, 0);
+
+        if (volumes)
+        {
+            const DX_Utils::SubmeshGeometry& sphere = mShapeGeo->DrawArgs.at("sphere");
+            D3D12_VERTEX_BUFFER_VIEW vbv = mShapeGeo->VertexBufferView();
+            D3D12_INDEX_BUFFER_VIEW ibv = mShapeGeo->IndexBufferView();
+            mCommandList->IASetVertexBuffers(0, 1, &vbv);
+            mCommandList->IASetIndexBuffer(&ibv);
+            mCommandList->SetPipelineState(mLightVolumePSO.Get());
+            mCommandList->DrawIndexedInstanced(sphere.IndexCount, kExtraLights, sphere.StartIndexLocation,
+                                               sphere.BaseVertexLocation, 0);
+        }
 
         // ④ 后续前向绘制还要测深度、写模板：把深度状态恢复
         /* 深度：PIXEL_SHADER_RESOURCE → DEPTH_WRITE */
@@ -3123,6 +3219,7 @@ private:
     std::unique_ptr<DX_Utils::MeshGeometry> mTreeGeo;
     // 后期模糊：A = mBlurMap[0]（场景复制进来，最终结果也在它里面），B = mBlurMap[1]（存横向模糊的结果）
     ComPtr<ID3D12Resource> mBlurMap[2];
+    bool mVsync = false; // 面板"垂直同步"：默认关
     bool mBlurEnabled = false; // B 键开关，默认关
     bool mBlurKeyWasDown = false;
     int mBlurCount = 4; // "横向 + 纵向"算一次，重复几次。越多越糊
@@ -3266,6 +3363,13 @@ private:
     ComPtr<ID3DBlob> mDeferredVSByteCode;
     ComPtr<ID3DBlob> mGBufferViewPSByteCode[kGBufferViews];
     ComPtr<ID3D12PipelineState> mGBufferViewPSO[kGBufferViews];
+    // 第③步：64 盏小灯（面板勾选，Lights[3..66]）。延迟 + 小灯时可以选光体积：每盏灯画一个球，只算球盖住的像素
+    bool mManyLights = false;
+    bool mLightVolumes = true;
+    ComPtr<ID3DBlob> mDeferredBasePSByteCode; // 光体积模式的全屏 Pass：只算原来的 3 盏（baseLightDefines 编的 PS）
+    ComPtr<ID3D12PipelineState> mDeferredLightBasePSO;
+    ComPtr<ID3DBlob> mLightVolumeVSByteCode, mLightVolumePSByteCode;
+    ComPtr<ID3D12PipelineState> mLightVolumePSO;
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, int nShowCmd)

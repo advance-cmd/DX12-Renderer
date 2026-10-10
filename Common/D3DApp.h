@@ -114,6 +114,10 @@ protected:
 
     ComPtr<IDXGISwapChain3> mSwapChain;
     static constexpr UINT SwapChainBufferCount = 2;   // 双缓冲
+    // 显卡和系统支持"允许撕裂"：关垂直同步时 Present 带上 DXGI_PRESENT_ALLOW_TEARING，帧率才不会被刷新率卡住。
+    // 建交换链和 ResizeBuffers 时都要带同一个标志（SwapChainFlags），否则 Present 带这个标志会报错
+    bool mTearingSupported = false;
+    UINT SwapChainFlags() const { return mTearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u; }
     UINT mClientWidth = 0;
     UINT mClientHeight = 0;
     ComPtr<ID3D12Resource> mSwapChainBuffer[SwapChainBufferCount];
