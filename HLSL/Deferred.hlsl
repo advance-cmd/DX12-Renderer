@@ -69,6 +69,8 @@ float4 PS(VertexOut pin) : SV_Target
 
     // 以下沿用前向 PS 的光照计算
     float3 ambient = gPass.AmbientLight.rgb * (DiffuseColor(mat) + F0(mat));
+    // SSAO：遮蔽图是半分辨率，用双线性 + 夹边的采样器放大回全屏。只压环境光，直接光不受影响
+    ambient *= gAoMap.SampleLevel(gsamLinearClamp, pin.UV, 0);
 
     float3 toEye = gPass.EyePosW - posW;
     float distToEye = length(toEye);
@@ -228,9 +230,38 @@ float PS_Ssao(VertexOut pin): SV_Target{
         float dist = length(v);
         float dp = max(dot(n, v / max(dist, 1e-4f)), 0.0f); // r 在 p 正上方挡得最多，贴着表面的不算
         occlusionSum += dp * OcclusionFunction(dist);
+        
     }
     float access = 1 - occlusionSum / kAoSamples; // 14 个点平均挡住了多少 → 没被挡住的比例
     return saturate(pow(access, kAoPower));
+}
+
+// 横、竖各一趟：编译时带宏 AO_BLUR_VERTICAL 的是竖的
+float PS_SsaoBlur(VertexOut pin) : SV_Target{
+    #ifdef AO_BLUR_VERTICAL
+        const int2 dir = int2(0, 1); // 竖着走：每一步 x 加几、y 加几
+    #else
+        const int2 dir = int2(1, 0);
+    #endif
+    int2 aoPixel = int2(pin.PosH.xy);   // 遮蔽图上的像素
+    float3 centerN = gGBuffer1.Load(int3(aoPixel*2,0)).xyz;
+    float centerZ = ViewDepth(gDepthMap.Load(int3(aoPixel * 2, 0)));
+    
+    float sum = 0.0f;
+    float weightSum = 0.0f;
+    [unroll]
+    for(int i=-5;i<=5;i++){
+        int2 a = aoPixel + i * dir; // 左右（或上下）各 5 个邻居，i = 0 是自己
+        float3 neighborN = gGBuffer1.Load(int3(a*2,0)).xyz;   // 邻居 a 对应的 G-Buffer 像素
+        float neighborZ = ViewDepth(gDepthMap.Load(int3(a*2,0)));
+        // 自己一定算；邻居要法线夹角小于约 37°（cos = 0.8）、远近差不到 0.2，才当成同一块表面
+        if (i == 0 || (dot(neighborN, centerN) >= 0.8f && abs(neighborZ - centerZ) <= 0.2f))
+        {
+            sum += kBlurWeights[i+5] * gAoMap.Load(int3(a, 0)); // i 是 -5～5，数组下标是 0～10
+            weightSum += kBlurWeights[i+5];
+        }
+    }
+    return sum / weightSum;
 }
 
 // ======================== 调试视图（面板上的"G-Buffer 视图"） ========================
