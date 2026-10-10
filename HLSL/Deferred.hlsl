@@ -1,5 +1,5 @@
 // 延迟渲染：读 G-Buffer 的全屏 Pass（光照 Pass + 调试视图）
-// 根签名用主根签名：b1 = Pass 常量，t6～t8 = 两张 G-Buffer + 深度缓冲（根参数 8，堆第 25～27 格）
+// 根签名用主根签名：b1 = Pass 常量，t6～t8 = 两张 G-Buffer + 深度缓冲（根参数 8，堆第 25～27 格），t9 = SSAO 遮蔽图（根参数 9）
 // 光照 Pass 还要用 LightingUtil.hlsl 里的 t1 阴影图、t2 天空图（雾色），Draw() 进 DrawDeferred 之前已经绑好
 #include "LightingUtil.hlsl"
 
@@ -8,6 +8,8 @@ ConstantBuffer<PassConstants> gPass : register(b1);
 Texture2D gGBuffer0 : register(t6);        // rgb 基础色，a 金属度（sRGB 格式，读出来已经换回线性值）
 Texture2D gGBuffer1 : register(t7);        // xyz 世界法线，w 粗糙度
 Texture2D<float> gDepthMap : register(t8); // 深度缓冲（R24_UNORM_X8_TYPELESS：只读前 24 位深度）
+Texture2D<float> gAoMap : register(t9);    // SSAO 的遮蔽图（半分辨率，R8）：1 = 完全没被挡，0 = 全挡住。根参数 9
+SamplerState gsamLinearClamp : register(s2); // 双线性 + 夹边：光照 Pass 把半分辨率的遮蔽图放大回全屏时用
 
 struct VertexOut
 {
@@ -130,6 +132,55 @@ float4 PS_LightVolume(VolumeOut pin) : SV_Target{
 #endif
     return float4(c, 0.0f); // alpha 用不上
 }
+// ======================== SSAO ========================
+// 环境光是"从四面八方来的光"。一个点周围挤着别的东西（墙角、箱子底下、缝里），能照到它的环境光就少。
+// 遮蔽 Pass 对每个像素估一个 0～1 的数（1 = 四周空旷），模糊两趟去掉噪点，光照 Pass 再拿它去乘环境光。
+
+// ---- 数据和小工具（AI 写的） ----
+static const int kAoSamples = 14;         // 每个像素在周围试 14 个点
+static const float kAoRadius = 0.5f;      // 试的点离这个像素多远（世界单位）
+static const float kAoFadeStart = 0.2f;   // 挡住我的东西离我这么近以内：算完全挡住
+static const float kAoFadeEnd = 1.0f;     // 远到这么多：不算挡（中间线性过渡）
+static const float kAoEpsilon = 0.05f;    // 比这还近：当成我自己所在的那个面，不算
+static const float kAoPower = 4.0f;       // 最后做几次方：越大，暗的地方越暗
+
+// 14 个方向：立方体的 8 个角 + 6 个面的中心，方向分布均匀；长度是 0.25～1 之间定死的随机数
+static const float3 kAoOffsets[14] = {
+    float3( 0.216f,  0.216f,  0.216f), float3(-0.443f, -0.443f, -0.443f),
+    float3(-0.419f,  0.419f,  0.419f), float3( 0.352f, -0.352f, -0.352f),
+    float3( 0.238f,  0.238f, -0.238f), float3(-0.488f, -0.488f,  0.488f),
+    float3(-0.494f,  0.494f, -0.494f), float3( 0.366f, -0.366f,  0.366f),
+    float3(-0.629f,  0.000f,  0.000f), float3( 0.427f,  0.000f,  0.000f),
+    float3( 0.000f, -0.252f,  0.000f), float3( 0.000f,  0.528f,  0.000f),
+    float3( 0.000f,  0.000f, -0.689f), float3( 0.000f,  0.000f,  0.302f)
+};
+
+uint Pcg(uint v)
+{
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+// 每个像素一个固定的"随机"单位向量：同一个像素每帧都一样（画面不闪），相邻像素之间没有规律
+float3 RandomVec(int2 p)
+{
+    uint h = Pcg((uint)p.x + Pcg((uint)p.y));
+    float3 v = float3(h & 1023u, (h >> 10) & 1023u, (h >> 20) & 1023u) / 1023.0f;
+    return normalize(v * 2.0f - 1.0f + 1e-4f);
+}
+
+// 深度缓冲里的值 → 离相机多远（观察空间的 z）。近平面 1、远平面 1000，和 OnResize 里的 SetLens 一致
+float ViewDepth(float depth)
+{
+    return 1000.0f / (1000.0f - 999.0f * depth);
+}
+
+// 模糊的 11 个权重：高斯，σ = 2.5，加起来等于 1。kBlurWeights[5] 是中间那个
+static const float kBlurWeights[11] = {
+    0.0222f, 0.0456f, 0.0798f, 0.1191f, 0.1514f, 0.1640f, 0.1514f, 0.1191f, 0.0798f, 0.0456f, 0.0222f
+};
+
 // ======================== 调试视图（面板上的"G-Buffer 视图"） ========================
 // 色调映射这时临时换成"曝光 0 EV + 截断"，这里输出的线性值经 sRGB 编码直接上屏：
 // 基础色本来就是线性颜色，原样输出；法线、粗糙度这些"数"先做 2.2 次方，上屏后的灰度才等于原值
@@ -152,9 +203,11 @@ float4 PS_GBufferView(VertexOut pin) : SV_Target
 #elif GBUFFER_VIEW == 4
     c = mat.Metallic;
 #elif GBUFFER_VIEW == 5
-    // 深度缓冲里的值和距离不成正比（近处变得快，远处全挤在 1 附近），换回观察空间的 z 再显示。近平面 1、远平面 1000
-    float viewZ = 1000.0f / (1000.0f - 999.0f * depth);
-    c = depth >= 1.0f ? 1.0f : saturate(viewZ / 150.0f);
+    // 深度缓冲里的值和距离不成正比（近处变得快，远处全挤在 1 附近），换回观察空间的 z 再显示
+    c = depth >= 1.0f ? 1.0f : saturate(ViewDepth(depth) / 150.0f);
+#elif GBUFFER_VIEW == 7
+    // SSAO 的遮蔽图（半分辨率，所以除以 2；不过滤，看到的就是存的值）：白 = 没被挡，黑 = 挡住了
+    c = gAoMap.Load(int3(pixel / 2, 0));
 #else
     // 世界坐标：每 2 个单位一条白色格线（xz 平面），底色按每 8 个单位循环。
     // 反推对了，挪相机时格子钉在物体表面上；反推错了，格子会跟着视角滑动、变形

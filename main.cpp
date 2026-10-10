@@ -103,7 +103,7 @@ enum class DrawPass
     GBuffer // 延迟：只写材质和法线
 };
 
-static constexpr UINT kTimestampCount = 9;
+static constexpr UINT kTimestampCount = 10;
 static constexpr UINT kShadowMapSize = 4096;
 
 //场景先画进这张 HDR 纹理，每个通道 16 位浮点，亮度可以超过 1，最后再压到后台缓冲
@@ -111,6 +111,8 @@ static constexpr DXGI_FORMAT kHdrFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 // 0：基础色 + 金属度；1：世界法线 + 粗糙度
 static constexpr DXGI_FORMAT kGBuffer0Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; //RGB：基础色，A：金属度
 static constexpr DXGI_FORMAT kGBuffer1Format = DXGI_FORMAT_R16G16B16A16_FLOAT; //XYZ：世界法线，W：粗糙度
+// SSAO 的遮蔽图：每个像素只存一个 0～1 的数，一个 8 位通道就够（1 字节）
+static constexpr DXGI_FORMAT kAoFormat = DXGI_FORMAT_R8_UNORM;
 // 延迟第③步：面板勾"64 盏小灯"时多出来的点光源，排在原来 3 盏后面（Lights[3..66]，MaxLights = 100 够用）
 static constexpr UINT kExtraLights = 64;
 
@@ -649,8 +651,11 @@ protected:
         ImGui::Checkbox("延迟渲染", &mDeferred);
         if (mDeferred) // 调试视图只有延迟模式才有（要读 G-Buffer）
         {
-            const char* gbufferViews[] = {"关", "基础色", "法线", "粗糙度", "金属度", "深度", "世界坐标"};
-            ImGui::Combo("G-Buffer 视图", &mGBufferView, gbufferViews, IM_ARRAYSIZE(gbufferViews));
+            // 第 7 个"环境光遮蔽"要等 SSAO 第①步写完、把 kGBufferViews 改成 7 才会出现在下拉框里
+            const char* gbufferViews[] = {"关", "基础色", "法线", "粗糙度", "金属度", "深度", "世界坐标", "环境光遮蔽"};
+            ImGui::Combo("G-Buffer 视图", &mGBufferView, gbufferViews, 1 + kGBufferViews);
+            ImGui::Checkbox("SSAO", &mSsao); // 关掉 = 遮蔽图清成全白（1 = 没被挡），环境光不变暗
+            ImGui::SliderInt("AO 模糊次数", &mSsaoBlurCount, 0, 4); // "横 + 竖"算一次；0 = 看没模糊的噪点
         }
         if (ImGui::Checkbox("64 盏小灯", &mManyLights))
         {
@@ -728,8 +733,8 @@ protected:
                 mPassSamples = 0;
                 // 基类每秒刷新一次标题（CalculateFrameStats），会把这段文字带上
                 mMainWndCaption = std::format(
-                    L"LearnDX12    移速 {:.1f}    GPU：阴影图 {:.3f} | 不透明/G-Buffer {:.3f} | 光照 {:.3f} | 天空+镜子 {:.3f} | 透明 {:.3f} | Bloom {:.3f} | 色调映射 {:.3f} | 模糊 {:.3f} ms",
-                    mCamera.GetMoveSpeed(), avg[0], avg[1], avg[2], avg[3], avg[4], avg[5], avg[6], avg[7]);
+                    L"LearnDX12    移速 {:.1f}    GPU：阴影图 {:.3f} | 不透明/G-Buffer {:.3f} | SSAO {:.3f} | 光照 {:.3f} | 天空+镜子 {:.3f} | 透明 {:.3f} | Bloom {:.3f} | 色调映射 {:.3f} | 模糊 {:.3f} ms",
+                    mCamera.GetMoveSpeed(), avg[0], avg[1], avg[2], avg[3], avg[4], avg[5], avg[6], avg[7], avg[8]);
             }
         }
 
@@ -823,7 +828,7 @@ protected:
         // 两条路出来时一样：HDR 纹理 + 深度缓冲绑着，深度里是不透明物体的深度
         if (mDeferred)
         {
-            DrawDeferred(rtv, dsv, tsBase); // T2、T3 在里面
+            DrawDeferred(rtv, dsv, tsBase); // T2、T3、T4 在里面
         }
         else
         {
@@ -834,7 +839,8 @@ protected:
                 DrawRenderItems(mRitemLayer[(int)RenderLayer::TestSpheres]);
             }
             mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 2); // T2
-            mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 3); // T3：前向没有单独的光照 Pass
+            mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 3); // T3：前向没有 SSAO
+            mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 4); // T4：前向没有单独的光照 Pass
         }
 
         // G-Buffer 视图只看 G-Buffer 里存的东西：天空、镜子、透明物体都不画。前向模式下没有 G-Buffer，下拉框不算数
@@ -851,13 +857,13 @@ protected:
             mCommandList->SetGraphicsRootConstantBufferView(2, passCB); // 换回主 Pass 常量，后面的镜子和水要用
             mCommandList->OMSetStencilRef(0); // 用完恢复
         }
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 4); // T4
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 5); // T5
         // 平面阴影（第 11 章的 Shadow 层）已经被阴影贴图取代，不再画；再画会和阴影贴图的影子叠成双重影子
         if (!gbufferView)
         {
             DrawRenderItems(mRitemLayer[(int)RenderLayer::Transparent]);
         }
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 5); // T5
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 6); // T6
 
         // 色调映射：HDR 纹理 → 后台缓冲。HDR 纹理先从"被写"转成"被读"，帧末就停在这个状态（约定）
         auto hdrToSrv = CD3DX12_RESOURCE_BARRIER::Transition(
@@ -867,7 +873,7 @@ protected:
         {
             DoBloom();
         }
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 6); // T6
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 7); // T7
         //Bloom Pass 把视口改成了Bloom图的大小，这里换回屏幕的
         mCommandList->RSSetViewports(1, &mScreenViewport);
         mCommandList->RSSetScissorRects(1, &mScissorRect);
@@ -890,12 +896,12 @@ protected:
         mCommandList->SetPipelineState(mTonemapPSO.Get());
         mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         mCommandList->DrawInstanced(3, 1, 0, 0); // 3 个顶点 = 一个盖住全屏的大三角形，位置在 VS 里按 SV_VertexID 算
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 7); // T7
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 8); // T8
         if (mBlurEnabled)
         {
             DoBlur();
         }
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 8); // T8
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 9); // T9
         // UI 最后画：盖在最上面，不被模糊，也不做深度测试。放在 T8 后面，不算进"模糊"的耗时
         // 画在后台缓冲上：rtv 现在是 HDR 纹理，画进去就不会再上屏了
         mCommandList->OMSetRenderTargets(1, &backRtv, true, nullptr);
@@ -3150,6 +3156,10 @@ private:
                                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
         };
         mCommandList->ResourceBarrier(_countof(toRead), toRead);
+
+        // SSAO 的两趟（遮蔽 + 模糊）画在这里：G-Buffer 和深度刚变成可读
+
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 3); // T3：SSAO 做完
         // ③ 光照 Pass（选了 G-Buffer 视图时换成调试视图）：全屏三角形读 G-Buffer 和深度，输出到 HDR 纹理
         mCommandList->OMSetRenderTargets(
             1, &hdrRtv, true, nullptr);
@@ -3197,7 +3207,7 @@ private:
         mCommandList->EndQuery(
             mTimestampHeap.Get(),
             D3D12_QUERY_TYPE_TIMESTAMP,
-            tsBase + 3); // T3：光照 / 调试视图完成
+            tsBase + 4); // T4：光照 / 调试视图完成
     }
 
     // ======================== 成员变量 ========================
@@ -3370,6 +3380,17 @@ private:
     ComPtr<ID3D12PipelineState> mDeferredLightBasePSO;
     ComPtr<ID3DBlob> mLightVolumeVSByteCode, mLightVolumePSByteCode;
     ComPtr<ID3D12PipelineState> mLightVolumePSO;
+
+    // SSAO（只在延迟渲染下有：法线和深度直接读 G-Buffer）。面板开关
+    bool mSsao = true;
+    int mSsaoBlurCount = 2; // 双边模糊做几次（横 + 竖算一次）
+    // 遮蔽图两张，半分辨率 kAoFormat：[0] 遮蔽 Pass 写、最终结果也在它里面（堆第 28 格），[1] 模糊时来回倒用（堆第 29 格）
+    ComPtr<ID3D12Resource> mSsaoMap[2];
+    ComPtr<ID3D12DescriptorHeap> mSsaoRtvHeap;
+    ComPtr<ID3DBlob> mSsaoPSByteCode;
+    ComPtr<ID3D12PipelineState> mSsaoPSO;
+    ComPtr<ID3DBlob> mSsaoBlurPSByteCode[2]; // [0] 横，[1] 竖
+    ComPtr<ID3D12PipelineState> mSsaoBlurPSO[2];
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, int nShowCmd)
