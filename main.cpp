@@ -243,6 +243,7 @@ public:
         BuildHdrResources();
         BuildBloomResources();
         BuildGBufferResources();
+        BuildSSAOResource();
         BuildTimestampQueries(); //Pass时间记录
         BuildShadowMap(); //构建阴影贴图资源和View
         BuildShapeGeometry(); // 录制复制命令（木箱）
@@ -309,6 +310,7 @@ protected:
             BuildHdrResources();
             BuildBloomResources();
             BuildGBufferResources();
+            BuildSSAOResource();
         }
     }
 
@@ -1326,7 +1328,7 @@ private:
     {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {
             .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            .NumDescriptors = 28,
+            .NumDescriptors = 30,
             /* 0～4 纹理，
              * 5～8 模糊用的两张纹理（各一个 SRV、一个 UAV），
              * 9 阴影图的 SRV，10天空图   
@@ -1337,6 +1339,7 @@ private:
              * 19～24 是 Bloom 的 6 个 SRV
              * 25~26 Gbuffer0~1
              * 27 原来的深度缓冲
+             * 28～29 SSAO 的两张遮蔽图
              */
             .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, // 着色器要从这个堆里读（RTV/DSV 堆不用，所以是 NONE）
             .NodeMask = 0,
@@ -2205,7 +2208,10 @@ private:
         CD3DX12_DESCRIPTOR_RANGE gbufferRange;
         gbufferRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 6); //t6~7 Gbuffer0~1，t8 深度
 
-        CD3DX12_ROOT_PARAMETER slotRootParameter[9];
+        CD3DX12_DESCRIPTOR_RANGE aoRange;
+        aoRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 9); //t9~10 AO 0-1
+
+        CD3DX12_ROOT_PARAMETER slotRootParameter[10];
         slotRootParameter[0].InitAsConstantBufferView(0);
         slotRootParameter[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
         slotRootParameter[2].InitAsConstantBufferView(1);
@@ -2215,6 +2221,7 @@ private:
         slotRootParameter[6].InitAsDescriptorTable(1, &tileNormalRange, D3D12_SHADER_VISIBILITY_PIXEL);
         slotRootParameter[7].InitAsDescriptorTable(1, &landRange, D3D12_SHADER_VISIBILITY_PIXEL);
         slotRootParameter[8].InitAsDescriptorTable(1, &gbufferRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        slotRootParameter[9].InitAsDescriptorTable(1, &aoRange, D3D12_SHADER_VISIBILITY_PIXEL);
 
         CD3DX12_STATIC_SAMPLER_DESC samplers[2] = {
             CD3DX12_STATIC_SAMPLER_DESC(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR),
@@ -2441,6 +2448,8 @@ private:
         mDeferredBasePSByteCode = CompileShader(L"HLSL\\Deferred.hlsl", baseLightDefines, "PS", "ps_6_6");
         mLightVolumeVSByteCode = CompileShader(L"HLSL\\Deferred.hlsl", lightDefines, "VS_LightVolume", "vs_6_6");
         mLightVolumePSByteCode = CompileShader(L"HLSL\\Deferred.hlsl", lightDefines, "PS_LightVolume", "ps_6_6");
+
+        mSsaoPSByteCode = CompileShader(L"HLSL\\Deferred.hlsl", lightDefines, "PS_Ssao", "ps_6_6");
     }
 
     void BuildPSO()
@@ -2771,6 +2780,11 @@ private:
         volumeDesc.BlendState.RenderTarget[0] = add;
         // CreateGraphicsPipelineState → mLightVolumePSO
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&volumeDesc, IID_PPV_ARGS(&mLightVolumePSO)));
+
+        auto ssaoDesc = lightDesc; // 全屏三角形、不测深度、主根签名，都继承下来
+        ssaoDesc.RTVFormats[0] = kAoFormat;
+        ssaoDesc.PS = {mSsaoPSByteCode->GetBufferPointer(), mSsaoPSByteCode->GetBufferSize()};
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&ssaoDesc, IID_PPV_ARGS(&mSsaoPSO)));
     }
 
     // 高斯权重：G(x) = exp(-x² / 2σ²)，x 从 -半径 到 +半径，最后除以总和，让它们加起来等于 1。
@@ -3158,12 +3172,17 @@ private:
         mCommandList->ResourceBarrier(_countof(toRead), toRead);
 
         // SSAO 的两趟（遮蔽 + 模糊）画在这里：G-Buffer 和深度刚变成可读
+        mCommandList->SetGraphicsRootDescriptorTable(8, HeapGpuHandle(25));
+        if (mGBufferView == 0 || mGBufferView == 7) // 看别的调试视图时用不上遮蔽图
+        {
+            DrawSsao();
+        }
 
         mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 3); // T3：SSAO 做完
         // ③ 光照 Pass（选了 G-Buffer 视图时换成调试视图）：全屏三角形读 G-Buffer 和深度，输出到 HDR 纹理
         mCommandList->OMSetRenderTargets(
             1, &hdrRtv, true, nullptr);
-        mCommandList->SetGraphicsRootDescriptorTable(8, HeapGpuHandle(25));
+        mCommandList->SetGraphicsRootDescriptorTable(9, HeapGpuHandle(28)); // 遮蔽图的最终结果在 [0]
 
         // 光体积模式：开了小灯、选了光体积、没在看调试视图
         const bool volumes = mManyLights && mLightVolumes && mGBufferView == 0;
@@ -3208,6 +3227,89 @@ private:
             mTimestampHeap.Get(),
             D3D12_QUERY_TYPE_TIMESTAMP,
             tsBase + 4); // T4：光照 / 调试视图完成
+    }
+
+    void BuildSSAOResource()
+    {
+        if (!mSsaoRtvHeap)
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {
+                .Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                .NumDescriptors = 2,
+                .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                .NodeMask = 0,
+            };
+            ThrowIfFailed(mDevice->CreateDescriptorHeap(&heapDesc,IID_PPV_ARGS(&mSsaoRtvHeap)));
+        }
+        D3D12_RESOURCE_DESC desc = {
+            .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            .Alignment = 0,
+            .Width = (std::max)(1u, mClientWidth / 2), // 半分辨率；最小 1，和 DrawSsao 里算视口的写法一致
+            .Height = (std::max)(1u, mClientHeight / 2),
+            .DepthOrArraySize = 1,
+            .MipLevels = 1,
+            .Format = kAoFormat,
+            .SampleDesc = {.Count = 1, .Quality = 0},
+            .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            .Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, // 要当渲染目标
+        };
+        D3D12_CLEAR_VALUE optClear = {
+            .Format = kAoFormat,
+            .Color = {1.0f, 1.0f, 1.0f, 1.0f} //全白 = 没被遮挡
+        };
+        CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+        for (int i = 0; i < 2; i++)
+        {
+            mSsaoMap[i].Reset();
+            ThrowIfFailed(mDevice->CreateCommittedResource(
+                &heapProps, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &optClear,
+                IID_PPV_ARGS(&mSsaoMap[i])));
+            mDevice->CreateRenderTargetView(mSsaoMap[i].Get(), nullptr, SsaoRtv(i));
+            mDevice->CreateShaderResourceView(mSsaoMap[i].Get(), nullptr, HeapCpuHandle(28 + i)); // 大堆第 28、29 格
+        }
+    }
+
+    CD3DX12_CPU_DESCRIPTOR_HANDLE SsaoRtv(int i) const
+    {
+        return CD3DX12_CPU_DESCRIPTOR_HANDLE(mSsaoRtvHeap->GetCPUDescriptorHandleForHeapStart(), i, mRTVDescriptorSize);
+    }
+
+    // 进来时：G-Buffer 和深度已经可读，根参数 8 已经绑好。出去时：结果在 mSsaoMap[0]，视口已换回屏幕大小
+    void DrawSsao()
+    {
+        // 画一趟：写 mSsaoMap[dst]
+        auto pass = [&](int dst, ID3D12PipelineState* pso)
+        {
+            auto toRT = CD3DX12_RESOURCE_BARRIER::Transition(
+                mSsaoMap[dst].Get(),
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_RENDER_TARGET);
+            mCommandList->ResourceBarrier(1, &toRT);
+            auto rtv = SsaoRtv(dst);
+            mCommandList->OMSetRenderTargets(
+                1,
+                &rtv,
+                true,
+                nullptr); // 这一趟要不要深度缓冲
+            mCommandList->SetPipelineState(pso);
+            mCommandList->DrawInstanced(3, 1, 0, 0);
+            auto toSRV = CD3DX12_RESOURCE_BARRIER::Transition(
+                mSsaoMap[dst].Get(),
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            mCommandList->ResourceBarrier(1, &toSRV);
+        };
+        const UINT w = (std::max)(1u, mClientWidth / 2), h = (std::max)(1u, mClientHeight / 2);
+        D3D12_VIEWPORT vp = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f}; // 视口要和遮蔽图一样大
+        D3D12_RECT sc = {0, 0, (LONG)w, (LONG)h};
+        mCommandList->RSSetViewports(1, &vp);
+        mCommandList->RSSetScissorRects(1, &sc);
+        mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        pass(0, mSsaoPSO.Get()); // 遮蔽 Pass → [0]
+
+        mCommandList->RSSetViewports(1, &mScreenViewport); // 后面的光照 Pass 画全屏
+        mCommandList->RSSetScissorRects(1, &mScissorRect);
     }
 
     // ======================== 成员变量 ========================
@@ -3368,7 +3470,7 @@ private:
     ComPtr<ID3DBlob> mDeferredPSByteCode;
     ComPtr<ID3D12PipelineState> mDeferredLightPSO;
     // G-Buffer 调试视图：基础色、法线、粗糙度、金属度、深度、世界坐标（面板上的下拉框选，0 = 关 = 正常算光）
-    static constexpr int kGBufferViews = 6;
+    static constexpr int kGBufferViews = 7;
     int mGBufferView = 0;
     ComPtr<ID3DBlob> mDeferredVSByteCode;
     ComPtr<ID3DBlob> mGBufferViewPSByteCode[kGBufferViews];

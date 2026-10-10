@@ -181,6 +181,58 @@ static const float kBlurWeights[11] = {
     0.0222f, 0.0456f, 0.0798f, 0.1191f, 0.1514f, 0.1640f, 0.1514f, 0.1191f, 0.0798f, 0.0456f, 0.0222f
 };
 
+// 屏幕上第 pixel 个像素（全分辨率）那里的表面，在世界里的位置
+float3 WorldPosAt(int2 pixel){
+    uint width, height;
+    gDepthMap.GetDimensions(width, height);
+    float depth = gDepthMap.Load(int3(pixel, 0));
+    float2 uv = (pixel + 0.5f) / float2(width, height); // 像素中心
+    return WorldPosFromDepth(uv,depth);
+}
+
+// 挡住我的那个点离我 dist 远：算挡住多少（0～1） 输入 dist 是 r 到 p 的距离
+float OcclusionFunction(float dist){
+    float occlusion = 0.0f;
+        if (dist > kAoEpsilon) // 比门槛远，才进来算
+        {
+            occlusion = saturate((kAoFadeEnd - dist) / (kAoFadeEnd - kAoFadeStart));
+        }
+        return occlusion;   // 没进 if 的（太近），返回的还是开头
+}
+
+float PS_Ssao(VertexOut pin): SV_Target{
+    int2 pixel = int2(pin.PosH.xy) * 2;
+    if(gDepthMap.Load(int3(pixel,0))>=1.0f)
+        return 1.0f;
+    float3 p = WorldPosAt(pixel);
+    float3 n = normalize(gGBuffer1.Load(int3(pixel,0)).xyz);
+    float3 randVec = RandomVec(int2(pin.PosH.xy));
+    
+    uint width,height;
+    gDepthMap.GetDimensions(width,height);
+    
+    float occlusionSum = 0.0f;
+    [loop]
+    for(int i=0;i<kAoSamples;i++){
+        float3 offset = reflect(kAoOffsets[i],randVec); // 14 个固定方向，用这个像素的随机向量翻一下
+        float flip = sign(dot(offset, n));            // 和谁同侧才算在表面外面；不同侧就翻过来
+        float3 q = p + flip * kAoRadius * offset;   
+        
+        float4 qH = mul(float4(q,1.0f),gPass.ViewProj); //世界 ->裁剪空间
+        float2 qUV = qH.xy / qH.w * float2(0.5f, -0.5f) + 0.5f;  // 先变成 NDC（-1～1），再变成 uv
+        if (any(qUV < 0.0f) || any(qUV >= 1.0f))
+            continue; // 屏幕外：不知道那里有什么，当作没挡
+        
+        float3 r = WorldPosAt(int2(qUV* float2(width,height))); // q 那个像素上真正看得见的表面点
+        float3 v = r - p;
+        float dist = length(v);
+        float dp = max(dot(n, v / max(dist, 1e-4f)), 0.0f); // r 在 p 正上方挡得最多，贴着表面的不算
+        occlusionSum += dp * OcclusionFunction(dist);
+    }
+    float access = 1 - occlusionSum / kAoSamples; // 14 个点平均挡住了多少 → 没被挡住的比例
+    return saturate(pow(access, kAoPower));
+}
+
 // ======================== 调试视图（面板上的"G-Buffer 视图"） ========================
 // 色调映射这时临时换成"曝光 0 EV + 截断"，这里输出的线性值经 sRGB 编码直接上屏：
 // 基础色本来就是线性颜色，原样输出；法线、粗糙度这些"数"先做 2.2 次方，上屏后的灰度才等于原值
