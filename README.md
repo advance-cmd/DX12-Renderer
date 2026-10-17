@@ -40,8 +40,6 @@
 | ![法线贴图地板](docs/p6_normal_map.jpg) | ![PBR 测试球](docs/p7_pbr.jpg) |
 | **法线贴图地板**：砖缝凹凸来自法线贴图 | **PBR 测试球**：一排从光滑到粗糙，金属 / 非金属各一排 |
 
-<sub>这一组截图拍于加 IBL 之前（环境光还是常数），加了 IBL 以后的样子见下面的 [IBL](#ibl基于图像的光照) 一节。</sub>
-
 ## 延迟渲染与 G-Buffer
 
 ![G-Buffer 调试视图](docs/gbuffer.jpg)
