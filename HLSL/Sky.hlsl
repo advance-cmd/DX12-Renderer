@@ -35,5 +35,10 @@ VertexOut VS(VertexIn vin)
 
 float4 PS(VertexOut pin) : SV_Target
 {
+    // 面板"天空显示"：把天空换成 IBL 生成的图。查的方向一样，所以应该和原图对得上，只是更糊
+    if (gPass.SkyView == 1)
+        return float4(gIrradianceMap.SampleLevel(gsamLinearWrap, pin.PosL, 0).rgb, 1.0f);
+    if (gPass.SkyView >= 2)
+        return float4(gPrefilteredMap.SampleLevel(gsamLinearWrap, pin.PosL, gPass.SkyView - 2).rgb, 1.0f);
     return gCubeMap.Sample(gsamLinearWrap, pin.PosL);
 }

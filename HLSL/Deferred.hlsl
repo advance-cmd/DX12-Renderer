@@ -1,5 +1,6 @@
 // 延迟渲染：读 G-Buffer 的全屏 Pass（光照 Pass + 调试视图）
 // 根签名用主根签名：b1 = Pass 常量，t6～t8 = 两张 G-Buffer + 深度缓冲（根参数 8，堆第 25～27 格），t9 = SSAO 遮蔽图（根参数 9）
+// s2（双线性 + 夹边）和 IBL 的 t10～t12 声明在 LightingUtil.hlsl 里
 // 光照 Pass 还要用 LightingUtil.hlsl 里的 t1 阴影图、t2 天空图（雾色），Draw() 进 DrawDeferred 之前已经绑好
 #include "LightingUtil.hlsl"
 
@@ -9,7 +10,6 @@ Texture2D gGBuffer0 : register(t6);        // rgb 基础色，a 金属度（sRGB
 Texture2D gGBuffer1 : register(t7);        // xyz 世界法线，w 粗糙度
 Texture2D<float> gDepthMap : register(t8); // 深度缓冲（R24_UNORM_X8_TYPELESS：只读前 24 位深度）
 Texture2D<float> gAoMap : register(t9);    // SSAO 的遮蔽图（半分辨率，R8）：1 = 完全没被挡，0 = 全挡住。根参数 9
-SamplerState gsamLinearClamp : register(s2); // 双线性 + 夹边：光照 Pass 把半分辨率的遮蔽图放大回全屏时用
 
 struct VertexOut
 {
@@ -66,15 +66,14 @@ float4 PS(VertexOut pin) : SV_Target
     ReadGBuffer(pixel, mat, normal);
 
     float3 posW = WorldPosFromDepth(pin.UV, depth);
-
-    // 以下沿用前向 PS 的光照计算
-    float3 ambient = gPass.AmbientLight.rgb * (DiffuseColor(mat) + F0(mat));
-    // SSAO：遮蔽图是半分辨率，用双线性 + 夹边的采样器放大回全屏。只压环境光，直接光不受影响
-    ambient *= gAoMap.SampleLevel(gsamLinearClamp, pin.UV, 0);
-
     float3 toEye = gPass.EyePosW - posW;
     float distToEye = length(toEye);
     toEye /= distToEye;
+
+    // 以下沿用前向 PS 的光照计算
+    float3 ambient = AmbientLighting(mat, normal, toEye, gPass); // 环境光：IBL 或常数（面板"IBL"）
+    // SSAO：遮蔽图是半分辨率，用双线性 + 夹边的采样器放大回全屏。只压环境光，直接光不受影响
+    ambient *= gAoMap.SampleLevel(gsamLinearClamp, pin.UV, 0);
 
     float3 shadowFactor = float3(1.0f, 1.0f, 1.0f);
     shadowFactor[0] = CalcShadowFactor(mul(float4(posW, 1.0f), gPass.ShadowTransform));

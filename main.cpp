@@ -113,6 +113,13 @@ static constexpr DXGI_FORMAT kGBuffer0Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; 
 static constexpr DXGI_FORMAT kGBuffer1Format = DXGI_FORMAT_R16G16B16A16_FLOAT; //XYZ：世界法线，W：粗糙度
 // SSAO 的遮蔽图：每个像素只存一个 0～1 的数，一个 8 位通道就够（1 字节）
 static constexpr DXGI_FORMAT kAoFormat = DXGI_FORMAT_R8_UNORM;
+// IBL：三张预计算的图（启动后第一帧用计算着色器生成，热重载之后重新生成），和窗口大小无关
+static constexpr UINT kIrradianceSize = 32; // 辐照度图每个面 32×32：漫反射本来就很糊，不用大
+static constexpr UINT kPrefilterSize = 256; // 预滤波环境贴图第 0 级每个面 256×256，往下每级减半
+static constexpr UINT kPrefilterMips = 5; // 第 i 级 = 粗糙度 i/4，正好对上测试球的 5 列。必须和 LightingUtil.hlsl 一致
+static constexpr UINT kBrdfLutSize = 256;
+static constexpr DXGI_FORMAT kIblCubeFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; // 计算着色器要写（UAV）；16 位浮点
+static constexpr DXGI_FORMAT kBrdfLutFormat = DXGI_FORMAT_R16G16_FLOAT; // 只存 A、B 两个数
 // 延迟第③步：面板勾"64 盏小灯"时多出来的点光源，排在原来 3 盏后面（Lights[3..66]，MaxLights = 100 够用）
 static constexpr UINT kExtraLights = 64;
 
@@ -244,7 +251,9 @@ public:
         BuildBloomResources();
         BuildGBufferResources();
         BuildSSAOResource();
+        BuildIblResources(); // 要用到堆（写第 30、33 格）
         BuildTimestampQueries(); //Pass时间记录
+        BuildIblTimer(); // IBL 预计算的 2 个时间戳
         BuildShadowMap(); //构建阴影贴图资源和View
         BuildShapeGeometry(); // 录制复制命令（木箱）
         BuildLandGeometry(); // 录制复制命令（陆地的顶点/索引）
@@ -255,6 +264,7 @@ public:
         BuildBlurRootSignature(); //模糊专用的根签名
         BuildTonemapRootSignature();
         BuildBloomRootSignature();
+        BuildIblRootSignature(); // 必须在 BuildPSO 前面：建计算 PSO 要用它
         BuildShadersAndInputLayout(); // PSO 要用着色器和输入布局
         BuildPSO(); // 上面两样都有了才能建 PSO；渲染项要记住用哪个 PSO，所以再排在它前面
         BuildMaterials(); //FrameResources要用到这个
@@ -531,13 +541,38 @@ protected:
         mCommandList->ResourceBarrier(3, b5);
     }
 
-    // 堆里第 slot 格的 GPU 句柄
+    /*
+     * 大堆 mHeap（着色器可见的 CBV/SRV/UAV 堆，共 40 格）里第 slot 格的"地址"。两个版本用在不同的时候：
+     *   HeapCpuHandle(slot)：建视图时用 —— CreateShaderResourceView / CreateUnorderedAccessView 把描述符写进这一格（CPU 在写）
+     *   HeapGpuHandle(slot)：绑定时用 —— Set…RootDescriptorTable(参数号, HeapGpuHandle(slot)) 告诉 GPU 描述符表从这一格开始
+     *                        （ImGui::Image 也用它：把这一格的 SRV 直接当成一张图显示）
+     * 算法都一样：堆起点 + slot × mCSUDescriptorSize（一格多少字节由显卡决定，框架在 D3DApp::CreateFenceAndDescriptorSizes 里用 GetDescriptorHandleIncrementSize 查过）
+     *
+     * 每一格放了什么（S = SRV 读，U = UAV 写）| 谁建的 | 谁用（绑到哪）
+     *   0～3   S 木箱、铁丝网、冰（镜子）、地砖的漫反射贴图 | BuildShaderResourceViews | 主根参数 1（t0），按材质的 DiffuseSrvHeapIndex
+     *   4      S 树的纹理数组（3 张）                   | BuildShaderResourceViews | 主根参数 1（t0），树的材质
+     *   5～8   后期模糊的两张纹理：5 A 的 S，6 A 的 U，7 B 的 S，8 B 的 U | BuildBlurResources | 模糊根签名参数 1（t0）、2（u0）
+     *   9      S 阴影图                                 | BuildShadowMap          | 主根参数 4（t1）
+     *   10     S 天空图（立方体）                       | BuildShaderResourceViews | 主根参数 5（t2）；IBL 预计算的 t0
+     *   11     S 地砖的法线贴图                         | BuildShaderResourceViews | 主根参数 6（t3），材质的 NormalSrvHeapIndex
+     *   12～15 ImGui 自己用（字体图集等），由 InitImGui 里的分配回调发出去
+     *   16～17 S 陆地的草地、岩石                       | BuildShaderResourceViews | 主根参数 7（t4、t5）
+     *   18     S HDR 场景纹理                           | BuildHdrResources       | Tonemap 根参数 0
+     *   19～24 S Bloom 纹理第 0～5 级 mip（每级一格）   | BuildBloomResources     | Bloom 根参数 0
+     *   25～27 S G-Buffer0、G-Buffer1、深度缓冲         | BuildGBufferResources   | 主根参数 8（t6～t8）
+     *   28～29 S SSAO 的两张遮蔽图（[0]、[1]）          | BuildSSAOResource       | 主根参数 9（t9），模糊时两格来回换
+     *   30～32 S IBL：辐照度图、预滤波环境贴图、BRDF LUT | BuildIblResources（先在 BuildDescriptorHeaps 里放了空描述符）| 主根参数 10（t10～t12）
+     *   33     U 辐照度图                               | BuildIblResources       | IBL 根签名参数 2（u0）
+     *   34～38 U 预滤波环境贴图第 0～4 级（每级一格）   | BuildIblResources       | IBL 根签名参数 2（u0），逐级换
+     *   39     U BRDF LUT                               | BuildIblResources       | IBL 根签名参数 2（u0）
+     * 加格子时三处一起改：BuildDescriptorHeaps 里的 NumDescriptors 和注释、这张表、建视图的那个函数
+     */
     CD3DX12_GPU_DESCRIPTOR_HANDLE HeapGpuHandle(int slot) const
     {
         return CD3DX12_GPU_DESCRIPTOR_HANDLE(mHeap->GetGPUDescriptorHandleForHeapStart(), slot, mCSUDescriptorSize);
     }
 
-    // 堆里第 slot 格的 CPU 句柄
+    // 同上，CPU 版：建视图（往这一格里写描述符）时用
     CD3DX12_CPU_DESCRIPTOR_HANDLE HeapCpuHandle(int slot) const
     {
         return CD3DX12_CPU_DESCRIPTOR_HANDLE(mHeap->GetCPUDescriptorHandleForHeapStart(), slot, mCSUDescriptorSize);
@@ -622,6 +657,7 @@ protected:
             BuildShadersAndInputLayout(); // 有一个编不过就抛异常，后面两步不执行，旧 PSO 照常用
             FlushCommandQueue(); // CPU 最多领先 3 帧，GPU 可能还在用旧 PSO，等它画完
             BuildPSO(); // IID_PPV_ARGS(&mXxxPSO) 先放掉旧的，再把新的建在同一个槽里，渲染项自动跟着换
+            mIblDirty = true; // IBL.hlsl 可能改过：下一帧开头重新生成三张图
             OutputDebugStringW(L"[热重载] 成功\n");
         }
         catch (DxException& e)
@@ -650,6 +686,21 @@ protected:
         ImGui::SliderFloat("Bloom 强度", &mBloomIntensity, 0.0f, 0.5f, "%.3f");
         ImGui::SliderFloat("Bloom 阈值", &mBloomThreshold, 0.0f, 4.0f, "%.2f");
         ImGui::Checkbox("PBR 测试球", &mShowTestSpheres);
+        ImGui::Checkbox("IBL", &mIbl); // 不勾 = 以前的常数环境光
+        if (mIbl)
+        {
+            ImGui::SliderFloat("IBL 强度", &mIblIntensity, 0.0f, 2.0f, "×%.2f");
+            ImGui::Text("IBL 预计算 %.2f ms（只在启动、热重载后跑一次）", mIblPrecomputeMs);
+        }
+        const char* skyViews[] = {"原图", "辐照度图", "预滤波 第 0 级", "预滤波 第 1 级", "预滤波 第 2 级", "预滤波 第 3 级", "预滤波 第 4 级"};
+        ImGui::Combo("天空显示", &mSkyView, skyViews, IM_ARRAYSIZE(skyViews));
+        if (ImGui::TreeNode("BRDF LUT"))
+        {
+            // 堆第 32 格的 SRV 直接给 ImGui 画：横 = NoV（0 → 1），竖 = 粗糙度（上 0 → 下 1）；红 = A，绿 = B
+            const float side = 128.0f * mDpiScale;
+            ImGui::Image((ImTextureID)HeapGpuHandle(32).ptr, ImVec2(side, side));
+            ImGui::TreePop();
+        }
         ImGui::Checkbox("延迟渲染", &mDeferred);
         if (mDeferred) // 调试视图只有延迟模式才有（要读 G-Buffer）
         {
@@ -706,6 +757,20 @@ protected:
         mCurrentFrame = mFrameResources[mCurrFrameResourceIndex].get();
         WaitForCurrentFrameResource(); //执行完，说明上一次用这份帧资源的那一帧，GPU 已经全部做完了。
 
+        if (mIblTimeFrame == mCurrentFrame) // 记了 IBL 时间戳的那一帧：上面刚等它做完
+        {
+            UINT64* t = nullptr;
+            D3D12_RANGE readRange{0, 2 * sizeof(UINT64)};
+            ThrowIfFailed(mIblTimeReadback->Map(0, &readRange, reinterpret_cast<void**>(&t)));
+            mIblPrecomputeMs = (float)((t[1] - t[0]) * 1000.0 / mTimestampFreq);
+            D3D12_RANGE noWrite{0, 0};
+            mIblTimeReadback->Unmap(0, &noWrite);
+            mIblTimeFrame = nullptr;
+            char msg[64];
+            sprintf_s(msg, "[IBL] precompute %.3f ms\n", mIblPrecomputeMs);
+            OutputDebugStringA(msg);
+        }
+
         if (mCurrentFrame->Fence != 0)
         {
             const UINT tsBase = mCurrFrameResourceIndex * kTimestampCount;
@@ -753,6 +818,9 @@ protected:
      * 创建 PSO 时的 RTVFormats / DSVFormat / 根签名，必须和那一段绑着的渲染目标、深度缓冲、根签名对上。
      * 下面的 rtv 就是 HDR 纹理的 RTV（传进 DrawDeferred 后叫 hdrRtv），dsv 是主深度缓冲。
      *
+     *   ⓪ IBL 预计算    PrecomputeIbl，只在 mIblDirty 时跑（启动后第一帧、热重载之后），计算着色器（Dispatch）
+     *        读：天空图 | 写：辐照度图、预滤波环境贴图（每级 mip 一趟）、BRDF LUT | PSO：mIrradiance/Prefilter/BrdfLutPSO
+     *        根签名：IBL（计算）。之后每帧主根签名的参数 10 读这三张图
      *   ① 阴影图        DrawShadowMap
      *        渲染目标：无 | 深度：阴影图 | PSO：各物体的 ShadowPSO | 根签名：主
      *   ② 不透明物体
@@ -803,6 +871,16 @@ protected:
         ID3D12DescriptorHeap* heaps[] = {mHeap.Get()};
         mCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
         mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
+        if (mIblDirty)
+        {
+            // ⓪ 启动后第一帧、热重载之后：生成 IBL 的三张图。前后各打一个时间戳，量这一次花了多久
+            mCommandList->EndQuery(mIblQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            PrecomputeIbl();
+            mCommandList->EndQuery(mIblQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            mCommandList->ResolveQueryData(mIblQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2,
+                                           mIblTimeReadback.Get(), 0);
+            mIblTimeFrame = mCurrentFrame; // 轮回到这份帧资源时，这一帧 GPU 肯定做完了，再去读
+        }
 
         // 3 份 Pass 常量挨着放：passCB = 第 0 份（主 Pass），+1 份 = 镜像，+2 份 = 阴影 Pass
         const UINT passCBByteSize = CalcConstantBufferByteSize(sizeof(PassConstants));
@@ -813,6 +891,7 @@ protected:
         DrawShadowMap(passCB + 2 * passCBByteSize);
         mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 1); // T1
         mCommandList->SetGraphicsRootDescriptorTable(5, HeapGpuHandle(10));
+        mCommandList->SetGraphicsRootDescriptorTable(10, HeapGpuHandle(30)); // IBL 三张图（堆第 30～32 格）
 
         // ② 主 Pass。阴影 Pass 把视口改成了阴影图的大小，这里换回屏幕的
         mCommandList->RSSetViewports(1, &mScreenViewport);
@@ -1104,6 +1183,9 @@ private:
         pc.FogColor = XMFLOAT4(Colors::LightSteelBlue.f);
         pc.FogStart = 70.f;
         pc.FogRange = 120.f;
+        pc.IblOn = mIbl ? 1 : 0;
+        pc.IblIntensity = mIblIntensity;
+        pc.SkyView = mSkyView;
         /*struct Light
         {
         XMFLOAT3 Strength;
@@ -1332,7 +1414,7 @@ private:
     {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {
             .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            .NumDescriptors = 30,
+            .NumDescriptors = 40,
             /* 0～4 纹理，
              * 5～8 模糊用的两张纹理（各一个 SRV、一个 UAV），
              * 9 阴影图的 SRV，10天空图   
@@ -1344,11 +1426,30 @@ private:
              * 25~26 Gbuffer0~1
              * 27 原来的深度缓冲
              * 28～29 SSAO 的两张遮蔽图
+             * 30～32 IBL：辐照度图、预滤波环境贴图、BRDF LUT（SRV，根参数 10 的表）
+             * 33 辐照度图的 UAV，34～38 预滤波第 0～4 级的 UAV，39 BRDF LUT 的 UAV（只在生成时写）
              */
             .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, // 着色器要从这个堆里读（RTV/DSV 堆不用，所以是 NONE）
             .NodeMask = 0,
         };
         ThrowIfFailed(mDevice->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(mHeap.GetAddressOf())));
+
+        // IBL 的三格先放"空描述符"（资源传 nullptr）：着色器读出来全是 0。IBL 每一步建好资源后，用真的 SRV 盖掉
+        D3D12_SHADER_RESOURCE_VIEW_DESC nullCube = {
+            .Format = kIblCubeFormat,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .TextureCube = {.MostDetailedMip = 0, .MipLevels = 1, .ResourceMinLODClamp = 0.0f},
+        };
+        mDevice->CreateShaderResourceView(nullptr, &nullCube, HeapCpuHandle(30));
+        mDevice->CreateShaderResourceView(nullptr, &nullCube, HeapCpuHandle(31));
+        D3D12_SHADER_RESOURCE_VIEW_DESC nullLut = {
+            .Format = kBrdfLutFormat,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .Texture2D = {.MostDetailedMip = 0, .MipLevels = 1, .PlaneSlice = 0, .ResourceMinLODClamp = 0.0f},
+        };
+        mDevice->CreateShaderResourceView(nullptr, &nullLut, HeapCpuHandle(32));
     }
 
     // 构建SRV
@@ -2188,6 +2289,7 @@ private:
      *   参数 7：描述符表 → t4、t5，陆地的草地、岩石（堆第 16、17 格）
      *   参数 8：描述符表 → t6、t7、t8，两张 G-Buffer + 深度缓冲（堆第 25、26、27 格，延迟渲染的光照 Pass 读）
      *   参数 9：描述符表 → t9，SSAO 的遮蔽图（堆第 28 或 29 格：模糊时两张来回倒，光照 Pass 读第 28 格）
+     *   参数 10：描述符表 → t10、t11、t12，IBL 的辐照度图、预滤波环境贴图、BRDF LUT（堆第 30～32 格）
      *   描述符表（参数 1、4～8）只给像素着色器看；根 CBV（参数 0、2、3）所有阶段都能看
      *
      *   静态采样器 s0：三线性过滤 + WRAP（CD3DX12_STATIC_SAMPLER_DESC 默认的寻址模式）
@@ -2217,7 +2319,10 @@ private:
         CD3DX12_DESCRIPTOR_RANGE aoRange;
         aoRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 9); // t9：遮蔽图（绑第 28 格还是第 29 格，画的时候定）
 
-        CD3DX12_ROOT_PARAMETER slotRootParameter[10];
+        CD3DX12_DESCRIPTOR_RANGE iblRange;
+        iblRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 10); // t10～t12：IBL 三张图
+
+        CD3DX12_ROOT_PARAMETER slotRootParameter[11];
         slotRootParameter[0].InitAsConstantBufferView(0);
         slotRootParameter[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
         slotRootParameter[2].InitAsConstantBufferView(1);
@@ -2228,6 +2333,7 @@ private:
         slotRootParameter[7].InitAsDescriptorTable(1, &landRange, D3D12_SHADER_VISIBILITY_PIXEL);
         slotRootParameter[8].InitAsDescriptorTable(1, &gbufferRange, D3D12_SHADER_VISIBILITY_PIXEL);
         slotRootParameter[9].InitAsDescriptorTable(1, &aoRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        slotRootParameter[10].InitAsDescriptorTable(1, &iblRange, D3D12_SHADER_VISIBILITY_PIXEL);
 
         CD3DX12_STATIC_SAMPLER_DESC samplers[3] = {
             CD3DX12_STATIC_SAMPLER_DESC(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR),
@@ -2295,7 +2401,7 @@ private:
             0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&mBlurRootSignature)));
     }
 
-    //编译着色器
+    //编译着色器 + PSO
     void BuildShadersAndInputLayout()
     {
         // 第③步的小灯：数量也用宏传（排在原来 3 盏后面），勾选"64 盏小灯"时 ReloadShaders 重编
@@ -2460,7 +2566,7 @@ private:
         mLightVolumePSByteCode = CompileShader(L"HLSL\\Deferred.hlsl", lightDefines, "PS_LightVolume", "ps_6_6");
 
         mSsaoPSByteCode = CompileShader(L"HLSL\\Deferred.hlsl", lightDefines, "PS_Ssao", "ps_6_6");
-        
+
         const D3D_SHADER_MACRO blurVertDefines[] = {
             {"NUM_DIR_LIGHTS", "1"},
             {"NUM_POINT_LIGHTS", "1"},
@@ -2470,6 +2576,13 @@ private:
         };
         mSsaoBlurPSByteCode[0] = CompileShader(L"HLSL\\Deferred.hlsl", lightDefines, "PS_SsaoBlur", "ps_6_6");
         mSsaoBlurPSByteCode[1] = CompileShader(L"HLSL\\Deferred.hlsl", blurVertDefines, "PS_SsaoBlur", "ps_6_6");
+
+        // IBL 预计算的计算着色器（IBL.hlsl）
+        mIrradianceCSByteCode = CompileShader(L"HLSL\\IBL.hlsl", nullptr, "CS_Irradiance", "cs_6_6");
+        //预滤波图
+        mPrefilterCSByteCode = CompileShader(L"HLSL\\IBL.hlsl", nullptr, "CS_Prefilter", "cs_6_6");
+        //Brdf Lut
+        mBrdfLutCSByteCode = CompileShader(L"HLSL\\IBL.hlsl", nullptr, "CS_BrdfLut", "cs_6_6");
     }
 
     void BuildPSO()
@@ -2805,12 +2918,25 @@ private:
         ssaoDesc.RTVFormats[0] = kAoFormat;
         ssaoDesc.PS = {mSsaoPSByteCode->GetBufferPointer(), mSsaoPSByteCode->GetBufferSize()};
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&ssaoDesc, IID_PPV_ARGS(&mSsaoPSO)));
-        
+
         for (int i = 0; i < 2; i++)
         {
             ssaoDesc.PS = {mSsaoBlurPSByteCode[i]->GetBufferPointer(), mSsaoBlurPSByteCode[i]->GetBufferSize()};
             ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&ssaoDesc, IID_PPV_ARGS(&mSsaoBlurPSO[i])));
         }
+
+        // IBL 预计算：计算 PSO，用 IBL 根签名
+        D3D12_COMPUTE_PIPELINE_STATE_DESC iblDesc = {
+            .pRootSignature = mIblRootSignature.Get(),
+            .CS = {mIrradianceCSByteCode->GetBufferPointer(), mIrradianceCSByteCode->GetBufferSize()},
+            .Flags = D3D12_PIPELINE_STATE_FLAG_NONE
+        };
+
+        ThrowIfFailed(mDevice->CreateComputePipelineState(&iblDesc, IID_PPV_ARGS(&mIrradiancePSO)));
+        iblDesc.CS = {mPrefilterCSByteCode->GetBufferPointer(), mPrefilterCSByteCode->GetBufferSize()};
+        ThrowIfFailed(mDevice->CreateComputePipelineState(&iblDesc, IID_PPV_ARGS(&mPrefilterPSO)));
+        iblDesc.CS = {mBrdfLutCSByteCode->GetBufferPointer(), mBrdfLutCSByteCode->GetBufferSize()};
+        ThrowIfFailed(mDevice->CreateComputePipelineState(&iblDesc, IID_PPV_ARGS(&mBrdfLutPSO)));
     }
 
     // 高斯权重：G(x) = exp(-x² / 2σ²)，x 从 -半径 到 +半径，最后除以总和，让它们加起来等于 1。
@@ -3351,17 +3477,181 @@ private:
         mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
         pass(0, mSsaoPSO.Get()); // 遮蔽 Pass → [0]
-        
+
         for (int i = 0; i < mSsaoBlurCount; i++)
         {
             mCommandList->SetGraphicsRootDescriptorTable(9, HeapGpuHandle(28)); // 横：读 [0]
-            pass(1, mSsaoBlurPSO[0].Get());                                    //     写哪张
+            pass(1, mSsaoBlurPSO[0].Get()); //     写哪张
             mCommandList->SetGraphicsRootDescriptorTable(9, HeapGpuHandle(29)); // 竖：读 [1]
-            pass(0, mSsaoBlurPSO[1].Get());                                    //     写哪张
+            pass(0, mSsaoBlurPSO[1].Get()); //     写哪张
         }
 
         mCommandList->RSSetViewports(1, &mScreenViewport); // 后面的光照 Pass 画全屏
         mCommandList->RSSetScissorRects(1, &mScissorRect);
+    }
+
+    // IBL 的三张图：启动时建一次（和窗口大小无关，OnResize 里不用重建）。平时停在 PIXEL_SHADER_RESOURCE
+    void BuildIblResources()
+    {
+        CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+
+        // ① 辐照度图：立方体 = 6 张图的数组，计算着色器要写，所以带 UAV 标志
+        D3D12_RESOURCE_DESC cubeDesc = {
+            .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            .Alignment = 0,
+            .Width = kIrradianceSize,
+            .Height = kIrradianceSize,
+            .DepthOrArraySize = 6, // 6 个面
+            .MipLevels = 1,
+            .Format = kIblCubeFormat,
+            .SampleDesc = {.Count = 1, .Quality = 0},
+            .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            .Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, // 没有这个标志建不了 UAV
+        };
+        ThrowIfFailed(mDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &cubeDesc,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+            IID_PPV_ARGS(&mIrradianceMap)));
+        // 读的时候：看成立方体，用方向查（光照 Pass 和天空显示用）
+        D3D12_SHADER_RESOURCE_VIEW_DESC cubeSrv = {
+            .Format = kIblCubeFormat,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .TextureCube = {.MostDetailedMip = 0, .MipLevels = 1, .ResourceMinLODClamp = 0.0f},
+        };
+        mDevice->CreateShaderResourceView(mIrradianceMap.Get(), &cubeSrv, HeapCpuHandle(30)); // 盖掉第 30 格的空描述符
+        // 写的时候：UAV 没有"立方体"，看成 6 张图的数组，按 (x, y, 第几个面) 写
+        D3D12_UNORDERED_ACCESS_VIEW_DESC cubeUav = {
+            .Format = kIblCubeFormat,
+            .ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+            .Texture2DArray = {.MipSlice = 0, .FirstArraySlice = 0, .ArraySize = 6, .PlaneSlice = 0},
+        };
+        mDevice->CreateUnorderedAccessView(mIrradianceMap.Get(), nullptr, &cubeUav, HeapCpuHandle(33));
+        // ② 预滤波环境贴图：和辐照度图一样是立方体，只是更大、有 5 级 mip，每级一个 UAV
+        cubeDesc.Width = kPrefilterSize;
+        cubeDesc.Height = kPrefilterSize;
+        cubeDesc.MipLevels = kPrefilterMips;
+        ThrowIfFailed(mDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &cubeDesc,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+            IID_PPV_ARGS(&mPrefilteredMap)));
+        cubeSrv.TextureCube.MipLevels = kPrefilterMips; // 读的时候 5 级都能读（SampleLevel 第三个参数选级）
+        mDevice->CreateShaderResourceView(mPrefilteredMap.Get(), &cubeSrv, HeapCpuHandle(31));
+        for (UINT mip = 0; mip < kPrefilterMips; mip++)
+        {
+            cubeUav.Texture2DArray.MipSlice = mip; // 写的时候一次只能写一级
+            mDevice->CreateUnorderedAccessView(mPrefilteredMap.Get(), nullptr, &cubeUav, HeapCpuHandle(34 + mip));
+        }
+        // ③ BRDF LUT：普通的 2D 纹理，两个通道
+        D3D12_RESOURCE_DESC lutDesc = cubeDesc; // 先抄一份（DEFAULT 堆、UAV 标志这些都一样），再改不一样的
+        lutDesc.Width = kBrdfLutSize;
+        lutDesc.Height = kBrdfLutSize;
+        lutDesc.DepthOrArraySize = 1;
+        lutDesc.MipLevels = 1;
+        lutDesc.Format = kBrdfLutFormat;
+        ThrowIfFailed(
+            mDevice->CreateCommittedResource(&heapProps,D3D12_HEAP_FLAG_NONE,&lutDesc,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&mBrdfLut)));
+        mDevice->CreateShaderResourceView(mBrdfLut.Get(),nullptr,HeapCpuHandle(32));
+        mDevice->CreateUnorderedAccessView(mBrdfLut.Get(),nullptr,nullptr,HeapCpuHandle(39));
+    }
+
+    // IBL 预计算专用的根签名（计算）：b0 = 1 个根常量（粗糙度），t0 = 天空图，u0 = 这一趟要写的图，s0 = 三线性
+    void BuildIblRootSignature()
+    {
+        CD3DX12_DESCRIPTOR_RANGE srvRange;
+        srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0 : 天空图
+        CD3DX12_DESCRIPTOR_RANGE uavRange;
+        uavRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);
+        // u0：这次 Dispatch 往哪写（UAV）。辐照度绑第 33 格，预滤波逐级绑 34～38，LUT 绑 39
+
+        CD3DX12_ROOT_PARAMETER slotRootParameter[3];
+        slotRootParameter[0].InitAsConstants(1, 0);
+        slotRootParameter[1].InitAsDescriptorTable(1, &srvRange);
+        slotRootParameter[2].InitAsDescriptorTable(1, &uavRange);
+
+        // 天空图要读糊一点的 mip（SampleLevel 第三个参数），所以要三线性
+        CD3DX12_STATIC_SAMPLER_DESC linearSampler(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
+
+        CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(
+            _countof(slotRootParameter), slotRootParameter,
+            1, &linearSampler);
+        // 第一步：把描述序列化成一段二进制数据；出错时错误信息在 error 里
+        ComPtr<ID3DBlob> serialized;
+        ComPtr<ID3DBlob> error;
+        HRESULT hr = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &error);
+        if (error != nullptr)
+        {
+            OutputDebugStringA((char*)error->GetBufferPointer());
+        }
+        ThrowIfFailed(hr);
+
+        // 第二步：用这段二进制数据创建根签名对象
+        ThrowIfFailed(mDevice->CreateRootSignature(
+            0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&mIblRootSignature)));
+    }
+
+    // IBL 预计算的 GPU 耗时：单独一个 2 格的查询堆（预计算不是每帧都跑，不放进每帧的那 10 格里）
+    void BuildIblTimer()
+    {
+        D3D12_QUERY_HEAP_DESC desc = {.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP, .Count = 2, .NodeMask = 0};
+        ThrowIfFailed(mDevice->CreateQueryHeap(&desc, IID_PPV_ARGS(&mIblQueryHeap)));
+        CD3DX12_HEAP_PROPERTIES readBackHeap(D3D12_HEAP_TYPE_READBACK);
+        CD3DX12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(2 * sizeof(UINT64));
+        ThrowIfFailed(mDevice->CreateCommittedResource(&readBackHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&mIblTimeReadback)));
+    }
+
+    // ⓪ IBL 预计算：三张图各生成一次。录在这一帧命令列表的最前面（Draw 里 mIblDirty 时调用）
+    // 进来、出去时：天空图和 IBL 的图都在 PIXEL_SHADER_RESOURCE
+    void PrecomputeIbl()
+    {
+        ID3D12Resource* sky = mTextures.at("skyCubeTex")->Resource.Get();
+        D3D12_RESOURCE_BARRIER toWrite[] = {
+            // 天空图被计算着色器读：要在 NON_PIXEL_SHADER_RESOURCE（PIXEL_SHADER_RESOURCE 只管像素着色器）
+            CD3DX12_RESOURCE_BARRIER::Transition(sky, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            // 辐照度图被计算着色器写：UNORDERED_ACCESS 是"写"状态，不能和任何"读"状态并在一起
+            CD3DX12_RESOURCE_BARRIER::Transition(mIrradianceMap.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            CD3DX12_RESOURCE_BARRIER::Transition(mPrefilteredMap.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            CD3DX12_RESOURCE_BARRIER::Transition(mBrdfLut.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        };
+        mCommandList->ResourceBarrier(_countof(toWrite), toWrite);
+        mCommandList->SetComputeRootSignature(mIblRootSignature.Get());
+        mCommandList->SetComputeRootDescriptorTable(1, HeapGpuHandle(10)); //t0 天空图
+        // ① 辐照度图：一个线程组管 8×8 个像素，z 方向 6 组 = 6 个面
+        mCommandList->SetPipelineState(mIrradiancePSO.Get());
+        mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(33)); //u0 = 辐照度图的 UAV
+        mCommandList->Dispatch(kIrradianceSize / 8, kIrradianceSize / 8, 6); // 32 / 8 = 4 组；z 方向 6 组 = 6 个面
+        // ② 预滤波：每级 mip 一趟，粗糙度用根常量传进去
+        mCommandList->SetPipelineState(mPrefilterPSO.Get());
+        for (UINT mip = 0; mip < kPrefilterMips; mip++)
+        {
+            const float roughness = (float)mip / (kPrefilterMips - 1); // 0、0.25、0.5、0.75、1
+            mCommandList->SetComputeRoot32BitConstants(0, 1, &roughness, 0);
+            mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(34 + mip)); // u0 = 这一级的 UAV
+            const UINT size = kPrefilterSize >> mip; // 256、128、64、32、16
+            mCommandList->Dispatch((size + 7) / 8, (size + 7) / 8, 6);
+        }
+        // ③ BRDF LUT：不读天空图，普通 2D
+        mCommandList->SetPipelineState(mBrdfLutPSO.Get());
+        mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(39)); // u0 = LUT 的 UAV
+        mCommandList->Dispatch((kBrdfLutSize + 7) / 8, (kBrdfLutSize + 7) / 8, 1);
+        D3D12_RESOURCE_BARRIER toRead[] = {
+            // 写完都转回 PIXEL_SHADER_RESOURCE：天空、光照 Pass 的像素着色器要读
+            CD3DX12_RESOURCE_BARRIER::Transition(sky, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            CD3DX12_RESOURCE_BARRIER::Transition(mIrradianceMap.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            CD3DX12_RESOURCE_BARRIER::Transition(mPrefilteredMap.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            CD3DX12_RESOURCE_BARRIER::Transition(mBrdfLut.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        };
+        mCommandList->ResourceBarrier(_countof(toRead), toRead);
+        mIblDirty = false;
     }
 
     // ======================== 成员变量 ========================
@@ -3545,6 +3835,20 @@ private:
     ComPtr<ID3D12PipelineState> mSsaoPSO;
     ComPtr<ID3DBlob> mSsaoBlurPSByteCode[2]; // [0] 横，[1] 竖
     ComPtr<ID3D12PipelineState> mSsaoBlurPSO[2];
+
+    // IBL（s105）：三张图放在堆第 30～32 格（SRV），第 33～39 格是生成时写用的 UAV
+    bool mIbl = true; // 面板"IBL"：勾上 = 环境光用 IBL，不勾 = 以前的常数环境光
+    float mIblIntensity = 1.0f; // 面板"IBL 强度"
+    int mSkyView = 0; // 面板"天空显示"：0 原图，1 辐照度图，2～6 预滤波第 0～4 级
+    bool mIblDirty = true; // 这一帧开头要不要（重新）生成三张图：启动后第一帧、热重载之后
+    ComPtr<ID3D12Resource> mIrradianceMap, mPrefilteredMap, mBrdfLut;
+    ComPtr<ID3D12RootSignature> mIblRootSignature;
+    ComPtr<ID3DBlob> mIrradianceCSByteCode, mPrefilterCSByteCode, mBrdfLutCSByteCode;
+    ComPtr<ID3D12PipelineState> mIrradiancePSO, mPrefilterPSO, mBrdfLutPSO;
+    ComPtr<ID3D12QueryHeap> mIblQueryHeap; // 预计算前后 2 个时间戳
+    ComPtr<ID3D12Resource> mIblTimeReadback;
+    FrameResource* mIblTimeFrame = nullptr; // 哪一帧记了时间戳（还没读）
+    float mIblPrecomputeMs = 0.0f; // 面板显示
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR pCmdLine, int nShowCmd)

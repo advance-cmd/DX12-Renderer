@@ -37,11 +37,13 @@ struct PassConstants
     float4x4 ShadowTransform;
     float4x4 InvViewProj;
     float3 EyePosW;
-    float padding;
-    float4 AmbientLight;
+    float IblIntensity;  // IBL 的强度倍数（面板"IBL 强度"）
+    float4 AmbientLight; // 不用 IBL 时的常数环境光
     float4 FogColor;
     float FogStart;
     float FogRange;
+    int SkyView;         // 天空显示：0 原图，1 辐照度图，2～6 预滤波第 0～4 级（面板"天空显示"）
+    int IblOn;           // 1 = 环境光用 IBL，0 = 用以前的常数 AmbientLight（面板"IBL"）
     Light Lights[MaxLights];
 };
 
@@ -49,6 +51,13 @@ Texture2D gShadowMap : register(t1);
 TextureCube gCubeMap : register(t2); // 天空图：用方向去查
 SamplerState gsamLinearWrap : register(s0);
 SamplerComparisonState gsamShadow : register(s1);
+SamplerState gsamLinearClamp : register(s2); // 双线性 + 夹边：放大 SSAO 遮蔽图、查 BRDF LUT（查到边上不能绕回另一边）
+
+// IBL 的三张图（根参数 10，堆第 30～32 格）。启动后第一帧由 IBL.hlsl 的三个计算着色器生成，之后只查不写
+TextureCube gIrradianceMap : register(t10);  // 辐照度图（32×32）：用法线查，漫反射
+TextureCube gPrefilteredMap : register(t11); // 预滤波环境贴图（256×256、5 级 mip）：用反射方向查，第 i 级 = 粗糙度 i/4
+Texture2D gBrdfLut : register(t12);          // BRDF LUT（256×256）：用 (NoV, 粗糙度) 查，存 (A, B)，镜面那一半 = F0·A + B
+static const float kPrefilterMips = 5.0f;    // 预滤波有几级 mip，必须和 C++ 的 kPrefilterMips 一致
 
 //金属没有漫反射
 float3 DiffuseColor(MaterialConstants mat){
@@ -263,4 +272,20 @@ float CalcShadowFactor(float4 shadowPosH)
         percentLit += gShadowMap.SampleCmpLevelZero(
             gsamShadow, shadowPosH.xy + offsets[i], depth);
     return percentLit / 9.0f;
+}
+
+// 环境光：从天空四面八方来的光。pass.IblOn = 0：以前的常数环境光；1：IBL = 漫反射（辐照度图）+ 镜面（预滤波 × BRDF LUT）
+float3 AmbientLighting(MaterialConstants mat, float3 normal, float3 toEye, PassConstants pass)
+{
+    if (pass.IblOn == 0)
+        return pass.AmbientLight.rgb * (DiffuseColor(mat) + F0(mat));
+    float3 irradiance = gIrradianceMap.SampleLevel(gsamLinearWrap, SkyDir(normal), 0).rgb;
+    float3 diffuse = irradiance * DiffuseColor(mat);
+    float3 r = reflect(-toEye, normal);
+    float a = mat.Roughness;
+    float3 prefiltered = gPrefilteredMap.SampleLevel(gsamLinearWrap, SkyDir(r), a * (kPrefilterMips - 1)).rgb;
+    float NoV = dot(normal,toEye);
+    float2 dfg = gBrdfLut.SampleLevel(gsamLinearClamp, float2(NoV, a), 0).rg;
+    float3 specular = prefiltered * (F0(mat)*dfg.x + dfg.y);
+    return (diffuse + specular) * pass.IblIntensity;
 }

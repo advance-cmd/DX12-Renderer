@@ -83,17 +83,18 @@ float4 PS(VertexOut pin) : SV_Target
     float3 normal;
     GetSurface(pin, mat, normal);
 
-    float3 ambient = gPass.AmbientLight.rgb * (DiffuseColor(mat) + F0(mat));
     float3 toEye = gPass.EyePosW - pin.PosW;
     float distToEye = length(toEye);
     toEye /= distToEye;
+    float3 ambient = AmbientLighting(mat, normal, toEye, gPass); // 环境光：IBL 或常数（面板"IBL"）
     float3 shadowFactor = float3(1.0f, 1.0f, 1.0f);
     shadowFactor[0] = CalcShadowFactor(pin.shadowPosH); // Lights[0] 是太阳，阴影图是站在太阳那里画的
     float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye,shadowFactor);
 
     float4 res = float4(ambient + direct, mat.BaseColor.a);
 #ifdef ENV_REFLECT
-    res.rgb += EnvReflection(mat, normal, toEye);   // 水面多出一份"从天空反射来的光"：要用 toEye，属于算光，留在 PS
+    if (!gPass.IblOn) // IBL 的镜面那一半已经包含了天空的反射，再加一次就重复了
+    res.rgb += EnvReflection(mat, normal, toEye);
 #endif
 #ifdef FOG
     res.rgb = ApplyFog(res.rgb, distToEye, FogColorAt(toEye), gPass.FogStart, gPass.FogRange);

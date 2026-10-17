@@ -37,13 +37,14 @@ struct PassConstants
     XMFLOAT4X4 InvViewProj; //从深度反推世界坐标
 
     XMFLOAT3 EyePosW;
-    float padding;
+    float IblIntensity; // IBL 强度倍数（面板）
 
     XMFLOAT4 AmbientLight;
     XMFLOAT4 FogColor;
     float FogStart;
     float FogRange;
-    XMFLOAT2 FogPad;
+    int SkyView; // 天空显示：0 原图，1 辐照度图，2～6 预滤波第 0～4 级
+    int IblOn;   // 1 = 环境光用 IBL，0 = 常数 AmbientLight
     Light Lights[MaxLights];
 };
 
