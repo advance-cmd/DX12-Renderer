@@ -104,7 +104,7 @@ enum class DrawPass
 };
 
 static constexpr UINT kTimestampCount = 10;
-static constexpr UINT kShadowMapSize = 1024;
+static constexpr UINT kShadowMapSize = 2048;
 static constexpr float kSceneRadius = 120.0f; // 场景包围球：球心在原点（陆地 160×160，山高 ±43，最远的角离原点约 117）
 
 //场景先画进这张 HDR 纹理，每个通道 16 位浮点，亮度可以超过 1，最后再压到后台缓冲
