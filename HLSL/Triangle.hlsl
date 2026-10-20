@@ -34,7 +34,6 @@ struct VertexOut
     float3 NormalW : NORMAL;
     float2 TexC : TEXCOORD;
     float3 PosW : TEXCOORD1;
-    float4 shadowPosH : TEXCOORD2;
     float3 TangentW : TANGENT;
 };
 
@@ -46,7 +45,6 @@ VertexOut VS(VertexIn vin)
     vout.NormalW = mul(vin.NormalL, (float3x3)gObj.WorldInvTranspose); // 转到世界空间
     vout.TexC = vin.TexC;
     vout.PosW = posW.xyz;
-    vout.shadowPosH = mul(posW,gPass.ShadowTransform);
     vout.TangentW = mul(vin.TangentU,(float3x3)gObj.World);
     return vout;
 }
@@ -84,9 +82,9 @@ float4 PS(VertexOut pin) : SV_Target
     toEye /= distToEye;
     float3 ambient = AmbientLighting(mat, normal, toEye, gPass); // 环境光：IBL 或常数（面板"IBL"）
     float3 shadowFactor = float3(1.0f, 1.0f, 1.0f);
-    shadowFactor[0] = CalcShadowFactor(pin.shadowPosH); // Lights[0] 是太阳，阴影图是站在太阳那里画的
+    shadowFactor[0] = CalcShadowFactor(gPass, pin.PosW, normal); // Lights[0] 是太阳；级联阴影按离相机多远选级联
     float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye,shadowFactor);
-    float4 res = float4(ambient + direct, mat.BaseColor.a);
+    float4 res = float4((ambient + direct) * CascadeDebugTint(gPass, pin.PosW), mat.BaseColor.a);
 #ifdef FOG
     res.rgb = ApplyFog(res.rgb, distToEye, FogColorAt(toEye), gPass.FogStart, gPass.FogRange);
 #endif

@@ -26,7 +26,6 @@ struct GeoOut
     float3 NormalW : NORMAL;
     float2 TexC : TEXCOORD;
     uint PrimID : SV_PrimitiveID;
-    float4 shadowPosH : TEXCOORD1;
 };
 
 VertexOut VS(VertexIn vin)
@@ -64,9 +63,9 @@ float4 PS(GeoOut pin) : SV_Target
     toEye /= distToEye;
     float3 ambient = AmbientLighting(mat, normal, toEye, gPass); // 环境光：IBL 或常数（面板"IBL"）
     float3 shadowFactor = float3(1.0f, 1.0f, 1.0f);
-    shadowFactor[0] = CalcShadowFactor(pin.shadowPosH); // Lights[0] 是太阳，阴影图是站在太阳那里画的
+    shadowFactor[0] = CalcShadowFactor(gPass, pin.PosW, normal); // Lights[0] 是太阳；级联阴影按离相机多远选级联
     float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye,shadowFactor);
-    float4 res = float4(ambient + direct, mat.BaseColor.a);
+    float4 res = float4((ambient + direct) * CascadeDebugTint(gPass, pin.PosW), mat.BaseColor.a);
 #ifdef FOG
     res.rgb = ApplyFog(res.rgb, distToEye, FogColorAt(toEye), gPass.FogStart, gPass.FogRange);
 #endif
@@ -122,7 +121,6 @@ void GS(
         gout.NormalW = look;      // 法线朝向眼睛（所以逆光的时候是暗的）
         gout.TexC = texC[i];
         gout.PrimID = primID;
-        gout.shadowPosH = mul(v[i],gPass.ShadowTransform);
         triStream.Append(gout);
     }
 

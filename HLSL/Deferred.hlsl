@@ -76,9 +76,9 @@ float4 PS(VertexOut pin) : SV_Target
     ambient *= gAoMap.SampleLevel(gsamLinearClamp, pin.UV, 0);
 
     float3 shadowFactor = float3(1.0f, 1.0f, 1.0f);
-    shadowFactor[0] = CalcShadowFactor(mul(float4(posW, 1.0f), gPass.ShadowTransform));
+    shadowFactor[0] = CalcShadowFactor(gPass, posW, normal); // 级联阴影：按离相机多远选级联
     float3 direct = ComputeLighting(gPass.Lights, mat, posW, normal, toEye, shadowFactor);
-    float3 color = ambient + direct;
+    float3 color = (ambient + direct) * CascadeDebugTint(gPass, posW); // 面板"级联上色"关着时乘 1
 #ifdef FOG
     color = ApplyFog(color, distToEye, FogColorAt(toEye), gPass.FogStart, gPass.FogRange);
 #endif
@@ -287,6 +287,11 @@ float4 PS_GBufferView(VertexOut pin) : SV_Target
 #elif GBUFFER_VIEW == 5
     // 深度缓冲里的值和距离不成正比（近处变得快，远处全挤在 1 附近），换回观察空间的 z 再显示
     c = depth >= 1.0f ? 1.0f : saturate(ViewDepth(depth) / 150.0f);
+#elif GBUFFER_VIEW == 8
+    // 太阳的阴影因子（白 = 亮，黑 = 影子里）：不算光、不加环境光，看痤疮、悬浮、PCF 的边最清楚
+    if (depth >= 1.0f)
+        return float4(1.0f, 1.0f, 1.0f, 1.0f);
+    c = CalcShadowFactor(gPass, WorldPosFromDepth(pin.UV, depth), normal);
 #elif GBUFFER_VIEW == 7
     // SSAO 的遮蔽图（半分辨率，所以除以 2；不过滤，看到的就是存的值）：白 = 没被挡，黑 = 挡住了
     c = gAoMap.Load(int3(pixel / 2, 0));

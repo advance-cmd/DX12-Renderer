@@ -162,6 +162,7 @@
     <None Include="HLSL\Bloom.hlsl" />
     <None Include="HLSL\Deferred.hlsl" />
     <None Include="HLSL\IBL.hlsl" />
+    <None Include="HLSL\Shadow.hlsl" />
     <ClCompile Include="Waves.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="ThirdParty\imgui\imgui.cpp" />

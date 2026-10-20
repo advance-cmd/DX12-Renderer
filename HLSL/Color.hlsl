@@ -29,7 +29,6 @@ struct VertexOut
     float4 PosH : SV_POSITION; // H = Homogeneous，齐次裁剪空间
     float3 NormalW : NORMAL;
     float3 PosW : TEXCOORD;
-    float4 shadowPosH : TEXCOORD1;
 };
 
 VertexOut VS(VertexIn vin)
@@ -39,7 +38,6 @@ VertexOut VS(VertexIn vin)
     vout.PosH = mul(posW, gPass.ViewProj); // 世界 → 裁剪空间
     vout.NormalW = mul(vin.NormalL, (float3x3)gObj.WorldInvTranspose); // 转到世界空间
     vout.PosW = posW.xyz;
-    vout.shadowPosH = mul(posW,gPass.ShadowTransform);
     return vout;
 }
 
@@ -88,10 +86,10 @@ float4 PS(VertexOut pin) : SV_Target
     toEye /= distToEye;
     float3 ambient = AmbientLighting(mat, normal, toEye, gPass); // 环境光：IBL 或常数（面板"IBL"）
     float3 shadowFactor = float3(1.0f, 1.0f, 1.0f);
-    shadowFactor[0] = CalcShadowFactor(pin.shadowPosH); // Lights[0] 是太阳，阴影图是站在太阳那里画的
+    shadowFactor[0] = CalcShadowFactor(gPass, pin.PosW, normal); // Lights[0] 是太阳；级联阴影按离相机多远选级联
     float3 direct = ComputeLighting(gPass.Lights, mat, pin.PosW, normal, toEye,shadowFactor);
 
-    float4 res = float4(ambient + direct, mat.BaseColor.a);
+    float4 res = float4((ambient + direct) * CascadeDebugTint(gPass, pin.PosW), mat.BaseColor.a);
 #ifdef ENV_REFLECT
     if (!gPass.IblOn) // IBL 的镜面那一半已经包含了天空的反射，再加一次就重复了
     res.rgb += EnvReflection(mat, normal, toEye);

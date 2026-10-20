@@ -7,6 +7,7 @@
 #endif
 static const float PI = 3.14159265f;
 static const float MinRoughness = 0.045f; // 感知粗糙度的下限
+#define kMaxCascades 4 // 级联阴影最多几级，必须和 C++ FrameResource.h 的 kMaxCascades 一致
 
 // 必须和 C++ FrameResource.h 的 Light 一一对应（每两个字段正好一行 16 字节，共 48 字节）
 struct Light
@@ -34,7 +35,6 @@ struct MaterialConstants
 struct PassConstants
 {
     float4x4 ViewProj;
-    float4x4 ShadowTransform;
     float4x4 InvViewProj;
     float3 EyePosW;
     float IblIntensity;  // IBL 的强度倍数（面板"IBL 强度"）
@@ -44,10 +44,22 @@ struct PassConstants
     float FogRange;
     int SkyView;         // 天空显示：0 原图，1 辐照度图，2～6 预滤波第 0～4 级（面板"天空显示"）
     int IblOn;           // 1 = 环境光用 IBL，0 = 用以前的常数 AmbientLight（面板"IBL"）
+    // 级联阴影（和 C++ 一一对应，含义见 FrameResource.h）
+    float4x4 ShadowTransforms[kMaxCascades];
+    float4 CascadeSplits;
+    float4 CascadeTexel;
+    int CascadeCount;
+    int PcfRadius;
+    float NormalOffset;
+    float CascadeBlend;
+    int ShadowDebug;
+    int Pcss;
+    float LightTan;
+    float ShadowDepthRange;
     Light Lights[MaxLights];
 };
 
-Texture2D gShadowMap : register(t1);
+Texture2DArray gShadowMap : register(t1);
 TextureCube gCubeMap : register(t2); // 天空图：用方向去查
 SamplerState gsamLinearWrap : register(s0);
 SamplerComparisonState gsamShadow : register(s1);
@@ -253,27 +265,6 @@ float3 NormalSampleToWorldSpace(float3 normalMapSample, float3 unitNormalW, floa
     return mul(normalT,TBN); // x·T + y·B + z·N
 }
 
-// 返回 0～1：1 = 全亮，0 = 全在影子里。shadowPosH = 这个点在阴影图里的 (u, v, 深度, w)
-float CalcShadowFactor(float4 shadowPosH)
-{
-    shadowPosH.xyz /= shadowPosH.w; //正交投影 w = 1，但是聚光灯就不一定w=1了，所以这句还是要写
-    float depth = shadowPosH.z;
-    uint width, height, numMips;
-    gShadowMap.GetDimensions(0, width, height, numMips);
-    float dx = 1.0f / (float)width; //一个纹素在uv里有多宽
-
-    const float2 offsets[9] = {
-        float2(-dx, -dx), float2(0, -dx), float2(dx, -dx),
-        float2(-dx, 0), float2(0, 0), float2(dx, 0),
-        float2(-dx, dx), float2(0, dx), float2(dx, dx)
-    };
-    float percentLit = 0.0f;
-    [unroll] for (int i = 0; i < 9; ++i)
-        percentLit += gShadowMap.SampleCmpLevelZero(
-            gsamShadow, shadowPosH.xy + offsets[i], depth);
-    return percentLit / 9.0f;
-}
-
 // 环境光：从天空四面八方来的光。pass.IblOn = 0：以前的常数环境光；1：IBL = 漫反射（辐照度图）+ 镜面（预滤波 × BRDF LUT）
 float3 AmbientLighting(MaterialConstants mat, float3 normal, float3 toEye, PassConstants pass)
 {
@@ -289,3 +280,5 @@ float3 AmbientLighting(MaterialConstants mat, float3 normal, float3 toEye, PassC
     float3 specular = prefiltered * (F0(mat)*dfg.x + dfg.y);
     return (diffuse + specular) * pass.IblIntensity;
 }
+
+#include "Shadow.hlsl" // 级联阴影（s109）

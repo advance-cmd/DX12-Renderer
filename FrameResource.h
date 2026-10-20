@@ -9,6 +9,7 @@ using namespace DirectX;
 // 帧资源的份数：CPU 最多领先 GPU 这么多帧。RenderItem::NumFramesDirty 的初始值也用它
 inline constexpr int gNumFrameResources = 3;
 inline constexpr int MaxLights = 100;
+inline constexpr int kMaxCascades = 4; // 级联阴影最多几级。必须和 LightingUtil.hlsl 的 kMaxCascades 一致
 
 struct Light
 {
@@ -33,7 +34,6 @@ struct ObjectConstants
 struct PassConstants
 {
     XMFLOAT4X4 ViewProj;
-    XMFLOAT4X4 ShadowTransform;
     XMFLOAT4X4 InvViewProj; //从深度反推世界坐标
 
     XMFLOAT3 EyePosW;
@@ -45,6 +45,19 @@ struct PassConstants
     float FogRange;
     int SkyView; // 天空显示：0 原图，1 辐照度图，2～6 预滤波第 0～4 级
     int IblOn;   // 1 = 环境光用 IBL，0 = 常数 AmbientLight
+
+    // 级联阴影（s109）。前三项第①步你来填，后面的设置 AI 已经从面板填好了
+    XMFLOAT4X4 ShadowTransforms[kMaxCascades]; // 第 i 级：世界 → 第 i 张阴影图的 (u, v, 深度)
+    XMFLOAT4 CascadeSplits;   // 第 i 级管到观察空间 z = CascadeSplits[i]（这一级的远端）
+    XMFLOAT4 CascadeTexel;    // 第 i 级一个纹素 = 多少世界单位
+    int CascadeCount;         // 现在用几级（1～4）
+    int PcfRadius;            // PCF 核半径：0 → 1×1，1 → 3×3，2 → 5×5 …（第②步起生效）
+    float NormalOffset;       // 法线偏移，单位：这一级的纹素（第②步起生效）
+    float CascadeBlend;       // 过渡带占这一级长度的比例，0 = 不过渡（第③步起生效）
+    int ShadowDebug;          // 1 = 按级联上色
+    int Pcss;                 // 1 = PCSS 软阴影（第④步起生效）
+    float LightTan;           // tan(太阳角半径)：半影宽度 = 遮挡物到接收面的距离 × 它
+    float ShadowDepthRange;   // 阴影图深度 0～1 对应多少世界单位（正交投影的 far - near）
     Light Lights[MaxLights];
 };
 

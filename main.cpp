@@ -104,7 +104,8 @@ enum class DrawPass
 };
 
 static constexpr UINT kTimestampCount = 10;
-static constexpr UINT kShadowMapSize = 4096;
+static constexpr UINT kShadowMapSize = 1024;
+static constexpr float kSceneRadius = 120.0f; // 场景包围球：球心在原点（陆地 160×160，山高 ±43，最远的角离原点约 117）
 
 //场景先画进这张 HDR 纹理，每个通道 16 位浮点，亮度可以超过 1，最后再压到后台缓冲
 static constexpr DXGI_FORMAT kHdrFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -254,6 +255,7 @@ public:
         BuildIblResources(); // 要用到堆（写第 30、33 格）
         BuildTimestampQueries(); //Pass时间记录
         BuildIblTimer(); // IBL 预计算的 2 个时间戳
+        BuildCsmTimer(); // 级联阴影每一级的时间戳
         BuildShadowMap(); //构建阴影贴图资源和View
         BuildShapeGeometry(); // 录制复制命令（木箱）
         BuildLandGeometry(); // 录制复制命令（陆地的顶点/索引）
@@ -385,7 +387,7 @@ protected:
             .Alignment = 0,
             .Width = kShadowMapSize,
             .Height = kShadowMapSize,
-            .DepthOrArraySize = 1,
+            .DepthOrArraySize = kMaxCascades, // 纹理数组：每级一页
             .MipLevels = 1,
             .Format = DXGI_FORMAT_R24G8_TYPELESS,
             .SampleDesc = {.Count = 1, .Quality = 0},
@@ -405,33 +407,89 @@ protected:
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &optClear,
             IID_PPV_ARGS(&mShadowMap)));
 
-        // DSV：框架的 DSV 堆只有 1 格（屏幕的深度缓冲占着），自己建一个 1 格的小堆
+        // DSV：框架的 DSV 堆只有 1 格（屏幕的深度缓冲占着），自己建一个小堆，每级一格
         D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {
             .Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
-            .NumDescriptors = 1,
+            .NumDescriptors = kMaxCascades,
             .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
             .NodeMask = 0,
         };
         ThrowIfFailed(mDevice->CreateDescriptorHeap(&dsvHeapDesc,IID_PPV_ARGS(&mShadowDsvHeap)));
         // D3DApp 建屏幕深度缓冲的 DSV 时传的是 nullptr：那块资源本身就是有类型的 D24S8。
         // 阴影图是无类型的，必须告诉 DSV "按什么格式写"
-        D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {
-            .Format = DXGI_FORMAT_D24_UNORM_S8_UINT,
-            .ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D,
-            .Flags = D3D12_DSV_FLAG_NONE,
-            .Texture2D = {.MipSlice = 0},
-        };
-        mDevice->CreateDepthStencilView(mShadowMap.Get(), &dsvDesc,
-                                        mShadowDsvHeap->GetCPUDescriptorHandleForHeapStart());
+        // 第 i 个 DSV 只看数组的第 i 层：阴影 Pass 画第 i 级时绑它
+        for (UINT i = 0; i < kMaxCascades; i++)
+        {
+            D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {
+                .Format = DXGI_FORMAT_D24_UNORM_S8_UINT,
+                .ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY,
+                .Flags = D3D12_DSV_FLAG_NONE,
+                .Texture2DArray = {.MipSlice = 0, .FirstArraySlice = i, .ArraySize = 1},
+            };
+            CD3DX12_CPU_DESCRIPTOR_HANDLE dsv(mShadowDsvHeap->GetCPUDescriptorHandleForHeapStart(), i,
+                                              mDSVDescriptorSize);
+            mDevice->CreateDepthStencilView(mShadowMap.Get(), &dsvDesc, dsv);
+        }
         // SRV：放在大堆第 9 格，只读前 24 位深度，后 8 位模板不要
         D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {
             .Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
-            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
             .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            .Texture2D = {.MostDetailedMip = 0, .MipLevels = 1},
+            .Texture2DArray = {
+                .MostDetailedMip = 0,
+                .MipLevels = 1,
+                .FirstArraySlice = 0,
+                .ArraySize = kMaxCascades
+            }
         };
         CD3DX12_CPU_DESCRIPTOR_HANDLE srv(mHeap->GetCPUDescriptorHandleForHeapStart(), 9, mCSUDescriptorSize);
         mDevice->CreateShaderResourceView(mShadowMap.Get(), &srvDesc, srv);
+    }
+
+    // 级联阴影每一级的耗时（AI 写的）：每份帧资源 kMaxCascades + 1 个时间戳（第 i 级前后各一个，相邻共用）
+    void BuildCsmTimer()
+    {
+        D3D12_QUERY_HEAP_DESC desc = {
+            .Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+            .Count = (kMaxCascades + 1) * gNumFrameResources,
+            .NodeMask = 0,
+        };
+        ThrowIfFailed(mDevice->CreateQueryHeap(&desc, IID_PPV_ARGS(&mCsmQueryHeap)));
+        CD3DX12_HEAP_PROPERTIES readBackHeap(D3D12_HEAP_TYPE_READBACK);
+        CD3DX12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(desc.Count * sizeof(UINT64));
+        ThrowIfFailed(mDevice->CreateCommittedResource(&readBackHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&mCsmTimeReadback)));
+    }
+
+    // 轮到这份帧资源时（GPU 已经做完它上次那一帧）读出各级阴影 Pass 的耗时，攒 60 帧取平均
+    void ReadCsmTimes()
+    {
+        const int count = mCsmFrameCount[mCurrFrameResourceIndex];
+        if (count == 0) return;
+        const UINT base = mCurrFrameResourceIndex * (kMaxCascades + 1);
+        D3D12_RANGE readRange{base * sizeof(UINT64), (base + kMaxCascades + 1) * sizeof(UINT64)};
+        UINT64* data = nullptr;
+        ThrowIfFailed(mCsmTimeReadback->Map(0, &readRange, reinterpret_cast<void**>(&data)));
+        const UINT64* t = data + base;
+        for (int k = 0; k < count; k++)
+        {
+            mCsmMsSum[k] += (t[k + 1] - t[k]) * 1000.0 / mTimestampFreq;
+        }
+        D3D12_RANGE noWrite{0, 0};
+        mCsmTimeReadback->Unmap(0, &noWrite);
+        if (++mCsmSamples == 60)
+        {
+            std::string line = std::format("[CSM] n={}", count);
+            for (int k = 0; k < kMaxCascades; k++)
+            {
+                mCsmMs[k] = k < count ? (float)(mCsmMsSum[k] / mCsmSamples) : 0.0f;
+                mCsmMsSum[k] = 0.0;
+                if (k < count) line += std::format(" {:.3f}", mCsmMs[k]);
+            }
+            mCsmSamples = 0;
+            OutputDebugStringA((line + "\n").c_str()); // 调试输出窗口里能看到，沙盒的计时脚本也读它
+        }
     }
 
     void BuildTimestampQueries()
@@ -705,7 +763,7 @@ protected:
         if (mDeferred) // 调试视图只有延迟模式才有（要读 G-Buffer）
         {
             // 第 7 个"环境光遮蔽"要等 SSAO 第①步写完、把 kGBufferViews 改成 7 才会出现在下拉框里
-            const char* gbufferViews[] = {"关", "基础色", "法线", "粗糙度", "金属度", "深度", "世界坐标", "环境光遮蔽"};
+            const char* gbufferViews[] = {"关", "基础色", "法线", "粗糙度", "金属度", "深度", "世界坐标", "环境光遮蔽", "阴影因子"};
             ImGui::Combo("G-Buffer 视图", &mGBufferView, gbufferViews, 1 + kGBufferViews);
             ImGui::Checkbox("SSAO", &mSsao); // 关掉 = 遮蔽图清成全白（1 = 没被挡），环境光不变暗
             ImGui::SliderInt("AO 模糊次数", &mSsaoBlurCount, 0, 4); // "横 + 竖"算一次；0 = 看没模糊的噪点
@@ -717,6 +775,39 @@ protected:
         if (mDeferred && mManyLights) // 只有延迟 + 小灯时才有两种画法可选
         {
             ImGui::Checkbox("光体积", &mLightVolumes); // 勾上：每盏小灯画一个球；不勾：全屏 Pass 里循环 64 盏
+        }
+        if (ImGui::TreeNodeEx("阴影（级联）", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::SliderInt("级联数", &mCascadeCount, 1, kMaxCascades);
+            ImGui::SliderFloat("划分 λ", &mCascadeLambda, 0.0f, 1.0f, "%.2f（0 均匀，1 对数）");
+            ImGui::SliderFloat("阴影距离", &mShadowDistance, 20.0f, 300.0f, "%.0f");
+            ImGui::Checkbox("级联上色", &mCascadeDebug);
+            ImGui::SliderFloat("过渡带", &mCascadeBlend, 0.0f, 0.5f, "%.2f");
+            ImGui::SliderInt("PCF 核半径", &mPcfRadius, 0, 4);
+            ImGui::SameLine();
+            ImGui::Text("%d×%d", 2 * mPcfRadius + 1, 2 * mPcfRadius + 1);
+            ImGui::SliderFloat("法线偏移", &mNormalOffset, 0.0f, 4.0f, "%.2f 纹素");
+            // 硬件偏移在 PSO 里：松开滑块时才重建 PSO（拖动过程中每帧都建太慢）
+            bool rebuild = false;
+            ImGui::SliderInt("固定偏移", &mDepthBias, 0, 20000);
+            rebuild |= ImGui::IsItemDeactivatedAfterEdit();
+            ImGui::SliderFloat("斜率偏移", &mSlopeBias, 0.0f, 5.0f, "%.2f");
+            rebuild |= ImGui::IsItemDeactivatedAfterEdit();
+            if (rebuild)
+            {
+                FlushCommandQueue(); // GPU 可能还在用旧 PSO
+                BuildPSO();
+            }
+            ImGui::Checkbox("PCSS 软阴影", &mPcss);
+            if (mPcss)
+            {
+                ImGui::SliderFloat("太阳角直径", &mSunAngle, 0.1f, 5.0f, "%.2f°");
+            }
+            for (int i = 0; i < mCsmFrameCount[mCurrFrameResourceIndex]; i++)
+            {
+                ImGui::Text("第 %d 级：到 %.1f，纹素 %.3f，%.3f ms", i, mCascadeSplits[i], mCascadeTexel[i], mCsmMs[i]);
+            }
+            ImGui::TreePop();
         }
         bool sunChanged = ImGui::SliderFloat("太阳方位角", &mSunAzimuth, -180.0f, 180.0f, "%.1f°");
         sunChanged |= ImGui::SliderFloat("太阳仰角", &mSunElevation, 5.0f, 85.0f, "%.1f°");
@@ -773,6 +864,7 @@ protected:
 
         if (mCurrentFrame->Fence != 0)
         {
+            ReadCsmTimes();
             const UINT tsBase = mCurrFrameResourceIndex * kTimestampCount;
             D3D12_RANGE readRange{
                 tsBase * sizeof(UINT64), (tsBase + kTimestampCount) * sizeof(UINT64)
@@ -882,13 +974,13 @@ protected:
             mIblTimeFrame = mCurrentFrame; // 轮回到这份帧资源时，这一帧 GPU 肯定做完了，再去读
         }
 
-        // 3 份 Pass 常量挨着放：passCB = 第 0 份（主 Pass），+1 份 = 镜像，+2 份 = 阴影 Pass
+        // 2 + kMaxCascades 份 Pass 常量挨着放：passCB = 第 0 份（主 Pass），+1 份 = 镜像，从 +2 份开始是第 0～3 级阴影
         const UINT passCBByteSize = CalcConstantBufferByteSize(sizeof(PassConstants));
         const D3D12_GPU_VIRTUAL_ADDRESS passCB = mCurrentFrame->PassCB->Resource()->GetGPUVirtualAddress();
 
         // ① 阴影 Pass：从太阳那里把场景的深度画进阴影图
         mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 0); // T0
-        DrawShadowMap(passCB + 2 * passCBByteSize);
+        DrawShadowMap(passCB + 2 * passCBByteSize, passCBByteSize);
         mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 1); // T1
         mCommandList->SetGraphicsRootDescriptorTable(5, HeapGpuHandle(10));
         mCommandList->SetGraphicsRootDescriptorTable(10, HeapGpuHandle(30)); // IBL 三张图（堆第 30～32 格）
@@ -1069,28 +1161,40 @@ private:
     // ======================== 每帧 ========================
 
     // 阴影 Pass：站在灯的位置只画深度，画进阴影图。进来、出去时阴影图都是 PIXEL_SHADER_RESOURCE
-    void DrawShadowMap(D3D12_GPU_VIRTUAL_ADDRESS shadowPassCB)
+    void DrawShadowMap(D3D12_GPU_VIRTUAL_ADDRESS firstCascadeCB, UINT passCBByteSize)
     {
-        // 视口、裁剪矩形换成阴影图的大小
+        // 每一级阴影 Pass 的耗时（AI 写的）：这份帧资源的 kMaxCascades + 1 个时间戳从 csmBase 开始
+        const UINT csmBase = mCurrFrameResourceIndex * (kMaxCascades + 1);
+        mCsmFrameCount[mCurrFrameResourceIndex] = mCascadeCount; // 这一帧画几级（面板和计时按它读）
+        // 视口、裁剪矩形换成阴影图的大小（4 页一样大，4 级共用）
         mCommandList->RSSetViewports(1, &mShadowViewPort);
         mCommandList->RSSetScissorRects(1, &mShadowScissorRect);
-        // 这一趟阴影图当深度缓冲写：PIXEL_SHADER_RESOURCE → DEPTH_WRITE
+        // 这一趟阴影图当深度缓冲写：PIXEL_SHADER_RESOURCE → DEPTH_WRITE（不写子资源号 = 4 页一起转）
         D3D12_RESOURCE_BARRIER b1[] = {
             CD3DX12_RESOURCE_BARRIER::Transition(mShadowMap.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                                                  D3D12_RESOURCE_STATE_DEPTH_WRITE),
         };
         mCommandList->ResourceBarrier(1, b1);
-        // 只有 DSV（堆里只有 1 格，就是开头那格），没有颜色目标
-        D3D12_CPU_DESCRIPTOR_HANDLE shadowDsv = mShadowDsvHeap->GetCPUDescriptorHandleForHeapStart();
-        mCommandList->OMSetRenderTargets(0, nullptr, false, &shadowDsv);
-        mCommandList->ClearDepthStencilView(shadowDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr); // 只清深度；最后两个 = 整张都清
-        mCommandList->SetGraphicsRootConstantBufferView(2, shadowPassCB); // 第 2 份 Pass 常量：ViewProj 是灯的
-        DrawRenderItems(mRitemLayer[(int)RenderLayer::Opaque], DrawPass::Shadow);
-        if (mShowTestSpheres)
+        // 每一级：绑第 i 层的 DSV → 清 → 换成第 i 级的 Pass 常量 → 画一遍
+        for (int i = 0; i < mCascadeCount; i++)
         {
-            DrawRenderItems(mRitemLayer[(int)RenderLayer::TestSpheres], DrawPass::Shadow);
+            mCommandList->EndQuery(mCsmQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, csmBase + i); // 计时（给的）
+            CD3DX12_CPU_DESCRIPTOR_HANDLE dsv(mShadowDsvHeap->GetCPUDescriptorHandleForHeapStart(), i,
+                                              mDSVDescriptorSize);
+            mCommandList->OMSetRenderTargets(0, nullptr, false, &dsv);
+            mCommandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+            mCommandList->SetGraphicsRootConstantBufferView(2, firstCascadeCB + i * passCBByteSize);
+            DrawRenderItems(mRitemLayer[(int)RenderLayer::Opaque], DrawPass::Shadow);
+            if (mShowTestSpheres)
+            {
+                DrawRenderItems(mRitemLayer[(int)RenderLayer::TestSpheres], DrawPass::Shadow);
+            }
         }
-        // 转回 PIXEL_SHADER_RESOURCE：主 Pass 要把它当纹理读
+        // 计时（给的）：N 级前后共 N + 1 个时间戳
+        mCommandList->EndQuery(mCsmQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, csmBase + mCascadeCount);
+        mCommandList->ResolveQueryData(mCsmQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, csmBase, mCascadeCount + 1,
+                                       mCsmTimeReadback.Get(), csmBase * sizeof(UINT64));
+        // b2 屏障：原样不动
         D3D12_RESOURCE_BARRIER b2[] = {
             CD3DX12_RESOURCE_BARRIER::Transition(mShadowMap.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
                                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
@@ -1176,7 +1280,12 @@ private:
         XMStoreFloat4x4(
             &pc.InvViewProj,
             XMMatrixTranspose(invViewProj));
-        XMStoreFloat4x4(&pc.ShadowTransform, XMMatrixTranspose(XMLoadFloat4x4(&mShadowTransform)));
+        for (int t = 0; t < kMaxCascades; t++)
+        {
+            XMStoreFloat4x4(&pc.ShadowTransforms[t], XMMatrixTranspose(XMLoadFloat4x4(&mShadowTransforms[t])));
+        }
+        pc.CascadeSplits = {mCascadeSplits[0], mCascadeSplits[1], mCascadeSplits[2], mCascadeSplits[3]};
+        pc.CascadeTexel = {mCascadeTexel[0], mCascadeTexel[1], mCascadeTexel[2], mCascadeTexel[3]};
         pc.EyePosW = mCamera.GetPosition3f();
         // 灯和环境光都是线性值：以前在 sRGB 编码过的数值上凭眼睛调的，换算时每个分量取 2.2 次方（原值写在注释里）
         pc.AmbientLight = {0.071f, 0.082f, 0.133f, 1.0f}; // 偏蓝：天空散射过来的光，阴影里带点蓝（原 0.3, 0.32, 0.4）
@@ -1186,6 +1295,15 @@ private:
         pc.IblOn = mIbl ? 1 : 0;
         pc.IblIntensity = mIblIntensity;
         pc.SkyView = mSkyView;
+        // 级联阴影的面板设置（AI 写的）。ShadowTransforms、CascadeSplits、CascadeTexel 第①步你来填
+        pc.CascadeCount = mCascadeCount;
+        pc.PcfRadius = mPcfRadius;
+        pc.NormalOffset = mNormalOffset;
+        pc.CascadeBlend = mCascadeBlend;
+        pc.ShadowDebug = mCascadeDebug ? 1 : 0;
+        pc.Pcss = mPcss ? 1 : 0;
+        pc.LightTan = tanf(XMConvertToRadians(0.5f * mSunAngle)); // 面板给的是角直径，半影用角半径
+        pc.ShadowDepthRange = 2.0f * kSceneRadius; // 正交投影的 z 从 -kSceneRadius 到 kSceneRadius
         /*struct Light
         {
         XMFLOAT3 Strength;
@@ -1229,7 +1347,7 @@ private:
         mCurrentFrame->PassCB->CopyData(0, pc);
 
         PassConstants reflectedPass = pc; // 其余都一样，只把灯反射一下
-        const XMMATRIX R = XMMatrixReflect(XMLoadFloat4(&mMirrorPlane));
+        const XMMATRIX R = XMMatrixReflect(XMLoadFloat4(&mMirrorPlane)); //反射矩阵
         const int lightCount = 3 + (mManyLights ? (int)kExtraLights : 0); // 小灯也要反射，镜子里才照得到
         for (int i = 0; i < lightCount; ++i)
         {
@@ -1239,14 +1357,23 @@ private:
             XMStoreFloat3(&reflectedPass.Lights[i].Position,
                           XMVector3TransformCoord(XMLoadFloat3(&pc.Lights[i].Position), R));
         }
-        XMStoreFloat4x4(&reflectedPass.ShadowTransform, XMMatrixTranspose(R * XMLoadFloat4x4(&mShadowTransform)));
+        for (int i = 0; i < kMaxCascades; i++)
+        {
+            // 镜像里的点先反射回原来的位置，再去查阴影图
+            XMStoreFloat4x4(&reflectedPass.ShadowTransforms[i],
+                            XMMatrixTranspose(R * XMLoadFloat4x4(&mShadowTransforms[i])));
+        }
         mCurrentFrame->PassCB->CopyData(1, reflectedPass);
 
         // 阴影 Pass：只把 ViewProj 换成灯的。
         // EyePosW 不改，保留相机位置：树的 GS 靠它决定朝向，阴影图里的树必须和屏幕上的树朝同一个方向
-        PassConstants shadowPass = pc;
-        XMStoreFloat4x4(&shadowPass.ViewProj, XMMatrixTranspose(XMLoadFloat4x4(&mLightViewProj)));
-        mCurrentFrame->PassCB->CopyData(2, shadowPass);
+        // 每一级一份：第几份？主 Pass 占第 0 份、镜像占第 1 份
+        for (int i = 0; i < mCascadeCount; i++)
+        {
+            PassConstants shadowPass = pc;
+            XMStoreFloat4x4(&shadowPass.ViewProj, XMMatrixTranspose(XMLoadFloat4x4(&mCascadeViewProj[i])));
+            mCurrentFrame->PassCB->CopyData(2 + i, shadowPass);
+        }
     }
 
     // 第③步的 64 盏小灯：8×8 排在地砖、木箱、测试球一带，离地 0.7，影响半径 4，色相按编号转一圈
@@ -1267,32 +1394,59 @@ private:
         }
     }
 
-    // 灯是固定的，其实算一次就够；放在每帧算，以后让太阳动起来也不用改
+    // 级联阴影：把相机视锥按距离切成几段，每段配一张阴影图；近处那段框得小，纹素就密
     void UpdateShadowTransform()
     {
-        //场景包围球：中心在原点，半径120（陆地160x160，山高+-43，最远的角离原点约117）
-        const XMVECTOR center = XMVectorZero();
-        const float radius = 120.f;
+        // ① 切分。splits[0] = 近平面，splits[i + 1] = 第 i 级的远端
+        const float n = mCamera.GetNearZ(), f = mShadowDistance;
+        float splits[kMaxCascades + 1] = {n};
+        for (int i = 1; i <= mCascadeCount; i++)
+        {
+            const float p = i * 1.0f / mCascadeCount; // 第 i 个切点在 0～1 里的位置
+            const float logSplit = n * pow(f / n, p); // 对数
+            const float uniSplit = n + (f - n) * p; // 均匀
+            splits[i] = std::lerp(uniSplit, logSplit, mCascadeLambda); // 按 λ（mCascadeLambda）混合，λ = 1 是纯对数
+        }
 
-        //灯的观察矩阵：灯放在球外--从球心逆着光的方向退2个半径
-        const XMVECTOR lightDir = XMLoadFloat3(&mSunDir);
-        const XMVECTOR lightPos = center - lightDir * 2 * radius;
-        const XMMATRIX V = XMMatrixLookAtLH(lightPos, center, XMVectorSet(0.f, 1.f, 0.f, 0.f)); //世界坐标换到太阳视角
-
-        //正交投影：盒子刚好框柱球。先把球心变到灯的观察空间，结果是c
-        XMFLOAT3 c;
-        XMStoreFloat3(&c, XMVector3TransformCoord(center, V));
-        const XMMATRIX P = XMMatrixOrthographicOffCenterLH(c.x - radius, c.x + radius, c.y - radius, c.y + radius,
-                                                           c.z - radius, c.z + radius); //压进盒子，得到 NDC
-        // T：NDC → 纹理坐标（u = 0.5x + 0.5，v = -0.5y + 0.5，深度不变）。行向量，平移在第 4 行
+        // ② 灯的观察矩阵：站在原点、只朝光的方向转，不平移（纹素对齐靠这个）
+        const XMVECTOR lightDir = XMVector3Normalize(XMLoadFloat3(&mSunDir));
+        const XMMATRIX V = XMMatrixLookToLH(XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f), lightDir,
+                                            XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f));
+        // T：NDC → 纹理坐标，照抄你原来的那个矩阵
         const XMMATRIX T(
             .5f, 0, 0, 0,
             0, -.5f, 0, 0,
             0, 0, 1, 0,
-            .5f, .5f, 0, 1.f); //NDC 换成 (u, v, 深度)
+            .5f, .5f, 0, 1.f);
 
-        XMStoreFloat4x4(&mLightViewProj, V * P);
-        XMStoreFloat4x4(&mShadowTransform, V * P * T);
+        // Update() 里先调本函数、后调 UpdateMainPassCB：相机这一帧刚挪过，观察矩阵还"脏"着，
+        // 不先重建的话 GetView() 会触发 Camera.cpp 里的断言（沙盒里踩到过）
+        mCamera.UpdateViewMatrix();
+        const XMMATRIX invView = XMMatrixInverse(nullptr, mCamera.GetView());
+        const float tanX = tanf(0.5f * mCamera.GetFovX()), tanY = tanf(0.5f * mCamera.GetFovY());
+        const float k = tanX * tanX + tanY * tanY; // 观察空间 z = d 处，视锥的角离视线的距离² = d²·k
+        for (int i = 0; i < mCascadeCount; i++)
+        {
+            const float a = splits[i], b = splits[i + 1];
+            // ③ 包住这一段的最小球：球心在视线上 z = c（解上面那个"近角、远角一样远"的方程）
+            const float c = (std::min)(b, (a + b) * (1 + k) / 2);
+            const float r = sqrtf(b * b * k + (b - c) * (b - c));
+            // 球心 (0, 0, c) 到远角 (b·tanX, b·tanY, b) 的距离
+            const XMVECTOR centerW = XMVector3TransformCoord(XMVectorSet(0, 0, c, 1), invView); // 观察空间 → 世界
+            XMFLOAT3 cL;
+            XMStoreFloat3(&cL, XMVector3TransformCoord(centerW, V)); // 世界 → 灯空间
+            // ④ 纹素对齐：x、y 取整到纹素的整数倍
+            const float texel = 2 * r / kShadowMapSize; // 阴影图宽 2r，分成 kShadowMapSize 格
+            cL.x = floorf(cL.x / texel) * texel;
+            cL.y = floorf(cL.y / texel) * texel;
+            // ⑤ 正交投影：x、y 框住球，z 用整个场景（kSceneRadius 我已经加好了）
+            const XMMATRIX P = XMMatrixOrthographicOffCenterLH(cL.x - r, cL.x + r, cL.y - r, cL.y + r, -kSceneRadius,
+                                                               kSceneRadius);
+            XMStoreFloat4x4(&mCascadeViewProj[i], V * P); // 阴影 Pass 用
+            XMStoreFloat4x4(&mShadowTransforms[i], V * P * T); // 主 Pass 用：世界 → (u, v, 深度)
+            mCascadeSplits[i] = b; // 这一级的远端（着色器选级联用，面板也显示）
+            mCascadeTexel[i] = texel;
+        }
     }
 
     void UpdateWaves(const GameTimer& gt)
@@ -2266,7 +2420,7 @@ private:
             mFrameResources.push_back(
                 std::make_unique<FrameResource>(
                     mDevice.Get(),
-                    3,
+                    2 + kMaxCascades, // Pass 常量：0 主、1 镜像、2+i 第 i 级阴影
                     (UINT)mAllItems.size(),
                     (UINT)mWaves->VertexCount(),
                     (UINT)mMaterials.size()));
@@ -3550,8 +3704,8 @@ private:
         ThrowIfFailed(
             mDevice->CreateCommittedResource(&heapProps,D3D12_HEAP_FLAG_NONE,&lutDesc,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&mBrdfLut)));
-        mDevice->CreateShaderResourceView(mBrdfLut.Get(),nullptr,HeapCpuHandle(32));
-        mDevice->CreateUnorderedAccessView(mBrdfLut.Get(),nullptr,nullptr,HeapCpuHandle(39));
+        mDevice->CreateShaderResourceView(mBrdfLut.Get(), nullptr, HeapCpuHandle(32));
+        mDevice->CreateUnorderedAccessView(mBrdfLut.Get(), nullptr, nullptr, HeapCpuHandle(39));
     }
 
     // IBL 预计算专用的根签名（计算）：b0 = 1 个根常量（粗糙度），t0 = 天空图，u0 = 这一趟要写的图，s0 = 三线性
@@ -3749,11 +3903,32 @@ private:
 
     //阴影功能相关成员变量
     ComPtr<ID3D12Resource> mShadowMap; //阴影贴图
-    ComPtr<ID3D12DescriptorHeap> mShadowDsvHeap; //只放阴影图的 DSV，1格
+    ComPtr<ID3D12DescriptorHeap> mShadowDsvHeap; //只放阴影图的 DSV，每级一格（第 i 格只看第 i 页）
     D3D12_VIEWPORT mShadowViewPort = {0.f, 0.f, (float)kShadowMapSize, (float)kShadowMapSize, 0.0f, 1.0f};
     D3D12_RECT mShadowScissorRect = {0, 0, (LONG)kShadowMapSize, (LONG)kShadowMapSize};
-    XMFLOAT4X4 mLightViewProj = {}; //阴影Pass用：世界->灯的裁剪空间
-    XMFLOAT4X4 mShadowTransform = {}; //主Pass用：世界->阴影图的(u,v,深度)
+    XMFLOAT4X4 mCascadeViewProj[kMaxCascades] = {}; // 阴影 Pass 用：世界 → 第 i 级灯的裁剪空间
+    XMFLOAT4X4 mShadowTransforms[kMaxCascades] = {}; // 主 Pass 用：世界 → 第 i 张阴影图的 (u, v, 深度)
+    // 级联阴影（s109）的面板设置（AI 写的；带"第 N 步"的那几项要等你写到那一步才起作用）
+    int mCascadeCount = 4; // 面板"级联数" 1～kMaxCascades
+    float mCascadeLambda = 0.75f; // 面板"划分 λ"：0 = 均匀，1 = 对数
+    float mShadowDistance = 150.0f; // 面板"阴影距离"：阴影画到观察空间 z = 多少，再远就没有阴影
+    float mCascadeBlend = 0.1f; // 面板"过渡带"（第③步）：占这一级长度的比例
+    bool mCascadeDebug = false; // 面板"级联上色"
+    int mPcfRadius = 1; // 面板"PCF 核半径"（第②步）：1 → 3×3
+    float mNormalOffset = 1.0f; // 面板"法线偏移"（第②步），单位：纹素
+    int mDepthBias = 0; // 面板"固定偏移"（第②步）：PSO 里的 DepthBias，24 位深度的格数
+    float mSlopeBias = 1.5f; // 面板"斜率偏移"（第②步）：PSO 里的 SlopeScaledDepthBias
+    bool mPcss = false; // 面板"PCSS 软阴影"（第④步）
+    float mSunAngle = 1.0f; // 面板"太阳角直径"（第④步），单位：度。真实太阳约 0.53°
+    float mCascadeSplits[kMaxCascades] = {}; // 第 i 级的远端（观察空间 z）：第①步你在 UpdateShadowTransform 里填，面板显示
+    float mCascadeTexel[kMaxCascades] = {}; // 第 i 级一个纹素多少世界单位：同上
+    // 每一级阴影 Pass 的耗时（AI 写的）
+    ComPtr<ID3D12QueryHeap> mCsmQueryHeap;
+    ComPtr<ID3D12Resource> mCsmTimeReadback;
+    int mCsmFrameCount[gNumFrameResources] = {}; // 这份帧资源那一帧画了几级
+    double mCsmMsSum[kMaxCascades] = {};
+    int mCsmSamples = 0;
+    float mCsmMs[kMaxCascades] = {}; // 面板显示
     ComPtr<ID3DBlob> mShadowCratePSByteCode;
     ComPtr<ID3DBlob> mShadowTreePSByteCode;
     ComPtr<ID3D12PipelineState> mShadowCratePSO; //木箱、地板、铁丝网
@@ -3812,7 +3987,7 @@ private:
     ComPtr<ID3DBlob> mDeferredPSByteCode;
     ComPtr<ID3D12PipelineState> mDeferredLightPSO;
     // G-Buffer 调试视图：基础色、法线、粗糙度、金属度、深度、世界坐标（面板上的下拉框选，0 = 关 = 正常算光）
-    static constexpr int kGBufferViews = 7;
+    static constexpr int kGBufferViews = 8;
     int mGBufferView = 0;
     ComPtr<ID3DBlob> mDeferredVSByteCode;
     ComPtr<ID3DBlob> mGBufferViewPSByteCode[kGBufferViews];
