@@ -61,13 +61,32 @@ float CascadeShadow(PassConstants pass,int i,float3 posW,float3 normal){
     float4 sp = mul(float4(p, 1.0f), pass.ShadowTransforms[i]); // 正交投影：w = 1，不用除
     return PCF(i, sp.xy, sp.z, pass.PcfRadius);
 }
+
+// 过渡带里的混合系数 t：过渡带起点 = 1，这一级远端 = 0，中间按距离线性变（再往近 > 1 = 不在过渡带里）
+float CascadeBlendT(PassConstants pass, int i, float viewZ)
+{
+    float farZ = pass.CascadeSplits[i];                    // 这一级的远端
+    float nearZ = i == 0 ? 0.0f : pass.CascadeSplits[i-1];   // 这一级的近端 = 上一级的远端
+    float band = (farZ - nearZ)*pass.CascadeBlend;                    // 过渡带多长：这一级长度 × 面板"过渡带"
+    return band > 0.0f ? (farZ - viewZ)/band : 1.0f;     // 面板拖到 0 = 不过渡，别除以 0
+}
+
 // 返回 0～1：1 = 全亮，0 = 全在影子里
 float CalcShadowFactor(PassConstants pass,float3 posW,float3 normal){
     float viewZ = ViewZ(pass,posW);
     int i =CascadeIndex(pass,viewZ);
     if (viewZ > pass.CascadeSplits[i])
         return 1.0f;
-    return CascadeShadow(pass, i, posW, normal);
+    float s = CascadeShadow(pass, i, posW, normal);
+    // 过渡带：这一级最后那一段，和下一级的结果混合；最后一级没有下一级，就和"全亮"混合（阴影慢慢淡出）
+    float t = CascadeBlendT(pass, i, viewZ);
+    [branch] // 不在过渡带里的像素整段跳过，不多采一次
+    if (t < 1)
+    {
+        float next = (i+1)<pass.CascadeCount ? CascadeShadow(pass, i + 1, posW, normal) : 1;
+        s = lerp(next, s, t); // t = 1 → 全用这一级，t = 0 → 全用下一级
+    }
+    return s;
 }
 // 面板"级联上色"（AI 写的，照抄）：每级一种颜色；关掉时乘 1
 float3 CascadeDebugTint(PassConstants pass, float3 posW)
@@ -78,5 +97,7 @@ float3 CascadeDebugTint(PassConstants pass, float3 posW)
     int i = CascadeIndex(pass, viewZ);
     if (viewZ > pass.CascadeSplits[i])
     return 1.0f;
-    return kCascadeColors[i];
+    float t = saturate(CascadeBlendT(pass, i, viewZ));
+    float3 next = i + 1 < pass.CascadeCount ? kCascadeColors[i + 1] : 1.0f;
+    return lerp(next, kCascadeColors[i], t);
 }
