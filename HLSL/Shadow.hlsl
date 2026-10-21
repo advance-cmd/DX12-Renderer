@@ -37,27 +37,29 @@ int CascadeIndex(PassConstants pass, float viewZ)
         ++i;
     return i;
 }
-//3x3 PCF
-float PCF(int i,float2 uv,float depth){
-    uint w,h,n;
-    gShadowMap.GetDimensions(w,h,n);    //纹理数组：宽，高，几层
-    float dx = 1.0f/(float)w;
-    const float2 offsets[9] = {
-        float2(-dx, -dx), float2(0, -dx), float2(dx, -dx),
-        float2(-dx, 0), float2(0, 0), float2(dx, 0),
-        float2(-dx, dx), float2(0, dx), float2(dx, dx)
-    };
-    float percentLit = 0.0f;    //这个点周围的采样范围里，有多大比例照得到太阳
-    [unroll]
-    for(int k=0;k<9;k++){
-        percentLit +=gShadowMap.SampleCmpLevelZero(gsamShadow,float3(uv + offsets[k],i),depth);
+// PCF：(2r+1)×(2r+1) 个点，每个点硬件再做一次 2×2 比较 + 双线性
+float PCF(int i, float2 uv, float depth, int radius)
+{
+    uint w, h, n;
+    gShadowMap.GetDimensions(w, h, n);
+    float dx = 1.0f / (float)w;
+    float sum = 0.0f;
+    [loop]
+    for (int y = -radius; y <= radius; ++y)
+    {
+        [loop]
+        for (int x = -radius; x <= radius; ++x)
+            sum += gShadowMap.SampleCmpLevelZero(gsamShadow, float3(uv + dx*float2(x,y), i), depth); // 以前的 offsets[k] 是怎么写出来的？
     }
-    return percentLit/9.0f;
+    float side = 2*radius+1; // 一行几个点
+    return sum / (side*side);
 }
 // 第 i 级阴影图里，这个点被挡了多少（normal 第②步才用）
 float CascadeShadow(PassConstants pass,int i,float3 posW,float3 normal){
-    float4 sp =mul(float4(posW,1.0f),pass.ShadowTransforms[i]);    //正交投影
-    return PCF(i,sp.xy,sp.z);
+    // 法线偏移：沿法线往外挪几个纹素再去查。pass.NormalOffset 的单位是"这一级的纹素"
+    float3 p = posW + pass.NormalOffset*normal*pass.CascadeTexel[i];
+    float4 sp = mul(float4(p, 1.0f), pass.ShadowTransforms[i]); // 正交投影：w = 1，不用除
+    return PCF(i, sp.xy, sp.z, pass.PcfRadius);
 }
 // 返回 0～1：1 = 全亮，0 = 全在影子里
 float CalcShadowFactor(PassConstants pass,float3 posW,float3 normal){

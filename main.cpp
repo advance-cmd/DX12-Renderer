@@ -2772,9 +2772,9 @@ private:
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&floorDesc,IID_PPV_ARGS(&mFloorPSO)));
 
         auto shadowDesc = psoDesc;
-        shadowDesc.RasterizerState.DepthBias = 10000; //固定偏移(单位：24位深度最小的一格)
+        shadowDesc.RasterizerState.DepthBias = mDepthBias; //固定偏移(单位：24位深度最小的一格)
         shadowDesc.RasterizerState.DepthBiasClamp = 0.0f; //0 = 不限上限
-        shadowDesc.RasterizerState.SlopeScaledDepthBias = 1.0f; //斜率偏移，表面越斜着对灯，加的越多
+        shadowDesc.RasterizerState.SlopeScaledDepthBias = mSlopeBias; //斜率偏移，表面越斜着对灯，加的越多
         shadowDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; // 铁丝网正反两面都要挡光
         shadowDesc.NumRenderTargets = 0; // 阴影 Pass 没有颜色目标：阴影图绑在 DSV 上，不是 RTV
         shadowDesc.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
