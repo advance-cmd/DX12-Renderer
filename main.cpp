@@ -103,7 +103,7 @@ enum class DrawPass
     GBuffer // 延迟：只写材质和法线
 };
 
-static constexpr UINT kTimestampCount = 10;
+static constexpr UINT kTimestampCount = 11;
 static constexpr UINT kShadowMapSize = 2048;
 static constexpr float kSceneRadius = 120.0f; // 场景包围球：球心在原点（陆地 160×160，山高 ±43，最远的角离原点约 117）
 
@@ -249,6 +249,7 @@ public:
         BuildDescriptorHeaps();
         BuildBlurResources(); // 模糊用的两张纹理和它们的 4 个描述符（要用到堆）
         BuildHdrResources();
+        BuildLdrResources();
         BuildBloomResources();
         BuildGBufferResources();
         BuildSSAOResource();
@@ -265,6 +266,7 @@ public:
         BuildRootSignature(); // PSO 要用根签名
         BuildBlurRootSignature(); //模糊专用的根签名
         BuildTonemapRootSignature();
+        BuildFxaaRootSignature();
         BuildBloomRootSignature();
         BuildIblRootSignature(); // 必须在 BuildPSO 前面：建计算 PSO 要用它
         BuildShadersAndInputLayout(); // PSO 要用着色器和输入布局
@@ -320,6 +322,7 @@ protected:
         {
             BuildBlurResources();
             BuildHdrResources();
+            BuildLdrResources();
             BuildBloomResources();
             BuildGBufferResources();
             BuildSSAOResource();
@@ -623,6 +626,7 @@ protected:
      *   33     U 辐照度图                               | BuildIblResources       | IBL 根签名参数 2（u0）
      *   34～38 U 预滤波环境贴图第 0～4 级（每级一格）   | BuildIblResources       | IBL 根签名参数 2（u0），逐级换
      *   39     U BRDF LUT                               | BuildIblResources       | IBL 根签名参数 2（u0）
+     *   40 色调映射的结果（LDR 纹理）的 SRV，FXAA 读
      * 加格子时三处一起改：BuildDescriptorHeaps 里的 NumDescriptors 和注释、这张表、建视图的那个函数
      */
     CD3DX12_GPU_DESCRIPTOR_HANDLE HeapGpuHandle(int slot) const
@@ -809,6 +813,14 @@ protected:
             }
             ImGui::TreePop();
         }
+        if (ImGui::TreeNodeEx("抗锯齿", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::Checkbox("FXAA", &mFxaa);
+            ImGui::SliderFloat("次像素混合", &mFxaaSubpix, 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat("边缘门槛", &mFxaaEdgeThreshold, 0.063f, 0.333f, "%.3f");
+            ImGui::Checkbox("看 FXAA 判出的边", &mFxaaDebug);
+            ImGui::TreePop();
+        }
         bool sunChanged = ImGui::SliderFloat("太阳方位角", &mSunAzimuth, -180.0f, 180.0f, "%.1f°");
         sunChanged |= ImGui::SliderFloat("太阳仰角", &mSunElevation, 5.0f, 85.0f, "%.1f°");
         if (sunChanged)
@@ -892,8 +904,9 @@ protected:
                 mPassSamples = 0;
                 // 基类每秒刷新一次标题（CalculateFrameStats），会把这段文字带上
                 mMainWndCaption = std::format(
-                    L"LearnDX12    移速 {:.1f}    GPU：阴影图 {:.3f} | 不透明/G-Buffer {:.3f} | SSAO {:.3f} | 光照 {:.3f} | 天空+镜子 {:.3f} | 透明 {:.3f} | Bloom {:.3f} | 色调映射 {:.3f} | 模糊 {:.3f} ms",
-                    mCamera.GetMoveSpeed(), avg[0], avg[1], avg[2], avg[3], avg[4], avg[5], avg[6], avg[7], avg[8]);
+                    L"LearnDX12    移速 {:.1f}    GPU：阴影图 {:.3f} | 不透明/G-Buffer {:.3f} | SSAO {:.3f} | 光照 {:.3f} | 天空+镜子 {:.3f} | 透明 {:.3f} | Bloom {:.3f} | 色调映射 {:.3f} | FXAA {:.3f} | 模糊 {:.3f} ms",
+                    mCamera.GetMoveSpeed(), avg[0], avg[1], avg[2], avg[3], avg[4], avg[5], avg[6], avg[7], avg[8],
+                    avg[9]);
             }
         }
 
@@ -935,6 +948,8 @@ protected:
      *        渲染目标：Bloom 纹理链（kBloomFormat）| 深度：无 | PSO：mBloomPrefilter/Down/UpPSO | 根签名：Bloom
      *   ⑤ 色调映射      全屏三角形，HDR 纹理 → 屏幕
      *        渲染目标：后台缓冲（mBackBufferFormat）| 深度：无 | PSO：mTonemapPSO | 根签名：Tonemap
+     *   ⑤b FXAA         全屏三角形，色调映射的结果（LDR 纹理）→ 屏幕。面板没勾 FXAA 时没有这一步，⑤ 直接写后台缓冲
+     *        渲染目标：后台缓冲 | 深度：无 | PSO：mFxaaPSO | 根签名：FXAA
      *   ⑥ 模糊          DoBlur，计算着色器（Dispatch，不绑渲染目标）
      *        读写：后台缓冲 ↔ 模糊纹理 | PSO：mHorzBlurPSO / mVertBlurPSO | 根签名：Blur（计算）
      *   ⑦ UI            ImGui
@@ -1055,7 +1070,16 @@ protected:
         mCommandList->RSSetViewports(1, &mScreenViewport);
         mCommandList->RSSetScissorRects(1, &mScissorRect);
         D3D12_CPU_DESCRIPTOR_HANDLE backRtv = CurrentBackBufferView();
-        mCommandList->OMSetRenderTargets(1, &backRtv, true, nullptr);
+        // 勾了 FXAA：色调映射先画进 LDR 纹理，⑤b 再由 FXAA 写后台缓冲。G-Buffer 视图看的是存的原值，不做 FXAA
+        const bool fxaa = mFxaa && !gbufferView;
+        D3D12_CPU_DESCRIPTOR_HANDLE ldrRtv = mLdrRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        if (fxaa)
+        {
+            auto ldrToRt = CD3DX12_RESOURCE_BARRIER::Transition(mLdrMap.Get(), 
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            mCommandList->ResourceBarrier(1, &ldrToRt);
+        }
+        mCommandList->OMSetRenderTargets(1, fxaa ? &ldrRtv : &backRtv, true, nullptr); // 勾了写哪张？没勾写哪张？
         mCommandList->SetGraphicsRootSignature(mTonemapRootSignature.Get());
         mCommandList->SetGraphicsRootDescriptorTable(0, HeapGpuHandle(18)); // 堆第 18 格：HDR 纹理的 SRV
         // 根参数 1：两个 32 位根常量（b0），和 Tonemap.hlsl 的 TonemapSettings 一一对应。EV 每 +1 亮一倍，所以是 2^EV
@@ -1074,12 +1098,33 @@ protected:
         mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         mCommandList->DrawInstanced(3, 1, 0, 0); // 3 个顶点 = 一个盖住全屏的大三角形，位置在 VS 里按 SV_VertexID 算
         mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 8); // T8
+        // ⑤b FXAA（s178）画在这里：T8 ～ T9 就是它的耗时
+        if (fxaa)
+        {
+            auto RtToldr = CD3DX12_RESOURCE_BARRIER::Transition(mLdrMap.Get(), 
+                D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            mCommandList->ResourceBarrier(1, &RtToldr);
+            mCommandList->OMSetRenderTargets(1, &backRtv, true, nullptr);
+            mCommandList->SetGraphicsRootSignature(mFxaaRootSignature.Get());
+            mCommandList->SetGraphicsRootDescriptorTable(0, HeapGpuHandle(40));
+            struct
+            {
+                float RcpW, RcpH; // 一个像素在 uv 里有多宽、多高
+                float Subpix;
+                float EdgeThreshold;
+                UINT Debug;
+            } fxaaSettings = { 1.0f / mClientWidth, 1.0f / mClientHeight, mFxaaSubpix, mFxaaEdgeThreshold, mFxaaDebug ? 1u : 0u};
+            mCommandList->SetGraphicsRoot32BitConstants(1,5, &fxaaSettings, 0);
+            mCommandList->SetPipelineState(mFxaaPSO.Get());
+            mCommandList->DrawInstanced(3, 1, 0, 0);
+        }
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 9); // T9
         if (mBlurEnabled)
         {
             DoBlur();
         }
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 9); // T9
-        // UI 最后画：盖在最上面，不被模糊，也不做深度测试。放在 T8 后面，不算进"模糊"的耗时
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 10); // T10
+        // UI 最后画：盖在最上面，不被模糊，也不做深度测试。放在 T10 后面，不算进"模糊"的耗时
         // 画在后台缓冲上：rtv 现在是 HDR 纹理，画进去就不会再上屏了
         mCommandList->OMSetRenderTargets(1, &backRtv, true, nullptr);
         ID3D12DescriptorHeap* uiHeaps[] = {mHeap.Get()}; // 字体图集的 SRV 在 mHeap 第 12～15 格；显式再绑一次，不依赖前面绑过什么
@@ -1568,7 +1613,7 @@ private:
     {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {
             .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            .NumDescriptors = 40,
+            .NumDescriptors = 41,
             /* 0～4 纹理，
              * 5～8 模糊用的两张纹理（各一个 SRV、一个 UAV），
              * 9 阴影图的 SRV，10天空图   
@@ -1582,6 +1627,7 @@ private:
              * 28～29 SSAO 的两张遮蔽图
              * 30～32 IBL：辐照度图、预滤波环境贴图、BRDF LUT（SRV，根参数 10 的表）
              * 33 辐照度图的 UAV，34～38 预滤波第 0～4 级的 UAV，39 BRDF LUT 的 UAV（只在生成时写）
+             * 40 色调映射的结果（LDR 纹理）的 SRV，FXAA 读
              */
             .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, // 着色器要从这个堆里读（RTV/DSV 堆不用，所以是 NONE）
             .NodeMask = 0,
@@ -2669,6 +2715,9 @@ private:
 
         mTonemapVSByteCode = CompileShader(L"HLSL\\Tonemap.hlsl", nullptr, "VS", "vs_6_6");
         mTonemapPSByteCode = CompileShader(L"HLSL\\Tonemap.hlsl", nullptr, "PS", "ps_6_6");
+        
+        mFxaaVSByteCode = CompileShader(L"HLSL\\Fxaa.hlsl", nullptr, "VS", "vs_6_6");
+        mFxaaPSByteCode = CompileShader(L"HLSL\\Fxaa.hlsl", nullptr, "PS", "ps_6_6");
 
         mBloomVSByteCode = CompileShader(L"HLSL\\Bloom.hlsl", nullptr, "VS", "vs_6_6");
         mBloomPrefilterPSByteCode = CompileShader(L"HLSL\\Bloom.hlsl", nullptr, "PS_Prefilter", "ps_6_6");
@@ -2997,6 +3046,13 @@ private:
         tonemapDesc.DSVFormat = DXGI_FORMAT_UNKNOWN; // 不绑深度缓冲
         tonemapDesc.SampleDesc.Count = 1;
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&tonemapDesc, IID_PPV_ARGS(&mTonemapPSO)));
+        
+        // fxaa
+        auto fxaaDesc = tonemapDesc;
+        fxaaDesc.pRootSignature = mFxaaRootSignature.Get();
+        fxaaDesc.VS = {mFxaaVSByteCode->GetBufferPointer(), mFxaaVSByteCode->GetBufferSize()};
+        fxaaDesc.PS = {mFxaaPSByteCode->GetBufferPointer(), mFxaaPSByteCode->GetBufferSize()};
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&fxaaDesc, IID_PPV_ARGS(&mFxaaPSO)));
 
         // Bloom 三个 PSO：和色调映射一样是全屏三角形，换根签名、着色器、输出格式；放大那个开加法混合
         auto bloomDesc = tonemapDesc;
@@ -3165,6 +3221,52 @@ private:
         mDevice->CreateShaderResourceView(mHdrMap.Get(), &srvDesc, HeapCpuHandle(18));
     }
 
+    /*
+     * 色调映射的结果（LDR 纹理）：勾了 FXAA 时，色调映射先画进它（RTV），FXAA 再读它（SRV，堆第 40 格）写后台缓冲。
+     * 约定：帧与帧之间停在 PIXEL_SHADER_RESOURCE。窗口变大小要重建
+     */
+    void BuildLdrResources()
+    {
+        D3D12_RESOURCE_DESC desc = {
+            .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            .Alignment = 0,
+            .Width = mClientWidth, // 和后台缓冲一样大
+            .Height = mClientHeight,
+            .DepthOrArraySize = 1,
+            .MipLevels = 1,
+            .Format = mBackBufferFormat,
+            .SampleDesc = {.Count = 1, .Quality = 0},
+            .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            .Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, // 要当渲染目标，必须带这个标志
+        };
+        CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+        mLdrMap.Reset();
+        ThrowIfFailed(
+            mDevice->CreateCommittedResource(&heapProps,D3D12_HEAP_FLAG_NONE,&desc,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&mLdrMap)));
+        
+        // 1 格 RTV 小堆（只在 !mLdrRtvHeap 时建）+ CreateRenderTargetView
+        if (!mLdrRtvHeap)
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {
+                .Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                .NumDescriptors = 1,
+                .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                .NodeMask = 0,
+            };
+            ThrowIfFailed(mDevice->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&mLdrRtvHeap)));
+        }
+        // 两个视图放在 if 外面：每次换了新纹理都要重建，否则还指着上面刚释放的旧纹理
+        mDevice->CreateRenderTargetView(mLdrMap.Get(), nullptr, mLdrRtvHeap->GetCPUDescriptorHandleForHeapStart());
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+            .Format = mBackBufferFormat,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .Texture2D = {.MostDetailedMip = 0, .MipLevels = 1},
+        };
+        mDevice->CreateShaderResourceView(mLdrMap.Get(), &srvDesc, HeapCpuHandle(40));
+    }
+
     void BuildTonemapRootSignature()
     {
         CD3DX12_DESCRIPTOR_RANGE hdrRange;
@@ -3192,6 +3294,35 @@ private:
             serialized->GetBufferPointer(),
             serialized->GetBufferSize(),
             IID_PPV_ARGS(&mTonemapRootSignature)));
+    }
+    
+    // FXAA 的根签名：一张表（t0 = LDR 纹理）+ 5 个根常量（b0）+ 双线性夹边采样器（s0）
+    void BuildFxaaRootSignature()
+    {
+        CD3DX12_DESCRIPTOR_RANGE ldrRange;
+        ldrRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);   //1张纹理
+        CD3DX12_ROOT_PARAMETER param[2];
+        param[0].InitAsDescriptorTable(1,&ldrRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        param[1].InitAsConstants(5, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL);   // RcpFrame.xy  Subpix  EdgeThreshold  Debug
+        CD3DX12_STATIC_SAMPLER_DESC linearClamp(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                                                D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+        CD3DX12_ROOT_SIGNATURE_DESC
+            rootSigDesc(_countof(param), param, 1, &linearClamp, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+        ComPtr<ID3DBlob> serialized;
+        ComPtr<ID3DBlob> error;
+        HRESULT hr = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &error);
+        if (error != nullptr)
+        {
+            OutputDebugStringA((char*)error->GetBufferPointer());
+        }
+        ThrowIfFailed(hr);
+
+        ThrowIfFailed(mDevice->CreateRootSignature(
+            0,
+            serialized->GetBufferPointer(),
+            serialized->GetBufferSize(),
+            IID_PPV_ARGS(&mFxaaRootSignature)));
     }
 
     //Bloom
@@ -3961,6 +4092,20 @@ private:
     ComPtr<ID3DBlob> mTonemapVSByteCode;
     ComPtr<ID3DBlob> mTonemapPSByteCode;
     ComPtr<ID3D12PipelineState> mTonemapPSO;
+
+    // FXAA（s178）：色调映射的结果（LDR 纹理）+ 它的 RTV 小堆，FXAA 的根签名、着色器、PSO
+    ComPtr<ID3D12Resource> mLdrMap; // 和后台缓冲一样大、一样格式；SRV 在大堆第 40 格
+    ComPtr<ID3D12DescriptorHeap> mLdrRtvHeap; // 1 格 RTV 小堆（和 mHdrRtvHeap 一样，只建一次）
+    ComPtr<ID3D12RootSignature> mFxaaRootSignature;
+    ComPtr<ID3DBlob> mFxaaVSByteCode;
+    ComPtr<ID3DBlob> mFxaaPSByteCode;
+    ComPtr<ID3D12PipelineState> mFxaaPSO;
+
+    // 抗锯齿（s178）面板
+    bool mFxaa = false; // 面板"FXAA"：勾上 = 色调映射先写 LDR 纹理，FXAA 再写后台缓冲
+    float mFxaaSubpix = 0.75f; // 面板"次像素混合"：FXAA 3.11 默认 0.75；0 = 只抹台阶，不抹孤立的细节
+    float mFxaaEdgeThreshold = 0.166f; // 面板"边缘门槛"：对比度 ≥ 最亮的 × 这个数才算边（默认 0.166）
+    bool mFxaaDebug = false; // 面板"看 FXAA 判出的边"：红 = 横边，蓝 = 竖边，越亮混得越多
 
     // Bloom
     static constexpr UINT kBloomMips = 6; // 2560×1440 下是 1280×720 … 40×22
