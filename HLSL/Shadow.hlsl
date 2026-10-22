@@ -54,11 +54,51 @@ float PCF(int i, float2 uv, float depth, int radius)
     float side = 2*radius+1; // 一行几个点
     return sum / (side*side);
 }
+// PCSS 软阴影：① 找遮挡物 → ② 算半影多宽 → ③ 按半影宽度做 PCF 最终返回阴影因子
+float PCSS(PassConstants pass,int i,float2 uv,float depth){
+    uint w,h,n;
+    gShadowMap.GetDimensions(w,h,n);
+    float worldPerUV = pass.CascadeTexel[i]*w;  // 这一级阴影图整张有多宽（世界单位）
+    
+    // ① 找遮挡物：在周围找比自己离太阳近的纹素，求它们的平均深度
+    //    找多大一圈：最远的遮挡物（kPcssMaxOccluderDist）能造成的半影，换成 uv
+    float searchUV = (kPcssMaxOccluderDist * pass.LightTan)/worldPerUV;
+    float blockerSum = 0.0f; // 找到的遮挡物深度加起来，最后除以个数 = 平均遮挡物深度
+    float blockers = 0.0f;   // 找到了几个遮挡物（用 float：后面直接当除数）；一个都没有 = 周围没东西挡光
+    [loop]
+    for(int k = 0;k<16;k++){
+        float2 suv = uv + kPoisson16[k]*searchUV;
+        int2 texel = clamp(suv*w,0,int(w)-1);// uv → 第几个纹素；Load 越界读出来是 0（= 最近），会被当成遮挡物  阴影图上第几列、第几行的那个像素    Load 不认 uv，只认这种整数坐标
+        float d = gShadowMap.Load(int4(texel,i,0)).r;
+        if(d<depth){
+            blockerSum +=d;
+            blockers +=1.0f;
+        }
+    }
+    if(blockers == 0.0f){
+        return 1.0f;
+    }
+    float avgBlocker = blockerSum / blockers;   //平均遮挡深度
+    
+    // ② 半影半宽（世界单位）：遮挡物到接收面的距离 × tan(太阳角半径)
+    //    深度差是 0～1 里的数，乘 ShadowDepthRange 才是世界单位
+    float penumbraWorld = (depth - avgBlocker) * pass.LightTan * pass.ShadowDepthRange;
+    float filterUV = max(penumbraWorld/worldPerUV,1.0f/w); // 至少1个纹素
+    
+    // ③ 可变核 PCF：还是这 16 个点，半径换成半影宽度
+    float sum = 0.0f;
+    [loop]
+    for (int k2 = 0; k2 < 16; ++k2)
+    sum += gShadowMap.SampleCmpLevelZero(gsamShadow, float3(uv + filterUV*kPoisson16[k2], i), depth);
+    return sum / 16.0f;
+}
 // 第 i 级阴影图里，这个点被挡了多少（normal 第②步才用）
 float CascadeShadow(PassConstants pass,int i,float3 posW,float3 normal){
     // 法线偏移：沿法线往外挪几个纹素再去查。pass.NormalOffset 的单位是"这一级的纹素"
     float3 p = posW + pass.NormalOffset*normal*pass.CascadeTexel[i];
     float4 sp = mul(float4(p, 1.0f), pass.ShadowTransforms[i]); // 正交投影：w = 1，不用除
+    if (pass.Pcss != 0) // 面板勾了"PCSS 软阴影"：核大小按半影算；没勾：固定大小的 PCF
+        return PCSS(pass, i, sp.xy, sp.z);
     return PCF(i, sp.xy, sp.z, pass.PcfRadius);
 }
 
