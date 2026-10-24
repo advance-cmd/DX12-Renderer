@@ -160,6 +160,7 @@
     <None Include="HLSL\Sky.hlsl" />
     <None Include="HLSL\Tonemap.hlsl" />
     <None Include="HLSL\Fxaa.hlsl" />
+    <None Include="HLSL\Taa.hlsl" />
     <None Include="HLSL\Bloom.hlsl" />
     <None Include="HLSL\Deferred.hlsl" />
     <None Include="HLSL\IBL.hlsl" />

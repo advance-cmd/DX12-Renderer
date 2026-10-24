@@ -36,6 +36,8 @@ struct PassConstants
 {
     float4x4 ViewProj;
     float4x4 InvViewProj;
+    float4x4 ViewProjNoJitter;     // 不带抖动的 ViewProj：算运动矢量用（TAA 第②步）
+    float4x4 PrevViewProjNoJitter; // 上一帧的（同样不带抖动）
     float3 EyePosW;
     float IblIntensity;  // IBL 的强度倍数（面板"IBL 强度"）
     float4 AmbientLight; // 不用 IBL 时的常数环境光
@@ -207,16 +209,24 @@ float3 ComputeLighting(Light lights[MaxLights], MaterialConstants mat, float3 po
 
     return result;
 }
+// 运动矢量（uv 空间）：这一帧的 uv − 上一帧的 uv。透视除法在 PS 里做（VS 里除完再插值是错的）
+float2 MotionVector(float4 curPosH,float4 prevPosH){
+    float2 cur = curPosH.xy / curPosH.w;    //NDC
+    float2 prev = prevPosH.xy / prevPosH.w;
+    return (cur - prev)*float2(0.5,-0.5);
+}
 
 struct GBufferOut{
     float4 BaseMetal : SV_Target0;
     float4 NormalRough : SV_Target1;
+    float2 Velocity : SV_Target2;
 };
 
-GBufferOut PackGBuffer(MaterialConstants mat,float3 normal){
+GBufferOut PackGBuffer(MaterialConstants mat,float3 normal,float2 velocity){
     GBufferOut o;
     o.BaseMetal = float4(mat.BaseColor.rgb,mat.Metallic);
     o.NormalRough = float4(normal,mat.Roughness);
+    o.Velocity = velocity;
     return o;
 }
 

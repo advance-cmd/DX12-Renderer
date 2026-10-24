@@ -10,6 +10,7 @@ Texture2D gGBuffer0 : register(t6);        // rgb 基础色，a 金属度（sRGB
 Texture2D gGBuffer1 : register(t7);        // xyz 世界法线，w 粗糙度
 Texture2D<float> gDepthMap : register(t8); // 深度缓冲（R24_UNORM_X8_TYPELESS：只读前 24 位深度）
 Texture2D<float> gAoMap : register(t9);    // SSAO 的遮蔽图（半分辨率，R8）：1 = 完全没被挡，0 = 全挡住。根参数 9
+Texture2D<float2> gVelocity : register(t13); // 速度缓冲：这一帧的 uv − 上一帧的 uv（根参数 11，堆第 41 格）
 
 struct VertexOut
 {
@@ -295,6 +296,14 @@ float4 PS_GBufferView(VertexOut pin) : SV_Target
 #elif GBUFFER_VIEW == 7
     // SSAO 的遮蔽图（半分辨率，所以除以 2；不过滤，看到的就是存的值）：白 = 没被挡，黑 = 挡住了
     c = gAoMap.Load(int3(pixel / 2, 0));
+#elif GBUFFER_VIEW == 9
+    // 运动矢量，换算成像素/帧：灰 = 不动；偏红 = 往右，偏蓝 = 往左；偏绿 = 往下，偏紫 = 往上
+    // 颜色 = 0.5 + 0.5·v / (|v| + 4)：1 像素/帧就看得出，4 像素/帧走到一半，再快也不会"到头"
+    uint w, h;
+    gVelocity.GetDimensions(w, h);
+    float2 px = gVelocity.Load(int3(pixel, 0)) * float2(w, h);
+    float2 s = 0.5f + 0.5f * px / (abs(px) + 4.0f);
+    c = float3(s.x, s.y, 1.0f - s.x);
 #else
     // 世界坐标：每 2 个单位一条白色格线（xz 平面），底色按每 8 个单位循环。
     // 反推对了，挪相机时格子钉在物体表面上；反推错了，格子会跟着视角滑动、变形

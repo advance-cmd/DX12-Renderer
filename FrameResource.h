@@ -29,12 +29,15 @@ struct ObjectConstants
 {
     XMFLOAT4X4 World;
     XMFLOAT4X4 WorldInvTranspose;   //这里的逆转置矩阵是为了Normal准备的，为了避免破坏方向性
+    XMFLOAT4X4 PrevWorld;           // 上一帧的 World（TAA 速度缓冲）：Triangle.hlsl 和 Color.hlsl 的 VS 读
 };
 
 struct PassConstants
 {
     XMFLOAT4X4 ViewProj;
     XMFLOAT4X4 InvViewProj; //从深度反推世界坐标
+    XMFLOAT4X4 ViewProjNoJitter;     // 不带抖动的 ViewProj：算运动矢量用（抖动不算运动）
+    XMFLOAT4X4 PrevViewProjNoJitter; // 上一帧的（同样不带抖动）
 
     XMFLOAT3 EyePosW;
     float IblIntensity; // IBL 强度倍数（面板）

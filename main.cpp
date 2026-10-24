@@ -57,6 +57,8 @@ struct TreeSpriteVertex
 struct RenderItem
 {
     XMFLOAT4X4 World = XMFLOAT4X4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1); // 局部 → 世界
+    // 上一帧的 World（TAA 速度缓冲用）：Initialize 里先设成和 World 一样，第②步你来每帧更新
+    XMFLOAT4X4 PrevWorld = XMFLOAT4X4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
 
     // 还有几份帧资源的 ObjectCB 没写入最新的 World。物体一动就要重新设成 gNumFrameResources
     int NumFramesDirty = gNumFrameResources;
@@ -103,7 +105,7 @@ enum class DrawPass
     GBuffer // 延迟：只写材质和法线
 };
 
-static constexpr UINT kTimestampCount = 11;
+static constexpr UINT kTimestampCount = 12;
 static constexpr UINT kShadowMapSize = 2048;
 static constexpr float kSceneRadius = 120.0f; // 场景包围球：球心在原点（陆地 160×160，山高 ±43，最远的角离原点约 117）
 
@@ -112,6 +114,49 @@ static constexpr DXGI_FORMAT kHdrFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 // 0：基础色 + 金属度；1：世界法线 + 粗糙度
 static constexpr DXGI_FORMAT kGBuffer0Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB; //RGB：基础色，A：金属度
 static constexpr DXGI_FORMAT kGBuffer1Format = DXGI_FORMAT_R16G16B16A16_FLOAT; //XYZ：世界法线，W：粗糙度
+static constexpr DXGI_FORMAT kVelocityFormat = DXGI_FORMAT_R16G16_FLOAT; // 速度缓冲（TAA 第②步）：这一帧的 uv − 上一帧的 uv
+
+// 大堆 mHeap（着色器可见的 CBV/SRV/UAV 堆）每一格放什么。每格"谁建、谁用"见 HeapGpuHandle 上面那张表
+// 用法：HeapCpuHandle(HeapSlot::Hdr)；一排连着的格子写"第一格 + i"，比如 HeapSlot::BloomMip0 + i
+// 加格子：这里加一个名字、把 Count 往后挪，NumDescriptors 用的就是 Count
+namespace HeapSlot
+{
+    enum : UINT
+    {
+        CrateTex = 0, // 0～3 漫反射贴图：木箱、铁丝网、冰（镜子）、地砖（材质的 DiffuseSrvHeapIndex）
+        FenceTex = 1,
+        IceTex = 2,
+        TileTex = 3,
+        TreeTexArray = 4, // 树的纹理数组（3 张）
+        BlurASrv = 5, // 5～8 后期模糊的两张纹理，每张两格（SRV、UAV）：第 i 张是 BlurASrv + 2i、BlurAUav + 2i
+        BlurAUav = 6,
+        BlurBSrv = 7,
+        BlurBUav = 8,
+        ShadowMap = 9, // 级联阴影图（Texture2DArray）
+        SkyCube = 10, // 天空图（立方体）
+        TileNormal = 11, // 地砖的法线贴图（材质的 NormalSrvHeapIndex）
+        ImGui0 = 12, // 12～15 ImGui 自己用（字体图集等）
+        Grass = 16, // 陆地：16 草地、17 岩石（主根参数 7 的表 t4～t5 从这里开始）
+        Stone = 17,
+        Hdr = 18, // HDR 场景纹理
+        BloomMip0 = 19, // 19～24 Bloom 第 0～5 级 mip：BloomMip0 + i
+        GBuffer0 = 25, // 25 G-Buffer0、26 G-Buffer1、27 深度（主根参数 8 的表 t6～t8 从这里开始）
+        GBuffer1 = 26,
+        Depth = 27,
+        SsaoMap0 = 28, // 28～29 SSAO 的两张遮蔽图：SsaoMap0 + i
+        IrradianceSrv = 30, // 30～32 IBL 三张图的 SRV（主根参数 10 的表 t10～t12 从这里开始）
+        PrefilteredSrv = 31,
+        BrdfLutSrv = 32,
+        IrradianceUav = 33,
+        PrefilteredUav0 = 34, // 34～38 预滤波第 0～4 级的 UAV：PrefilteredUav0 + mip
+        BrdfLutUav = 39,
+        Ldr = 40, // 色调映射的结果（LDR 纹理），FXAA 读
+        Velocity = 41, // 速度缓冲（TAA 第②步，主根参数 11 = t13）
+        TaaHistory0 = 42, // 42～43 TAA 的两张历史图（轮流读写）：TaaHistory0 + i
+        Count = 44 // 一共多少格
+    };
+}
+
 // SSAO 的遮蔽图：每个像素只存一个 0～1 的数，一个 8 位通道就够（1 字节）
 static constexpr DXGI_FORMAT kAoFormat = DXGI_FORMAT_R8_UNORM;
 // IBL：三张预计算的图（启动后第一帧用计算着色器生成，热重载之后重新生成），和窗口大小无关
@@ -250,6 +295,7 @@ public:
         BuildBlurResources(); // 模糊用的两张纹理和它们的 4 个描述符（要用到堆）
         BuildHdrResources();
         BuildLdrResources();
+        BuildTaaResources(); // TAA 的两张历史图（要用到堆）
         BuildBloomResources();
         BuildGBufferResources();
         BuildSSAOResource();
@@ -267,12 +313,17 @@ public:
         BuildBlurRootSignature(); //模糊专用的根签名
         BuildTonemapRootSignature();
         BuildFxaaRootSignature();
+        BuildTaaRootSignature();
         BuildBloomRootSignature();
         BuildIblRootSignature(); // 必须在 BuildPSO 前面：建计算 PSO 要用它
         BuildShadersAndInputLayout(); // PSO 要用着色器和输入布局
         BuildPSO(); // 上面两样都有了才能建 PSO；渲染项要记住用哪个 PSO，所以再排在它前面
         BuildMaterials(); //FrameResources要用到这个
         BuildRenderItems(); // 要用到几何体 和 PSO
+        for (auto& ri : mAllItems)
+        {
+            ri->PrevWorld = ri->World; // 第一帧没有"上一帧"：当成没动过，不然第一帧每个物体都有假的运动
+        }
         BuildFrameResources(); // ObjectCB 按渲染项个数、WavesVB 按水面顶点数，所以排在最后
 
         // 提交复制命令，等 GPU 做完
@@ -323,6 +374,7 @@ protected:
             BuildBlurResources();
             BuildHdrResources();
             BuildLdrResources();
+            BuildTaaResources();
             BuildBloomResources();
             BuildGBufferResources();
             BuildSSAOResource();
@@ -372,9 +424,9 @@ protected:
         };
         for (int i = 0; i < 2; i++)
         {
-            CD3DX12_CPU_DESCRIPTOR_HANDLE srv(mHeap->GetCPUDescriptorHandleForHeapStart(), 5 + 2 * i,
+            CD3DX12_CPU_DESCRIPTOR_HANDLE srv(mHeap->GetCPUDescriptorHandleForHeapStart(), HeapSlot::BlurASrv + 2 * i,
                                               mCSUDescriptorSize);
-            CD3DX12_CPU_DESCRIPTOR_HANDLE uav(mHeap->GetCPUDescriptorHandleForHeapStart(), 6 + 2 * i,
+            CD3DX12_CPU_DESCRIPTOR_HANDLE uav(mHeap->GetCPUDescriptorHandleForHeapStart(), HeapSlot::BlurAUav + 2 * i,
                                               mCSUDescriptorSize);
             mDevice->CreateShaderResourceView(mBlurMap[i].Get(), &srvDesc, srv);
             mDevice->CreateUnorderedAccessView(mBlurMap[i].Get(), nullptr, &uavDesc, uav); // 第二个参数是计数器资源，用不到
@@ -445,7 +497,8 @@ protected:
                 .ArraySize = kMaxCascades
             }
         };
-        CD3DX12_CPU_DESCRIPTOR_HANDLE srv(mHeap->GetCPUDescriptorHandleForHeapStart(), 9, mCSUDescriptorSize);
+        CD3DX12_CPU_DESCRIPTOR_HANDLE srv(mHeap->GetCPUDescriptorHandleForHeapStart(), HeapSlot::ShadowMap,
+                                          mCSUDescriptorSize);
         mDevice->CreateShaderResourceView(mShadowMap.Get(), &srvDesc, srv);
     }
 
@@ -553,8 +606,8 @@ protected:
         {
             // ③a 横向：读 A，写 B
             mCommandList->SetPipelineState(mHorzBlurPSO.Get());
-            mCommandList->SetComputeRootDescriptorTable(1, HeapGpuHandle(5)); // 根参数 1（输入）= 堆第 5 格：A 的 SRV
-            mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(8)); // 根参数 2（输出）= 堆第 8 格：B 的 UAV
+            mCommandList->SetComputeRootDescriptorTable(1, HeapGpuHandle(HeapSlot::BlurASrv)); // 根参数 1（输入）= A 的 SRV
+            mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(HeapSlot::BlurBUav)); // 根参数 2（输出）= B 的 UAV
             mCommandList->Dispatch(groupsX, mClientHeight, 1); // 每个线程组管一行里的 256 个像素
 
             // 交换：A 变成可写，B 变成可读
@@ -568,8 +621,8 @@ protected:
 
             // ③b 纵向：读 B，写 A
             mCommandList->SetPipelineState(mVertBlurPSO.Get());
-            mCommandList->SetComputeRootDescriptorTable(1, HeapGpuHandle(7)); // 输入 = 堆第 7 格：B 的 SRV
-            mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(6)); // 输出 = 堆第 6 格：A 的 UAV
+            mCommandList->SetComputeRootDescriptorTable(1, HeapGpuHandle(HeapSlot::BlurBSrv)); // 输入 = B 的 SRV
+            mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(HeapSlot::BlurAUav)); // 输出 = A 的 UAV
             mCommandList->Dispatch(mClientWidth, groupsY, 1); // 每个线程组管一列里的 256 个像素
 
             // 交换回来，下一轮又从"读 A、写 B"开始
@@ -603,7 +656,7 @@ protected:
     }
 
     /*
-     * 大堆 mHeap（着色器可见的 CBV/SRV/UAV 堆，共 40 格）里第 slot 格的"地址"。两个版本用在不同的时候：
+     * 大堆 mHeap（着色器可见的 CBV/SRV/UAV 堆，共 HeapSlot::Count 格）里第 slot 格的"地址"。两个版本用在不同的时候：
      *   HeapCpuHandle(slot)：建视图时用 —— CreateShaderResourceView / CreateUnorderedAccessView 把描述符写进这一格（CPU 在写）
      *   HeapGpuHandle(slot)：绑定时用 —— Set…RootDescriptorTable(参数号, HeapGpuHandle(slot)) 告诉 GPU 描述符表从这一格开始
      *                        （ImGui::Image 也用它：把这一格的 SRV 直接当成一张图显示）
@@ -627,7 +680,7 @@ protected:
      *   34～38 U 预滤波环境贴图第 0～4 级（每级一格）   | BuildIblResources       | IBL 根签名参数 2（u0），逐级换
      *   39     U BRDF LUT                               | BuildIblResources       | IBL 根签名参数 2（u0）
      *   40 色调映射的结果（LDR 纹理）的 SRV，FXAA 读
-     * 加格子时三处一起改：BuildDescriptorHeaps 里的 NumDescriptors 和注释、这张表、建视图的那个函数
+     * 加格子时两处一起改：文件开头的 HeapSlot 枚举（NumDescriptors 用它的 Count）、这张表
      */
     CD3DX12_GPU_DESCRIPTOR_HANDLE HeapGpuHandle(int slot) const
     {
@@ -760,14 +813,14 @@ protected:
         {
             // 堆第 32 格的 SRV 直接给 ImGui 画：横 = NoV（0 → 1），竖 = 粗糙度（上 0 → 下 1）；红 = A，绿 = B
             const float side = 128.0f * mDpiScale;
-            ImGui::Image((ImTextureID)HeapGpuHandle(32).ptr, ImVec2(side, side));
+            ImGui::Image((ImTextureID)HeapGpuHandle(HeapSlot::BrdfLutSrv).ptr, ImVec2(side, side));
             ImGui::TreePop();
         }
         ImGui::Checkbox("延迟渲染", &mDeferred);
         if (mDeferred) // 调试视图只有延迟模式才有（要读 G-Buffer）
         {
             // 第 7 个"环境光遮蔽"要等 SSAO 第①步写完、把 kGBufferViews 改成 7 才会出现在下拉框里
-            const char* gbufferViews[] = {"关", "基础色", "法线", "粗糙度", "金属度", "深度", "世界坐标", "环境光遮蔽", "阴影因子"};
+            const char* gbufferViews[] = {"关", "基础色", "法线", "粗糙度", "金属度", "深度", "世界坐标", "环境光遮蔽", "阴影因子", "速度"};
             ImGui::Combo("G-Buffer 视图", &mGBufferView, gbufferViews, 1 + kGBufferViews);
             ImGui::Checkbox("SSAO", &mSsao); // 关掉 = 遮蔽图清成全白（1 = 没被挡），环境光不变暗
             ImGui::SliderInt("AO 模糊次数", &mSsaoBlurCount, 0, 4); // "横 + 竖"算一次；0 = 看没模糊的噪点
@@ -819,6 +872,17 @@ protected:
             ImGui::SliderFloat("次像素混合", &mFxaaSubpix, 0.0f, 1.0f, "%.2f");
             ImGui::SliderFloat("边缘门槛", &mFxaaEdgeThreshold, 0.063f, 0.333f, "%.3f");
             ImGui::Checkbox("看 FXAA 判出的边", &mFxaaDebug);
+            ImGui::BeginDisabled(!mDeferred); // 速度缓冲在 G-Buffer 里，所以只有延迟模式能开
+            ImGui::Checkbox("TAA", &mTaa);
+            ImGui::EndDisabled();
+            if (mTaa && mDeferred)
+            {
+                ImGui::SliderFloat("抖动放大（调试）", &mTaaJitterScale, 1.0f, 20.0f, "×%.0f");
+                ImGui::SliderFloat("当前帧占比 α", &mTaaAlpha, 0.02f, 1.0f, "%.2f"); // 1 = 不要历史（只剩抖动）
+                ImGui::Checkbox("邻域裁剪（去拖影）", &mTaaClamp);
+                ImGui::Text("上一帧的抖动 (%.3f, %.3f) 像素", mTaaJitter.x, mTaaJitter.y);
+            }
+            ImGui::Checkbox("测试球左右移动（看速度）", &mTaaMoveSpheres); // 要先勾"PBR 测试球"
             ImGui::TreePop();
         }
         bool sunChanged = ImGui::SliderFloat("太阳方位角", &mSunAzimuth, -180.0f, 180.0f, "%.1f°");
@@ -904,18 +968,77 @@ protected:
                 mPassSamples = 0;
                 // 基类每秒刷新一次标题（CalculateFrameStats），会把这段文字带上
                 mMainWndCaption = std::format(
-                    L"LearnDX12    移速 {:.1f}    GPU：阴影图 {:.3f} | 不透明/G-Buffer {:.3f} | SSAO {:.3f} | 光照 {:.3f} | 天空+镜子 {:.3f} | 透明 {:.3f} | Bloom {:.3f} | 色调映射 {:.3f} | FXAA {:.3f} | 模糊 {:.3f} ms",
+                    L"LearnDX12    移速 {:.1f}    GPU：阴影图 {:.3f} | 不透明/G-Buffer {:.3f} | SSAO {:.3f} | 光照 {:.3f} | 天空+镜子 {:.3f} | 透明 {:.3f} | TAA {:.3f} | Bloom {:.3f} | 色调映射 {:.3f} | FXAA {:.3f} | 模糊 {:.3f} ms",
                     mCamera.GetMoveSpeed(), avg[0], avg[1], avg[2], avg[3], avg[4], avg[5], avg[6], avg[7], avg[8],
-                    avg[9]);
+                    avg[9],
+                    avg[10]);
             }
         }
 
         UpdateWaves(gt);
 
         UpdateMaterialCBs();
+        AnimateTestSpheres(gt); // 面板勾了"测试球左右移动"才动
         UpdateObjectCBs();
         UpdateShadowTransform();
         UpdateMainPassCB();
+    }
+
+    // TAA（第③步你来写）：读 HDR 纹理（这一帧）+ 历史图 [1 − mTaaCur]（上一帧）+ 速度 + 深度，写历史图 [mTaaCur]，再复制回 HDR 纹理
+    // 进来时：HDR 纹理、两张历史图、速度缓冲都是 PIXEL_SHADER_RESOURCE，深度是 DEPTH_WRITE；出去时要恢复成一样
+    void DrawTaa(D3D12_GPU_VIRTUAL_ADDRESS passCB)
+    {
+        const UINT cur = mTaaCur, prev = 1 - mTaaCur; // 这一帧写 cur，读 prev（上一帧写的那张）
+        // ① 历史图 [cur] 要当渲染目标；深度要当 SRV 读（天空的速度靠它反推）
+        D3D12_RESOURCE_BARRIER before[] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(mTaaHistory[cur].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                 D3D12_RESOURCE_STATE_RENDER_TARGET),
+            CD3DX12_RESOURCE_BARRIER::Transition(mDepthStencilBuffer.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        };
+        mCommandList->ResourceBarrier(2, before);
+        CD3DX12_CPU_DESCRIPTOR_HANDLE rtv(mTaaRtvHeap->GetCPUDescriptorHandleForHeapStart(), cur, mRTVDescriptorSize);
+        mCommandList->OMSetRenderTargets(1, &rtv, true, nullptr);
+        mCommandList->SetGraphicsRootSignature(mTaaRootSignature.Get());
+        mCommandList->SetGraphicsRootDescriptorTable(0, HeapGpuHandle(HeapSlot::Hdr)); //t0：这一帧
+        mCommandList->SetGraphicsRootDescriptorTable(1, HeapGpuHandle(HeapSlot::TaaHistory0 + prev)); //t1：上一帧的结果
+        mCommandList->SetGraphicsRootDescriptorTable(2, HeapGpuHandle(HeapSlot::Velocity)); //t2：速度
+        mCommandList->SetGraphicsRootDescriptorTable(3, HeapGpuHandle(HeapSlot::Depth)); //t3：深度
+        mCommandList->SetGraphicsRootConstantBufferView(4, passCB); //b1：矩阵
+        struct
+        {
+            float RcpW, RcpH;
+            float Alpha;
+            UINT Reset;
+            UINT Clamp;
+        } settings = {1.0f / mClientWidth, 1.0f / mClientHeight, mTaaAlpha, mTaaReset ? 1u : 0u,mTaaClamp ? 1u : 0u};
+        mCommandList->SetGraphicsRoot32BitConstants(5, 5, &settings, 0);
+        mCommandList->SetPipelineState(mTaaPSO.Get());
+        mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        mCommandList->DrawInstanced(3, 1, 0, 0);
+
+        // ② 结果复制回 HDR 纹理；深度顺便切回去（下一帧开头要清它）
+        D3D12_RESOURCE_BARRIER toCopy[] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(mTaaHistory[cur].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                 D3D12_RESOURCE_STATE_COPY_SOURCE),
+            CD3DX12_RESOURCE_BARRIER::Transition(mHdrMap.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                 D3D12_RESOURCE_STATE_COPY_DEST),
+            CD3DX12_RESOURCE_BARRIER::Transition(mDepthStencilBuffer.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                 D3D12_RESOURCE_STATE_DEPTH_WRITE),
+        };
+        mCommandList->ResourceBarrier(3, toCopy);
+        mCommandList->CopyResource(mHdrMap.Get(),mTaaHistory[cur].Get());
+        D3D12_RESOURCE_BARRIER afterCopy[] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(mTaaHistory[cur].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, 
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            CD3DX12_RESOURCE_BARRIER::Transition(mHdrMap.Get(), D3D12_RESOURCE_STATE_COPY_DEST, 
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        };
+        mCommandList->ResourceBarrier(2, afterCopy);
+        
+        // ③ 下一帧：这张变成"上一帧"
+        mTaaCur = (cur + 1) % 2;
+        mTaaReset = false;
     }
 
     /*
@@ -931,7 +1054,7 @@ protected:
      *   ② 不透明物体
      *        前向：渲染目标：HDR | 深度：主深度 | PSO：各物体的 PSO | 根签名：主
      *        延迟：DrawDeferred，分成几段 ↓
-     *     ②a G-Buffer   渲染目标：GBuffer0 + GBuffer1 | 深度：主深度 | PSO：各物体的 GbufferPSO | 根签名：主
+     *     ②a G-Buffer   渲染目标：GBuffer0 + GBuffer1 + 速度缓冲（TAA 第②步）| 深度：主深度 | PSO：各物体的 GbufferPSO | 根签名：主
      *     ②a' SSAO      DrawSsao，全屏三角形，视口是半分辨率（面板没勾 SSAO 时只把遮蔽图 [0] 清成全白）
      *        遮蔽：渲染目标：遮蔽图 [0]（kAoFormat）| 深度：无 | PSO：mSsaoPSO | 根签名：主（根参数 8）
      *        模糊：横 [0] → [1]，竖 [1] → [0]，重复"AO 模糊次数"遍 | PSO：mSsaoBlurPSO[0] / [1]
@@ -944,6 +1067,8 @@ protected:
      *        渲染目标：HDR（加法混合，叠在 ②b 上）| 深度：无 | PSO：mLightVolumePSO | 根签名：主
      *   ③ 天空、镜子、倒影、透明
      *        渲染目标：HDR | 深度：主深度 | PSO：各物体的 PSO | 根签名：主
+     *   ③b TAA          DrawTaa，全屏三角形（只在延迟 + 勾了 TAA 时）：HDR + 历史图 [1 − cur] + 速度 + 深度 → 历史图 [cur]，再复制回 HDR
+     *        渲染目标：历史图 [cur]（kHdrFormat）| 深度：无（深度当 SRV 读）| PSO：mTaaPSO | 根签名：TAA
      *   ④ Bloom         DoBloom，全屏三角形
      *        渲染目标：Bloom 纹理链（kBloomFormat）| 深度：无 | PSO：mBloomPrefilter/Down/UpPSO | 根签名：Bloom
      *   ⑤ 色调映射      全屏三角形，HDR 纹理 → 屏幕
@@ -997,8 +1122,8 @@ protected:
         mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 0); // T0
         DrawShadowMap(passCB + 2 * passCBByteSize, passCBByteSize);
         mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 1); // T1
-        mCommandList->SetGraphicsRootDescriptorTable(5, HeapGpuHandle(10));
-        mCommandList->SetGraphicsRootDescriptorTable(10, HeapGpuHandle(30)); // IBL 三张图（堆第 30～32 格）
+        mCommandList->SetGraphicsRootDescriptorTable(5, HeapGpuHandle(HeapSlot::SkyCube));
+        mCommandList->SetGraphicsRootDescriptorTable(10, HeapGpuHandle(HeapSlot::IrradianceSrv)); // IBL 三张图（连着的 3 格）
 
         // ② 主 Pass。阴影 Pass 把视口改成了阴影图的大小，这里换回屏幕的
         mCommandList->RSSetViewports(1, &mScreenViewport);
@@ -1013,8 +1138,8 @@ protected:
                                             nullptr);
 
         mCommandList->SetGraphicsRootConstantBufferView(2, passCB); // 阴影 Pass 用的是第 2 份，换回主 Pass 的
-        mCommandList->SetGraphicsRootDescriptorTable(4, HeapGpuHandle(9));
-        mCommandList->SetGraphicsRootDescriptorTable(7, HeapGpuHandle(16));
+        mCommandList->SetGraphicsRootDescriptorTable(4, HeapGpuHandle(HeapSlot::ShadowMap));
+        mCommandList->SetGraphicsRootDescriptorTable(7, HeapGpuHandle(HeapSlot::Grass));
 
         // 不透明物体。延迟 = G-Buffer Pass + 光照 Pass（选了 G-Buffer 视图时换成调试视图）；前向 = 边画边算光。
         // 两条路出来时一样：HDR 纹理 + 深度缓冲绑着，深度里是不透明物体的深度
@@ -1061,11 +1186,23 @@ protected:
         auto hdrToSrv = CD3DX12_RESOURCE_BARRIER::Transition(
             mHdrMap.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         mCommandList->ResourceBarrier(1, &hdrToSrv);
+        // ③b TAA（s110）：这一帧 + 上一帧的历史图 → 另一张历史图，再复制回 HDR 纹理，后面的 Bloom、色调映射照旧读 HDR 纹理。
+        //     T6 ～ T7 就是它的耗时。G-Buffer 视图看的是存的原值，不做 TAA
+        const bool taa = mTaa && mDeferred && !gbufferView;
+        if (taa)
+        {
+            DrawTaa(passCB);
+        }
+        else
+        {
+            mTaaReset = true; // 这一帧没做 TAA：历史图过时了，下次打开时先作废
+        }
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 7); // T7：TAA 做完
         if (mBloomEnabled && !gbufferView)
         {
             DoBloom();
         }
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 7); // T7
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 8); // T8
         //Bloom Pass 把视口改成了Bloom图的大小，这里换回屏幕的
         mCommandList->RSSetViewports(1, &mScreenViewport);
         mCommandList->RSSetScissorRects(1, &mScissorRect);
@@ -1075,13 +1212,14 @@ protected:
         D3D12_CPU_DESCRIPTOR_HANDLE ldrRtv = mLdrRtvHeap->GetCPUDescriptorHandleForHeapStart();
         if (fxaa)
         {
-            auto ldrToRt = CD3DX12_RESOURCE_BARRIER::Transition(mLdrMap.Get(), 
-                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            auto ldrToRt = CD3DX12_RESOURCE_BARRIER::Transition(mLdrMap.Get(),
+                                                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                                D3D12_RESOURCE_STATE_RENDER_TARGET);
             mCommandList->ResourceBarrier(1, &ldrToRt);
         }
         mCommandList->OMSetRenderTargets(1, fxaa ? &ldrRtv : &backRtv, true, nullptr); // 勾了写哪张？没勾写哪张？
         mCommandList->SetGraphicsRootSignature(mTonemapRootSignature.Get());
-        mCommandList->SetGraphicsRootDescriptorTable(0, HeapGpuHandle(18)); // 堆第 18 格：HDR 纹理的 SRV
+        mCommandList->SetGraphicsRootDescriptorTable(0, HeapGpuHandle(HeapSlot::Hdr)); // HDR 纹理的 SRV
         // 根参数 1：两个 32 位根常量（b0），和 Tonemap.hlsl 的 TonemapSettings 一一对应。EV 每 +1 亮一倍，所以是 2^EV
         struct
         {
@@ -1097,34 +1235,37 @@ protected:
         mCommandList->SetPipelineState(mTonemapPSO.Get());
         mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         mCommandList->DrawInstanced(3, 1, 0, 0); // 3 个顶点 = 一个盖住全屏的大三角形，位置在 VS 里按 SV_VertexID 算
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 8); // T8
-        // ⑤b FXAA（s178）画在这里：T8 ～ T9 就是它的耗时
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 9); // T9
+        // ⑤b FXAA（s178）画在这里：T9 ～ T10 就是它的耗时
         if (fxaa)
         {
-            auto RtToldr = CD3DX12_RESOURCE_BARRIER::Transition(mLdrMap.Get(), 
-                D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            auto RtToldr = CD3DX12_RESOURCE_BARRIER::Transition(mLdrMap.Get(),
+                                                                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             mCommandList->ResourceBarrier(1, &RtToldr);
             mCommandList->OMSetRenderTargets(1, &backRtv, true, nullptr);
             mCommandList->SetGraphicsRootSignature(mFxaaRootSignature.Get());
-            mCommandList->SetGraphicsRootDescriptorTable(0, HeapGpuHandle(40));
+            mCommandList->SetGraphicsRootDescriptorTable(0, HeapGpuHandle(HeapSlot::Ldr));
             struct
             {
                 float RcpW, RcpH; // 一个像素在 uv 里有多宽、多高
                 float Subpix;
                 float EdgeThreshold;
                 UINT Debug;
-            } fxaaSettings = { 1.0f / mClientWidth, 1.0f / mClientHeight, mFxaaSubpix, mFxaaEdgeThreshold, mFxaaDebug ? 1u : 0u};
-            mCommandList->SetGraphicsRoot32BitConstants(1,5, &fxaaSettings, 0);
+            } fxaaSettings = {
+                1.0f / mClientWidth, 1.0f / mClientHeight, mFxaaSubpix, mFxaaEdgeThreshold, mFxaaDebug ? 1u : 0u
+            };
+            mCommandList->SetGraphicsRoot32BitConstants(1, 5, &fxaaSettings, 0);
             mCommandList->SetPipelineState(mFxaaPSO.Get());
             mCommandList->DrawInstanced(3, 1, 0, 0);
         }
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 9); // T9
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 10); // T10
         if (mBlurEnabled)
         {
             DoBlur();
         }
-        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 10); // T10
-        // UI 最后画：盖在最上面，不被模糊，也不做深度测试。放在 T10 后面，不算进"模糊"的耗时
+        mCommandList->EndQuery(mTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsBase + 11); // T11
+        // UI 最后画：盖在最上面，不被模糊，也不做深度测试。放在 T11 后面，不算进"模糊"的耗时
         // 画在后台缓冲上：rtv 现在是 HDR 纹理，画进去就不会再上屏了
         mCommandList->OMSetRenderTargets(1, &backRtv, true, nullptr);
         ID3D12DescriptorHeap* uiHeaps[] = {mHeap.Get()}; // 字体图集的 SRV 在 mHeap 第 12～15 格；显式再绑一次，不依赖前面绑过什么
@@ -1289,21 +1430,58 @@ private:
         }
     }
 
+    // TAA 第②步的测试物体：PBR 测试球整排左右来回移动（振幅 3，4 秒一个来回），摆法和 BuildRenderItems 里一样
+    void AnimateTestSpheres(const GameTimer& gt)
+    {
+        if (!mTaaMoveSpheres)
+            return;
+        mSphereAnimTime += gt.DeltaTime();
+        const float dx = 3.0f * sinf(XM_2PI * mSphereAnimTime / 4.0f);
+        const auto& balls = mRitemLayer[(int)RenderLayer::TestSpheres];
+        for (size_t k = 0; k < balls.size(); k++)
+        {
+            const int row = (int)k / 5, i = (int)k % 5;
+            XMStoreFloat4x4(&balls[k]->World, XMMatrixScaling(1.6f, 1.6f, 1.6f) *
+                            XMMatrixTranslation(24.0f - 2.5f * i + dx, 1.2f, row == 0 ? -30.0f : -38.0f));
+            balls[k]->NumFramesDirty = gNumFrameResources;
+        }
+    }
+
     // 物体常量：只写还"脏"的渲染项，每写一份帧资源减 1，减到 0 就不再写
     void UpdateObjectCBs()
     {
         for (auto& ri : mAllItems)
         {
+            // 上一帧动过（PrevWorld ≠ World）：这一帧的常量变了，每份帧资源都要重写。
+            // 多 1 份：停下来以后 PrevWorld 会变成和 World 一样，这个新值也要写进全部 3 份
+            if (memcmp(&ri->PrevWorld, &ri->World, sizeof(XMFLOAT4X4)) != 0)
+                ri->NumFramesDirty = gNumFrameResources + 1;
             if (ri->NumFramesDirty > 0)
             {
                 ObjectConstants oc;
-                XMStoreFloat4x4(&oc.World, XMMatrixTranspose(XMLoadFloat4x4(&ri->World))); // HLSL 按列主序读，要转置
+                //"HLSL 按列主序读，要转置"、"只存逆矩阵：逆转置 + 上传前的转置，两次转置抵消"
+                XMStoreFloat4x4(&oc.World, XMMatrixTranspose(XMLoadFloat4x4(&ri->World)));
                 XMStoreFloat4x4(&oc.WorldInvTranspose, XMMatrixInverse(nullptr, XMLoadFloat4x4(&ri->World)));
-                // 只存逆矩阵：逆转置 + 上传前的转置，两次转置抵消
+                XMStoreFloat4x4(&oc.PrevWorld, XMMatrixTranspose(XMLoadFloat4x4(&ri->PrevWorld)));
                 mCurrentFrame->ObjectCB->CopyData(ri->ObjCBIndex, oc);
                 ri->NumFramesDirty--;
             }
+            ri->PrevWorld = ri->World; // 下一帧的"上一帧"
         }
+    }
+
+    // Halton 序列第 index 个数（0～1）：index 写成 base 进制，各位数字倒过来放到小数点后面
+    static float Halton(UINT index, UINT base)
+    {
+        float f = 1.0f;
+        float r = 0.0f;
+        while (index > 0)
+        {
+            f /= base;
+            r += f * (index % base);
+            index /= base;
+        }
+        return r;
     }
 
     // Pass 常量：相机每帧都可能动，所以每帧都写
@@ -1312,8 +1490,23 @@ private:
         mCamera.UpdateViewMatrix();
 
         PassConstants pc = {};
+        XMMATRIX proj = mCamera.GetProj();
+        if (mTaa && mDeferred)
+        {
+            const UINT i = mTaaFrame % kTaaSamples + 1; // 第几个样本：1～8 循环（表里第 0 个点是什么？）
+            mTaaJitter = {
+                (Halton(i, 2) - 0.5f) * mTaaJitterScale, (Halton(i, 3) - 0.5f) * mTaaJitterScale
+            }; // 换算成以像素中心为原点
+            proj.r[2] = XMVectorAdd(proj.r[2], XMVectorSet(2 * mTaaJitter.x / mClientWidth,
+                                                           -2 * mTaaJitter.y / mClientHeight, 0.0f, 0.0f)); // 像素 → NDC
+            mTaaFrame++; // 下一帧换下一个点
+        }
+        else
+        {
+            mTaaJitter = {0.0f, 0.0f};
+        }
         const XMMATRIX viewProj =
-            mCamera.GetView() * mCamera.GetProj();
+            mCamera.GetView() * proj;
 
         XMStoreFloat4x4(
             &pc.ViewProj,
@@ -1325,6 +1518,12 @@ private:
         XMStoreFloat4x4(
             &pc.InvViewProj,
             XMMatrixTranspose(invViewProj));
+
+        // 运动矢量用的两个矩阵：都不带抖动（抖动不是运动，算进去的话静止画面也有速度）
+        const XMMATRIX viewProjNoJitter = mCamera.GetView() * mCamera.GetProj();
+        XMStoreFloat4x4(&pc.ViewProjNoJitter, XMMatrixTranspose(viewProjNoJitter));
+        XMStoreFloat4x4(&pc.PrevViewProjNoJitter, XMMatrixTranspose(XMLoadFloat4x4(&mPrevViewProjNoJitter)));
+        XMStoreFloat4x4(&mPrevViewProjNoJitter, viewProjNoJitter);
         for (int t = 0; t < kMaxCascades; t++)
         {
             XMStoreFloat4x4(&pc.ShadowTransforms[t], XMMatrixTranspose(XMLoadFloat4x4(&mShadowTransforms[t])));
@@ -1613,7 +1812,7 @@ private:
     {
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {
             .Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            .NumDescriptors = 41,
+            .NumDescriptors = HeapSlot::Count,
             /* 0～4 纹理，
              * 5～8 模糊用的两张纹理（各一个 SRV、一个 UAV），
              * 9 阴影图的 SRV，10天空图   
@@ -1628,6 +1827,7 @@ private:
              * 30～32 IBL：辐照度图、预滤波环境贴图、BRDF LUT（SRV，根参数 10 的表）
              * 33 辐照度图的 UAV，34～38 预滤波第 0～4 级的 UAV，39 BRDF LUT 的 UAV（只在生成时写）
              * 40 色调映射的结果（LDR 纹理）的 SRV，FXAA 读
+             * 41 速度缓冲的 SRV（根参数 11 = t13）：G-Buffer 视图"速度"和 TAA 读
              */
             .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, // 着色器要从这个堆里读（RTV/DSV 堆不用，所以是 NONE）
             .NodeMask = 0,
@@ -1641,15 +1841,23 @@ private:
             .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             .TextureCube = {.MostDetailedMip = 0, .MipLevels = 1, .ResourceMinLODClamp = 0.0f},
         };
-        mDevice->CreateShaderResourceView(nullptr, &nullCube, HeapCpuHandle(30));
-        mDevice->CreateShaderResourceView(nullptr, &nullCube, HeapCpuHandle(31));
+        mDevice->CreateShaderResourceView(nullptr, &nullCube, HeapCpuHandle(HeapSlot::IrradianceSrv));
+        mDevice->CreateShaderResourceView(nullptr, &nullCube, HeapCpuHandle(HeapSlot::PrefilteredSrv));
         D3D12_SHADER_RESOURCE_VIEW_DESC nullLut = {
             .Format = kBrdfLutFormat,
             .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
             .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             .Texture2D = {.MostDetailedMip = 0, .MipLevels = 1, .PlaneSlice = 0, .ResourceMinLODClamp = 0.0f},
         };
-        mDevice->CreateShaderResourceView(nullptr, &nullLut, HeapCpuHandle(32));
+        mDevice->CreateShaderResourceView(nullptr, &nullLut, HeapCpuHandle(HeapSlot::BrdfLutSrv));
+        // 第 41 格（速度缓冲）同理：TAA 第②步建好速度纹理之前，调试视图"速度"读到的是 0（= 不动）
+        D3D12_SHADER_RESOURCE_VIEW_DESC nullVelocity = {
+            .Format = kVelocityFormat,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .Texture2D = {.MostDetailedMip = 0, .MipLevels = 1, .PlaneSlice = 0, .ResourceMinLODClamp = 0.0f},
+        };
+        mDevice->CreateShaderResourceView(nullptr, &nullVelocity, HeapCpuHandle(HeapSlot::Velocity));
     }
 
     // 构建SRV
@@ -1681,7 +1889,8 @@ private:
                 .ResourceMinLODClamp = 0.0f,
             },
         };
-        CD3DX12_CPU_DESCRIPTOR_HANDLE fenceHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), 1, mCSUDescriptorSize);
+        CD3DX12_CPU_DESCRIPTOR_HANDLE fenceHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), HeapSlot::FenceTex,
+                                                  mCSUDescriptorSize);
         mDevice->CreateShaderResourceView(WireFenceTex.Get(), &WireFenceDESC, fenceHandle);
 
         auto& iceTex = mTextures.at("iceTex")->Resource;
@@ -1696,7 +1905,8 @@ private:
                 .ResourceMinLODClamp = 0.0f,
             }
         };
-        CD3DX12_CPU_DESCRIPTOR_HANDLE iceHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), 2, mCSUDescriptorSize);
+        CD3DX12_CPU_DESCRIPTOR_HANDLE iceHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), HeapSlot::IceTex,
+                                                mCSUDescriptorSize);
         mDevice->CreateShaderResourceView(iceTex.Get(), &iceDesc, iceHandle);
 
         auto& tileTex = mTextures.at("tileTex")->Resource;
@@ -1711,7 +1921,8 @@ private:
                 .ResourceMinLODClamp = 0.0f,
             }
         };
-        CD3DX12_CPU_DESCRIPTOR_HANDLE tileHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), 3, mCSUDescriptorSize);
+        CD3DX12_CPU_DESCRIPTOR_HANDLE tileHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), HeapSlot::TileTex,
+                                                 mCSUDescriptorSize);
         mDevice->CreateShaderResourceView(tileTex.Get(), &tileDesc, tileHandle);
 
         auto& treeArrayTex = mTextures.at("treeArrayTex")->Resource;
@@ -1728,7 +1939,8 @@ private:
                 .ResourceMinLODClamp = 0.0f
             }
         };
-        CD3DX12_CPU_DESCRIPTOR_HANDLE treeHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), 4, mCSUDescriptorSize);
+        CD3DX12_CPU_DESCRIPTOR_HANDLE treeHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), HeapSlot::TreeTexArray,
+                                                 mCSUDescriptorSize);
         mDevice->CreateShaderResourceView(treeArrayTex.Get(), &treeArrayDesc, treeHandle);
 
         auto& skyTex = mTextures.at("skyCubeTex")->Resource;
@@ -1740,7 +1952,8 @@ private:
                 .MostDetailedMip = 0, .MipLevels = skyTex->GetDesc().MipLevels, .ResourceMinLODClamp = 0.0f
             },
         };
-        CD3DX12_CPU_DESCRIPTOR_HANDLE skyHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), 10, mCSUDescriptorSize);
+        CD3DX12_CPU_DESCRIPTOR_HANDLE skyHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), HeapSlot::SkyCube,
+                                                mCSUDescriptorSize);
         mDevice->CreateShaderResourceView(skyTex.Get(), &skyDesc, skyHandle);
 
         auto& tileNormalTex = mTextures.at("tileNormalTex")->Resource;
@@ -1755,7 +1968,8 @@ private:
                 .ResourceMinLODClamp = 0.0f,
             },
         };
-        CD3DX12_CPU_DESCRIPTOR_HANDLE tileNormalHandle(mHeap->GetCPUDescriptorHandleForHeapStart(), 11,
+        CD3DX12_CPU_DESCRIPTOR_HANDLE tileNormalHandle(mHeap->GetCPUDescriptorHandleForHeapStart(),
+                                                       HeapSlot::TileNormal,
                                                        mCSUDescriptorSize);
         mDevice->CreateShaderResourceView(tileNormalTex.Get(), &tileNormalTexDesc,
                                           tileNormalHandle);
@@ -1776,7 +1990,8 @@ private:
                     .ResourceMinLODClamp = 0.0f,
                 },
             };
-            mDevice->CreateShaderResourceView(landLayerTex.Get(), &landLayerTexDesc, HeapCpuHandle(16 + k));
+            mDevice->CreateShaderResourceView(landLayerTex.Get(), &landLayerTexDesc,
+                                              HeapCpuHandle(HeapSlot::Grass + k));
         }
     }
 
@@ -2112,7 +2327,7 @@ private:
         LMaterial_fence->Metallic = 1.0f; // 铁丝网当金属：没有漫反射，贴图颜色就是反光的颜色
         LMaterial_fence->Roughness = 0.4f;
         LMaterial_fence->Reflectance = 0.5f; // 金属用不到（f0 直接取基础色）
-        LMaterial_fence->DiffuseSrvHeapIndex = 1; //材质里的一个编号，意思是"我这个材质的贴图，放在 SRV 堆的第几格"。
+        LMaterial_fence->DiffuseSrvHeapIndex = HeapSlot::FenceTex; //材质里的一个编号，意思是"我这个材质的贴图，放在 SRV 堆的第几格"。
 
         LMaterial_mirror->Name = "mirror";
         LMaterial_mirror->MatCBIndex = 4;
@@ -2120,7 +2335,7 @@ private:
         LMaterial_mirror->Metallic = 0.0f;
         LMaterial_mirror->Roughness = 0.1f; // 冰面很光滑
         LMaterial_mirror->Reflectance = 0.35f; // 冰的 f0 和水差不多
-        LMaterial_mirror->DiffuseSrvHeapIndex = 2;
+        LMaterial_mirror->DiffuseSrvHeapIndex = HeapSlot::IceTex;
 
         LMaterial_floor->Name = "floor";
         LMaterial_floor->MatCBIndex = 5;
@@ -2128,8 +2343,8 @@ private:
         LMaterial_floor->Metallic = 0.0f;
         LMaterial_floor->Roughness = 0.5f; // 瓷砖；法线图的 alpha 还会把砖缝的粗糙度推到 1
         LMaterial_floor->Reflectance = 0.5f;
-        LMaterial_floor->DiffuseSrvHeapIndex = 3;
-        LMaterial_floor->NormalSrvHeapIndex = 11;
+        LMaterial_floor->DiffuseSrvHeapIndex = HeapSlot::TileTex;
+        LMaterial_floor->NormalSrvHeapIndex = HeapSlot::TileNormal;
 
         LMaterial_shadow->Name = "shadow";
         LMaterial_shadow->MatCBIndex = 6;
@@ -2137,7 +2352,7 @@ private:
         LMaterial_shadow->Metallic = 0.0f; // 平面阴影已经不画了，下面两项随便填
         LMaterial_shadow->Roughness = 1.0f;
         LMaterial_shadow->Reflectance = 0.5f;
-        LMaterial_shadow->DiffuseSrvHeapIndex = 0;
+        LMaterial_shadow->DiffuseSrvHeapIndex = HeapSlot::CrateTex;
 
         LMaterial_fenceShadow->Name = "fenceShadow";
         LMaterial_fenceShadow->MatCBIndex = 7;
@@ -2145,7 +2360,7 @@ private:
         LMaterial_fenceShadow->Metallic = 0.0f;
         LMaterial_fenceShadow->Roughness = 1.0f;
         LMaterial_fenceShadow->Reflectance = 0.5f;
-        LMaterial_fenceShadow->DiffuseSrvHeapIndex = 1;
+        LMaterial_fenceShadow->DiffuseSrvHeapIndex = HeapSlot::FenceTex;
 
         LMaterial_tree->Name = "tree";
         LMaterial_tree->MatCBIndex = 8;
@@ -2153,7 +2368,7 @@ private:
         LMaterial_tree->Metallic = 0.0f;
         LMaterial_tree->Roughness = 0.9f; // 树叶很粗糙
         LMaterial_tree->Reflectance = 0.5f;
-        LMaterial_tree->DiffuseSrvHeapIndex = 4;
+        LMaterial_tree->DiffuseSrvHeapIndex = HeapSlot::TreeTexArray;
 
         LMaterial_sky->Name = "sky";
         LMaterial_sky->MatCBIndex = 9;
@@ -2521,8 +2736,10 @@ private:
 
         CD3DX12_DESCRIPTOR_RANGE iblRange;
         iblRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 10); // t10～t12：IBL 三张图
+        CD3DX12_DESCRIPTOR_RANGE velocityRange;
+        velocityRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 13); // t13：速度缓冲（堆第 41 格）
 
-        CD3DX12_ROOT_PARAMETER slotRootParameter[11];
+        CD3DX12_ROOT_PARAMETER slotRootParameter[12];
         slotRootParameter[0].InitAsConstantBufferView(0);
         slotRootParameter[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
         slotRootParameter[2].InitAsConstantBufferView(1);
@@ -2534,6 +2751,7 @@ private:
         slotRootParameter[8].InitAsDescriptorTable(1, &gbufferRange, D3D12_SHADER_VISIBILITY_PIXEL);
         slotRootParameter[9].InitAsDescriptorTable(1, &aoRange, D3D12_SHADER_VISIBILITY_PIXEL);
         slotRootParameter[10].InitAsDescriptorTable(1, &iblRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        slotRootParameter[11].InitAsDescriptorTable(1, &velocityRange, D3D12_SHADER_VISIBILITY_PIXEL);
 
         CD3DX12_STATIC_SAMPLER_DESC samplers[3] = {
             CD3DX12_STATIC_SAMPLER_DESC(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR),
@@ -2715,9 +2933,11 @@ private:
 
         mTonemapVSByteCode = CompileShader(L"HLSL\\Tonemap.hlsl", nullptr, "VS", "vs_6_6");
         mTonemapPSByteCode = CompileShader(L"HLSL\\Tonemap.hlsl", nullptr, "PS", "ps_6_6");
-        
+
         mFxaaVSByteCode = CompileShader(L"HLSL\\Fxaa.hlsl", nullptr, "VS", "vs_6_6");
         mFxaaPSByteCode = CompileShader(L"HLSL\\Fxaa.hlsl", nullptr, "PS", "ps_6_6");
+        mTaaVSByteCode = CompileShader(L"HLSL\\Taa.hlsl", nullptr, "VS", "vs_6_6");
+        mTaaPSByteCode = CompileShader(L"HLSL\\Taa.hlsl", nullptr, "PS", "ps_6_6");
 
         mBloomVSByteCode = CompileShader(L"HLSL\\Bloom.hlsl", nullptr, "VS", "vs_6_6");
         mBloomPrefilterPSByteCode = CompileShader(L"HLSL\\Bloom.hlsl", nullptr, "PS_Prefilter", "ps_6_6");
@@ -2961,13 +3181,15 @@ private:
 
         auto gbufferDesc = psoDesc;
 
-        // 两张颜色目标，照常进行深度测试和深度写入
-        gbufferDesc.NumRenderTargets = 2;
+        // 三张颜色目标（两张 G-Buffer + 速度缓冲），照常进行深度测试和深度写入
+        gbufferDesc.NumRenderTargets = 3;
         gbufferDesc.RTVFormats[0] = kGBuffer0Format;
         gbufferDesc.RTVFormats[1] = kGBuffer1Format;
+        gbufferDesc.RTVFormats[2] = kVelocityFormat;
         /*
         * SV_Target0 ↔ RTVFormats[0] ↔ GBuffer0
         * SV_Target1 ↔ RTVFormats[1] ↔ GBuffer1
+        * SV_Target2 ↔ RTVFormats[2] ↔ 速度缓冲
         */
 
         // 下面 6 个和各自的前向 PSO 一一对应：前向那个改了哪些字段，这里就改哪些，只是 PS 换成 PS_GBuffer
@@ -3046,13 +3268,21 @@ private:
         tonemapDesc.DSVFormat = DXGI_FORMAT_UNKNOWN; // 不绑深度缓冲
         tonemapDesc.SampleDesc.Count = 1;
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&tonemapDesc, IID_PPV_ARGS(&mTonemapPSO)));
-        
+
         // fxaa
         auto fxaaDesc = tonemapDesc;
         fxaaDesc.pRootSignature = mFxaaRootSignature.Get();
         fxaaDesc.VS = {mFxaaVSByteCode->GetBufferPointer(), mFxaaVSByteCode->GetBufferSize()};
         fxaaDesc.PS = {mFxaaPSByteCode->GetBufferPointer(), mFxaaPSByteCode->GetBufferSize()};
         ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&fxaaDesc, IID_PPV_ARGS(&mFxaaPSO)));
+
+        // TAA：全屏三角形，写历史图（HDR 格式）
+        auto taaDesc = fxaaDesc;
+        taaDesc.pRootSignature = mTaaRootSignature.Get();
+        taaDesc.VS = {mTaaVSByteCode->GetBufferPointer(), mTaaVSByteCode->GetBufferSize()};
+        taaDesc.PS = {mTaaPSByteCode->GetBufferPointer(), mTaaPSByteCode->GetBufferSize()};
+        taaDesc.RTVFormats[0] = kHdrFormat;
+        ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&taaDesc, IID_PPV_ARGS(&mTaaPSO)));
 
         // Bloom 三个 PSO：和色调映射一样是全屏三角形，换根签名、着色器、输出格式；放大那个开加法混合
         auto bloomDesc = tonemapDesc;
@@ -3218,7 +3448,7 @@ private:
             .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             .Texture2D = {.MostDetailedMip = 0, .MipLevels = 1},
         };
-        mDevice->CreateShaderResourceView(mHdrMap.Get(), &srvDesc, HeapCpuHandle(18));
+        mDevice->CreateShaderResourceView(mHdrMap.Get(), &srvDesc, HeapCpuHandle(HeapSlot::Hdr));
     }
 
     /*
@@ -3244,7 +3474,7 @@ private:
         ThrowIfFailed(
             mDevice->CreateCommittedResource(&heapProps,D3D12_HEAP_FLAG_NONE,&desc,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&mLdrMap)));
-        
+
         // 1 格 RTV 小堆（只在 !mLdrRtvHeap 时建）+ CreateRenderTargetView
         if (!mLdrRtvHeap)
         {
@@ -3264,7 +3494,81 @@ private:
             .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             .Texture2D = {.MostDetailedMip = 0, .MipLevels = 1},
         };
-        mDevice->CreateShaderResourceView(mLdrMap.Get(), &srvDesc, HeapCpuHandle(40));
+        mDevice->CreateShaderResourceView(mLdrMap.Get(), &srvDesc, HeapCpuHandle(HeapSlot::Ldr));
+    }
+
+    // TAA 的两张历史图：格式、大小和 HDR 纹理一样（要互相 CopyResource）。每张一个 RTV（自己的小堆）、一个 SRV（大堆 42～43 格）
+    // 新建的纹理里是随机内容，所以建完把 mTaaReset 设上：下一次 TAA 不读历史
+    void BuildTaaResources()
+    {
+        if (!mTaaRtvHeap)
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {
+                .Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                .NumDescriptors = 2,
+                .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                .NodeMask = 0,
+            };
+            ThrowIfFailed(mDevice->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&mTaaRtvHeap)));
+        }
+        D3D12_RESOURCE_DESC desc = {
+            .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            .Alignment = 0,
+            .Width = mClientWidth,
+            .Height = mClientHeight,
+            .DepthOrArraySize = 1,
+            .MipLevels = 1,
+            .Format = kHdrFormat,
+            .SampleDesc = {.Count = 1, .Quality = 0},
+            .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            .Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        };
+        CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+        for (UINT i = 0; i < 2; i++)
+        {
+            mTaaHistory[i].Reset();
+            ThrowIfFailed(mDevice->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                IID_PPV_ARGS(&mTaaHistory[i])));
+            CD3DX12_CPU_DESCRIPTOR_HANDLE rtv(mTaaRtvHeap->GetCPUDescriptorHandleForHeapStart(), i, mRTVDescriptorSize);
+            mDevice->CreateRenderTargetView(mTaaHistory[i].Get(), nullptr, rtv);
+            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+                .Format = kHdrFormat,
+                .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+                .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                .Texture2D = {.MostDetailedMip = 0, .MipLevels = 1},
+            };
+            mDevice->CreateShaderResourceView(mTaaHistory[i].Get(), &srvDesc, HeapCpuHandle(HeapSlot::TaaHistory0 + i));
+        }
+        mTaaReset = true;
+    }
+
+    // TAA 的根签名：t0～t3 各一张表（四张图在堆里不挨着）、b1 = Pass 常量（根 CBV）、b0 = 4 个根常量、s0 = 双线性 + 夹边
+    void BuildTaaRootSignature()
+    {
+        CD3DX12_DESCRIPTOR_RANGE range[4];
+        CD3DX12_ROOT_PARAMETER param[6];
+        for (UINT i = 0; i < 4; i++)
+        {
+            range[i].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, i); // ti
+            param[i].InitAsDescriptorTable(1, &range[i], D3D12_SHADER_VISIBILITY_PIXEL);
+        }
+        param[4].InitAsConstantBufferView(1, 0, D3D12_SHADER_VISIBILITY_PIXEL); // b1：Pass 常量（反推天空的速度要用矩阵）
+        param[5].InitAsConstants(5, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL); // b0：RcpFrame.xy  Alpha  Reset  Clamp
+        CD3DX12_STATIC_SAMPLER_DESC linearClamp(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                                                D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+        CD3DX12_ROOT_SIGNATURE_DESC
+            rootSigDesc(_countof(param), param, 1, &linearClamp, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        ComPtr<ID3DBlob> serialized;
+        ComPtr<ID3DBlob> error;
+        HRESULT hr = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &error);
+        if (error != nullptr)
+        {
+            OutputDebugStringA((char*)error->GetBufferPointer());
+        }
+        ThrowIfFailed(hr);
+        ThrowIfFailed(mDevice->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+            IID_PPV_ARGS(&mTaaRootSignature)));
     }
 
     void BuildTonemapRootSignature()
@@ -3295,15 +3599,15 @@ private:
             serialized->GetBufferSize(),
             IID_PPV_ARGS(&mTonemapRootSignature)));
     }
-    
+
     // FXAA 的根签名：一张表（t0 = LDR 纹理）+ 5 个根常量（b0）+ 双线性夹边采样器（s0）
     void BuildFxaaRootSignature()
     {
         CD3DX12_DESCRIPTOR_RANGE ldrRange;
-        ldrRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);   //1张纹理
+        ldrRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); //1张纹理
         CD3DX12_ROOT_PARAMETER param[2];
-        param[0].InitAsDescriptorTable(1,&ldrRange, D3D12_SHADER_VISIBILITY_PIXEL);
-        param[1].InitAsConstants(5, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL);   // RcpFrame.xy  Subpix  EdgeThreshold  Debug
+        param[0].InitAsDescriptorTable(1, &ldrRange, D3D12_SHADER_VISIBILITY_PIXEL);
+        param[1].InitAsConstants(5, 0, 0, D3D12_SHADER_VISIBILITY_PIXEL); // RcpFrame.xy  Subpix  EdgeThreshold  Debug
         CD3DX12_STATIC_SAMPLER_DESC linearClamp(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
                                                 D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
         CD3DX12_ROOT_SIGNATURE_DESC
@@ -3374,7 +3678,7 @@ private:
                 .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                 .Texture2D = {.MostDetailedMip = i, .MipLevels = 1}, // 空6
             };
-            mDevice->CreateShaderResourceView(mBloomMap.Get(), &srvDesc, HeapCpuHandle(19 + i));
+            mDevice->CreateShaderResourceView(mBloomMap.Get(), &srvDesc, HeapCpuHandle(HeapSlot::BloomMip0 + i));
         }
     }
 
@@ -3462,15 +3766,20 @@ private:
         for (UINT i = 0; i < kBloomMips; i++)
         {
             toRT(i);
-            if (i == 0) pass(0, 18, (float)mClientWidth, (float)mClientHeight, mBloomPrefilterPSO.Get()); // 空11
-            else pass(i, 19 + (i - 1), (float)mipW(i - 1), (float)mipH(i - 1), mBloomDownPSO.Get()); // 空12
+            if (i == 0)
+                pass(0, HeapSlot::Hdr, (float)mClientWidth, (float)mClientHeight,
+                     mBloomPrefilterPSO.Get()); // 空11
+            else
+                pass(i, HeapSlot::BloomMip0 + (i - 1), (float)mipW(i - 1), (float)mipH(i - 1),
+                     mBloomDownPSO.Get()); // 空12
             toSRV(i);
         }
         // ② 放大叠加：从倒数第二级往上，每级读比它小一级的
         for (int i = (int)kBloomMips - 2; i >= 0; i--)
         {
             toRT((UINT)i);
-            pass((UINT)i, 19 + (i + 1), (float)mipW(i + 1), (float)mipH(i + 1), mBloomUpPSO.Get()); // 空13
+            pass((UINT)i, HeapSlot::BloomMip0 + (i + 1), (float)mipW(i + 1), (float)mipH(i + 1),
+                 mBloomUpPSO.Get()); // 空13
             toSRV((UINT)i);
         }
     }
@@ -3483,7 +3792,7 @@ private:
         {
             D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {
                 .Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                .NumDescriptors = 2,
+                .NumDescriptors = 3,
                 .Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
                 .NodeMask = 0,
             };
@@ -3538,8 +3847,38 @@ private:
                     .MipLevels = 1,
                 }
             };
-            mDevice->CreateShaderResourceView(mGBuffer[i].Get(), &srvDesc, HeapCpuHandle(25 + i));
+            mDevice->CreateShaderResourceView(mGBuffer[i].Get(), &srvDesc, HeapCpuHandle(HeapSlot::GBuffer0 + i));
         }
+        // 第 3 张：速度缓冲。格式不同、SRV 要放第 41 格（第 27 格已经是深度），所以单独建
+        D3D12_RESOURCE_DESC velDesc = {
+            .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            .Alignment = 0,
+            .Width = mClientWidth,
+            .Height = mClientHeight,
+            .DepthOrArraySize = 1,
+            .MipLevels = 1,
+            .Format = kVelocityFormat,
+            .SampleDesc = {.Count = 1, .Quality = 0},
+            .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            .Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+        };
+        D3D12_CLEAR_VALUE velClear = {.Format = kVelocityFormat, .Color = {0, 0, 0, 0}}; // 0 = 不动（天空没画，就留着 0）
+        mVelocity.Reset();
+        ThrowIfFailed(mDevice->CreateCommittedResource(
+            &heapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &velDesc,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            &velClear,
+            IID_PPV_ARGS(&mVelocity)));
+        mDevice->CreateRenderTargetView(mVelocity.Get(), nullptr, GBufferRtv(2));
+        D3D12_SHADER_RESOURCE_VIEW_DESC velSrv = {
+            .Format = kVelocityFormat,
+            .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .Texture2D = {.MostDetailedMip = 0, .MipLevels = 1},
+        };
+        mDevice->CreateShaderResourceView(mVelocity.Get(), &velSrv, HeapCpuHandle(HeapSlot::Velocity));
 
         // 深度缓冲的 SRV（堆第 27 格）：只读前 24 位深度，后 8 位模板不要（和阴影图一样）。
         // 深度缓冲是 D3DApp::OnResize 重建的，旧 SRV 指着已经释放的资源，所以每次都要跟着重建
@@ -3552,7 +3891,7 @@ private:
                 .MipLevels = 1,
             }
         };
-        mDevice->CreateShaderResourceView(mDepthStencilBuffer.Get(), &depthSrvDesc, HeapCpuHandle(27));
+        mDevice->CreateShaderResourceView(mDepthStencilBuffer.Get(), &depthSrvDesc, HeapCpuHandle(HeapSlot::Depth));
     }
 
     CD3DX12_CPU_DESCRIPTOR_HANDLE GBufferRtv(int i) const
@@ -3571,17 +3910,19 @@ private:
                                                  D3D12_RESOURCE_STATE_RENDER_TARGET),
             CD3DX12_RESOURCE_BARRIER::Transition(mGBuffer[1].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                                                  D3D12_RESOURCE_STATE_RENDER_TARGET),
+            CD3DX12_RESOURCE_BARRIER::Transition(mVelocity.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                 D3D12_RESOURCE_STATE_RENDER_TARGET),
         };
         mCommandList->ResourceBarrier(_countof(toRender), toRender);
-        // 清除两张颜色目标，清除值与创建资源时的 optClear 一致
+        // 清除三张颜色目标（两张 G-Buffer + 速度缓冲），清除值与创建资源时的 optClear 一致
         const float clear[4] = {0, 0, 0, 0};
-        for (int i = 0; i < 2; i++)
+        for (int i = 0; i < 3; i++)
         {
             mCommandList->ClearRenderTargetView(
                 GBufferRtv(i), clear, 0, nullptr);
         }
         D3D12_CPU_DESCRIPTOR_HANDLE gbufferRtv = GBufferRtv(0);
-        mCommandList->OMSetRenderTargets(2, &gbufferRtv, true, &dsv);
+        mCommandList->OMSetRenderTargets(3, &gbufferRtv, true, &dsv);
         DrawRenderItems(
             mRitemLayer[(int)RenderLayer::Opaque],
             DrawPass::GBuffer);
@@ -3597,11 +3938,13 @@ private:
             D3D12_QUERY_TYPE_TIMESTAMP,
             tsBase + 2); // T2：G-Buffer 写完
 
-        // ② 写完后切换成读取：两张颜色目标 + 一张深度
+        // ② 写完后切换成读取：三张颜色目标 + 一张深度
         D3D12_RESOURCE_BARRIER toRead[] = {
             CD3DX12_RESOURCE_BARRIER::Transition(mGBuffer[0].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
             CD3DX12_RESOURCE_BARRIER::Transition(mGBuffer[1].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            CD3DX12_RESOURCE_BARRIER::Transition(mVelocity.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
             CD3DX12_RESOURCE_BARRIER::Transition(mDepthStencilBuffer.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
                                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
@@ -3609,7 +3952,8 @@ private:
         mCommandList->ResourceBarrier(_countof(toRead), toRead);
 
         // SSAO 的两趟（遮蔽 + 模糊）画在这里：G-Buffer 和深度刚变成可读
-        mCommandList->SetGraphicsRootDescriptorTable(8, HeapGpuHandle(25));
+        mCommandList->SetGraphicsRootDescriptorTable(8, HeapGpuHandle(HeapSlot::GBuffer0));
+        mCommandList->SetGraphicsRootDescriptorTable(11, HeapGpuHandle(HeapSlot::Velocity)); // t13：速度缓冲（调试视图"速度"读）
         if (mGBufferView == 0 || mGBufferView == 7) // 看别的调试视图时用不上遮蔽图
         {
             DrawSsao();
@@ -3619,7 +3963,7 @@ private:
         // ③ 光照 Pass（选了 G-Buffer 视图时换成调试视图）：全屏三角形读 G-Buffer 和深度，输出到 HDR 纹理
         mCommandList->OMSetRenderTargets(
             1, &hdrRtv, true, nullptr);
-        mCommandList->SetGraphicsRootDescriptorTable(9, HeapGpuHandle(28)); // 遮蔽图的最终结果在 [0]
+        mCommandList->SetGraphicsRootDescriptorTable(9, HeapGpuHandle(HeapSlot::SsaoMap0)); // 遮蔽图的最终结果在 [0]
 
         // 光体积模式：开了小灯、选了光体积、没在看调试视图
         const bool volumes = mManyLights && mLightVolumes && mGBufferView == 0;
@@ -3702,7 +4046,7 @@ private:
                 &heapProps, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &optClear,
                 IID_PPV_ARGS(&mSsaoMap[i])));
             mDevice->CreateRenderTargetView(mSsaoMap[i].Get(), nullptr, SsaoRtv(i));
-            mDevice->CreateShaderResourceView(mSsaoMap[i].Get(), nullptr, HeapCpuHandle(28 + i)); // 大堆第 28、29 格
+            mDevice->CreateShaderResourceView(mSsaoMap[i].Get(), nullptr, HeapCpuHandle(HeapSlot::SsaoMap0 + i));
         }
     }
 
@@ -3765,9 +4109,9 @@ private:
 
         for (int i = 0; i < mSsaoBlurCount; i++)
         {
-            mCommandList->SetGraphicsRootDescriptorTable(9, HeapGpuHandle(28)); // 横：读 [0]
+            mCommandList->SetGraphicsRootDescriptorTable(9, HeapGpuHandle(HeapSlot::SsaoMap0)); // 横：读 [0]
             pass(1, mSsaoBlurPSO[0].Get()); //     写哪张
-            mCommandList->SetGraphicsRootDescriptorTable(9, HeapGpuHandle(29)); // 竖：读 [1]
+            mCommandList->SetGraphicsRootDescriptorTable(9, HeapGpuHandle(HeapSlot::SsaoMap0 + 1)); // 竖：读 [1]
             pass(0, mSsaoBlurPSO[1].Get()); //     写哪张
         }
 
@@ -3803,14 +4147,16 @@ private:
             .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             .TextureCube = {.MostDetailedMip = 0, .MipLevels = 1, .ResourceMinLODClamp = 0.0f},
         };
-        mDevice->CreateShaderResourceView(mIrradianceMap.Get(), &cubeSrv, HeapCpuHandle(30)); // 盖掉第 30 格的空描述符
+        mDevice->CreateShaderResourceView(mIrradianceMap.Get(), &cubeSrv, HeapCpuHandle(HeapSlot::IrradianceSrv));
+        // 盖掉这一格的空描述符
         // 写的时候：UAV 没有"立方体"，看成 6 张图的数组，按 (x, y, 第几个面) 写
         D3D12_UNORDERED_ACCESS_VIEW_DESC cubeUav = {
             .Format = kIblCubeFormat,
             .ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
             .Texture2DArray = {.MipSlice = 0, .FirstArraySlice = 0, .ArraySize = 6, .PlaneSlice = 0},
         };
-        mDevice->CreateUnorderedAccessView(mIrradianceMap.Get(), nullptr, &cubeUav, HeapCpuHandle(33));
+        mDevice->CreateUnorderedAccessView(mIrradianceMap.Get(), nullptr, &cubeUav,
+                                           HeapCpuHandle(HeapSlot::IrradianceUav));
         // ② 预滤波环境贴图：和辐照度图一样是立方体，只是更大、有 5 级 mip，每级一个 UAV
         cubeDesc.Width = kPrefilterSize;
         cubeDesc.Height = kPrefilterSize;
@@ -3819,11 +4165,12 @@ private:
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
             IID_PPV_ARGS(&mPrefilteredMap)));
         cubeSrv.TextureCube.MipLevels = kPrefilterMips; // 读的时候 5 级都能读（SampleLevel 第三个参数选级）
-        mDevice->CreateShaderResourceView(mPrefilteredMap.Get(), &cubeSrv, HeapCpuHandle(31));
+        mDevice->CreateShaderResourceView(mPrefilteredMap.Get(), &cubeSrv, HeapCpuHandle(HeapSlot::PrefilteredSrv));
         for (UINT mip = 0; mip < kPrefilterMips; mip++)
         {
             cubeUav.Texture2DArray.MipSlice = mip; // 写的时候一次只能写一级
-            mDevice->CreateUnorderedAccessView(mPrefilteredMap.Get(), nullptr, &cubeUav, HeapCpuHandle(34 + mip));
+            mDevice->CreateUnorderedAccessView(mPrefilteredMap.Get(), nullptr, &cubeUav,
+                                               HeapCpuHandle(HeapSlot::PrefilteredUav0 + mip));
         }
         // ③ BRDF LUT：普通的 2D 纹理，两个通道
         D3D12_RESOURCE_DESC lutDesc = cubeDesc; // 先抄一份（DEFAULT 堆、UAV 标志这些都一样），再改不一样的
@@ -3835,8 +4182,8 @@ private:
         ThrowIfFailed(
             mDevice->CreateCommittedResource(&heapProps,D3D12_HEAP_FLAG_NONE,&lutDesc,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&mBrdfLut)));
-        mDevice->CreateShaderResourceView(mBrdfLut.Get(), nullptr, HeapCpuHandle(32));
-        mDevice->CreateUnorderedAccessView(mBrdfLut.Get(), nullptr, nullptr, HeapCpuHandle(39));
+        mDevice->CreateShaderResourceView(mBrdfLut.Get(), nullptr, HeapCpuHandle(HeapSlot::BrdfLutSrv));
+        mDevice->CreateUnorderedAccessView(mBrdfLut.Get(), nullptr, nullptr, HeapCpuHandle(HeapSlot::BrdfLutUav));
     }
 
     // IBL 预计算专用的根签名（计算）：b0 = 1 个根常量（粗糙度），t0 = 天空图，u0 = 这一趟要写的图，s0 = 三线性
@@ -3905,10 +4252,10 @@ private:
         };
         mCommandList->ResourceBarrier(_countof(toWrite), toWrite);
         mCommandList->SetComputeRootSignature(mIblRootSignature.Get());
-        mCommandList->SetComputeRootDescriptorTable(1, HeapGpuHandle(10)); //t0 天空图
+        mCommandList->SetComputeRootDescriptorTable(1, HeapGpuHandle(HeapSlot::SkyCube)); //t0 天空图
         // ① 辐照度图：一个线程组管 8×8 个像素，z 方向 6 组 = 6 个面
         mCommandList->SetPipelineState(mIrradiancePSO.Get());
-        mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(33)); //u0 = 辐照度图的 UAV
+        mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(HeapSlot::IrradianceUav)); //u0 = 辐照度图的 UAV
         mCommandList->Dispatch(kIrradianceSize / 8, kIrradianceSize / 8, 6); // 32 / 8 = 4 组；z 方向 6 组 = 6 个面
         // ② 预滤波：每级 mip 一趟，粗糙度用根常量传进去
         mCommandList->SetPipelineState(mPrefilterPSO.Get());
@@ -3916,13 +4263,14 @@ private:
         {
             const float roughness = (float)mip / (kPrefilterMips - 1); // 0、0.25、0.5、0.75、1
             mCommandList->SetComputeRoot32BitConstants(0, 1, &roughness, 0);
-            mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(34 + mip)); // u0 = 这一级的 UAV
+            mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(HeapSlot::PrefilteredUav0 + mip));
+            // u0 = 这一级的 UAV
             const UINT size = kPrefilterSize >> mip; // 256、128、64、32、16
             mCommandList->Dispatch((size + 7) / 8, (size + 7) / 8, 6);
         }
         // ③ BRDF LUT：不读天空图，普通 2D
         mCommandList->SetPipelineState(mBrdfLutPSO.Get());
-        mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(39)); // u0 = LUT 的 UAV
+        mCommandList->SetComputeRootDescriptorTable(2, HeapGpuHandle(HeapSlot::BrdfLutUav)); // u0 = LUT 的 UAV
         mCommandList->Dispatch((kBrdfLutSize + 7) / 8, (kBrdfLutSize + 7) / 8, 1);
         D3D12_RESOURCE_BARRIER toRead[] = {
             // 写完都转回 PIXEL_SHADER_RESOURCE：天空、光照 Pass 的像素着色器要读
@@ -4076,7 +4424,7 @@ private:
     ComPtr<ID3D12PipelineState> mFloorPSO;
 
     //ImGui
-    static constexpr int kImGuiFirstSlot = 12, kImGuiSlotCount = 4;
+    static constexpr int kImGuiFirstSlot = HeapSlot::ImGui0, kImGuiSlotCount = 4;
     std::vector<int> mImGuiFreeSlots;
     float mSunAzimuth = 0.0f, mSunElevation = 0.0f; // 单位：度
     int mCameraPreset = -1; // 当前在第几个预设机位，-1 = 自由视角
@@ -4106,6 +4454,26 @@ private:
     float mFxaaSubpix = 0.75f; // 面板"次像素混合"：FXAA 3.11 默认 0.75；0 = 只抹台阶，不抹孤立的细节
     float mFxaaEdgeThreshold = 0.166f; // 面板"边缘门槛"：对比度 ≥ 最亮的 × 这个数才算边（默认 0.166）
     bool mFxaaDebug = false; // 面板"看 FXAA 判出的边"：红 = 横边，蓝 = 竖边，越亮混得越多
+    // TAA（s110）面板
+    static constexpr UINT kTaaSamples = 8; // Halton 序列取前 8 个点，8 帧一圈循环用
+    bool mTaa = false; // 面板"TAA"：只做了延迟路径（速度缓冲放在 G-Buffer 里）
+    UINT mTaaFrame = 0; // TAA 开着时的帧计数：第①步你来让它每帧加一
+    XMFLOAT2 mTaaJitter = {0.0f, 0.0f}; // 这一帧的抖动（单位：像素），面板显示用；第①步你来算
+    float mTaaJitterScale = 1.0f; // 面板"抖动放大（调试）"：抖动乘这个数，放大到肉眼看得见；正常用 1
+    XMFLOAT4X4 mPrevViewProjNoJitter = XMFLOAT4X4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
+    // 上一帧不带抖动的 ViewProj：第②步你来每帧存
+    bool mTaaMoveSpheres = false; // 面板"测试球左右移动"：看物体自己动时的速度（要先勾"PBR 测试球"）
+    float mSphereAnimTime = 0.0f; // 测试球动了多久（秒）
+    // TAA 第③步：两张历史图轮流用——这一帧写 [mTaaCur]、读 [1 − mTaaCur]（上一帧写的那张）。只做延迟路径
+    ComPtr<ID3D12Resource> mTaaHistory[2]; // kHdrFormat，和 HDR 纹理一样大；帧与帧之间停在 PIXEL_SHADER_RESOURCE
+    ComPtr<ID3D12DescriptorHeap> mTaaRtvHeap; // 2 格：两张历史图的 RTV
+    ComPtr<ID3D12RootSignature> mTaaRootSignature;
+    ComPtr<ID3DBlob> mTaaVSByteCode, mTaaPSByteCode;
+    ComPtr<ID3D12PipelineState> mTaaPSO;
+    UINT mTaaCur = 0; // 这一帧写第几张历史图：第③步你来每帧换
+    bool mTaaReset = true; // 历史作废（第一帧、改尺寸、这一帧没做 TAA）：下一次 TAA 直接输出当前帧
+    float mTaaAlpha = 0.1f; // 面板"当前帧占比 α"：0.1 = 新的占 10%、历史占 90%
+    bool mTaaClamp = true; // 面板"邻域裁剪（去拖影）"：第④步。关掉 = 第③步的样子，拖影回来
 
     // Bloom
     static constexpr UINT kBloomMips = 6; // 2560×1440 下是 1280×720 … 40×22
@@ -4121,6 +4489,7 @@ private:
 
     //延迟渲染
     ComPtr<ID3D12Resource> mGBuffer[2];
+    ComPtr<ID3D12Resource> mVelocity; // 速度缓冲（kVelocityFormat），和 G-Buffer 一起写：第②步你来建
     ComPtr<ID3D12DescriptorHeap> mGBufferRtvHeap;
     // G-Buffer Pass 的 6 个 PS：木箱、测试球、地砖、铁丝网、陆地、树（和各自的前向 PS 同一组宏）
     ComPtr<ID3DBlob> mGBufferCratePSByteCode, mGBufferSpherePSByteCode, mGBufferFloorPSByteCode;
@@ -4132,7 +4501,7 @@ private:
     ComPtr<ID3DBlob> mDeferredPSByteCode;
     ComPtr<ID3D12PipelineState> mDeferredLightPSO;
     // G-Buffer 调试视图：基础色、法线、粗糙度、金属度、深度、世界坐标（面板上的下拉框选，0 = 关 = 正常算光）
-    static constexpr int kGBufferViews = 8;
+    static constexpr int kGBufferViews = 9;
     int mGBufferView = 0;
     ComPtr<ID3DBlob> mDeferredVSByteCode;
     ComPtr<ID3DBlob> mGBufferViewPSByteCode[kGBufferViews];

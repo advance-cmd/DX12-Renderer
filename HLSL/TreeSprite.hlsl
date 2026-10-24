@@ -26,6 +26,8 @@ struct GeoOut
     float3 NormalW : NORMAL;
     float2 TexC : TEXCOORD;
     uint PrimID : SV_PrimitiveID;
+    float4 CurPosH : TEXCOORD1;  // 这一帧的裁剪坐标（不带抖动）
+    float4 PrevPosH : TEXCOORD2; // 上一帧的
 };
 
 VertexOut VS(VertexIn vin)
@@ -78,7 +80,7 @@ GBufferOut PS_GBuffer(GeoOut pin)
     MaterialConstants mat;
     float3 normal;
     GetSurface(pin, mat, normal);
-    return PackGBuffer(mat, normal);
+    return PackGBuffer(mat, normal, MotionVector(pin.CurPosH, pin.PrevPosH));
 }
 
 [maxvertexcount(4)]
@@ -111,7 +113,7 @@ void GS(
         float2(1.0f, 0.0f) // 右上
     };
     
-    //一个一个输出：变到裁剪空间，填满 GeoOut 的 5 个字段，Append
+    //一个一个输出：变到裁剪空间，填满 GeoOut 的 7 个字段，Append
     GeoOut gout;
     [unroll]
     for (int i = 0; i < 4; ++i)
@@ -121,6 +123,8 @@ void GS(
         gout.NormalW = look;      // 法线朝向眼睛（所以逆光的时候是暗的）
         gout.TexC = texC[i];
         gout.PrimID = primID;
+        gout.CurPosH = mul(v[i], gPass.ViewProjNoJitter);
+        gout.PrevPosH = mul(v[i], gPass.PrevViewProjNoJitter); // 树不会动：同一个世界坐标，只换成上一帧的矩阵
         triStream.Append(gout);
     }
 

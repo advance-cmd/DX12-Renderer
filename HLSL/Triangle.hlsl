@@ -10,6 +10,7 @@ struct ObjectConstants
 {
     float4x4 World;
     float4x4 WorldInvTranspose;
+    float4x4 PrevWorld; // 上一帧的 World（TAA 速度缓冲）
 };
 
 ConstantBuffer<ObjectConstants> gObj : register(b0);
@@ -35,6 +36,8 @@ struct VertexOut
     float2 TexC : TEXCOORD;
     float3 PosW : TEXCOORD1;
     float3 TangentW : TANGENT;
+    float4 CurPosH : TEXCOORD2; //这一帧的裁剪坐标（不带抖动）
+    float4 PrevPosH : TEXCOORD3;    //上一帧的
 };
 
 VertexOut VS(VertexIn vin)
@@ -46,6 +49,8 @@ VertexOut VS(VertexIn vin)
     vout.TexC = vin.TexC;
     vout.PosW = posW.xyz;
     vout.TangentW = mul(vin.TangentU,(float3x3)gObj.World);
+    vout.CurPosH = mul(posW, gPass.ViewProjNoJitter);
+    vout.PrevPosH = mul(mul(float4(vin.PosL, 1.0f), gObj.PrevWorld), gPass.PrevViewProjNoJitter);
     return vout;
 }
 
@@ -97,7 +102,7 @@ GBufferOut PS_GBuffer(VertexOut pin)
     MaterialConstants mat;
     float3 normal;
     GetSurface(pin, mat, normal);
-    return PackGBuffer(mat, normal);
+    return PackGBuffer(mat, normal, MotionVector(pin.CurPosH, pin.PrevPosH));
 }
 
 VertexOut VS_MirrorClear(VertexIn vin)
